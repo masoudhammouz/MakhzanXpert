@@ -1,10 +1,10 @@
 import { Link, NavLink } from 'react-router-dom';
 import { useCart } from '../context/CartContext.jsx';
+import logoImage from '../assets/makhzanxpert-logo.png';
 import LanguageToggle from './LanguageToggle.jsx';
-import SearchBar from './SearchBar.jsx';
 import ThemeToggle from './ThemeToggle.jsx';
 
-export default function MobileMenu({ open, onClose, searchValue, onSearchChange, onSearchSubmit }) {
+export default function MobileMenu({ open, onClose }) {
   const { totalItems } = useCart();
 
   if (!open) {
@@ -12,23 +12,18 @@ export default function MobileMenu({ open, onClose, searchValue, onSearchChange,
   }
 
   return (
-    <div className="mobile-menu-overlay" onClick={onClose}>
-      <aside className="mobile-menu" onClick={(event) => event.stopPropagation()}>
-        <div className="mobile-menu-header">
-          <p className="mobile-menu-title">Menu</p>
-          <button className="icon-button close-menu" type="button" onClick={onClose} aria-label="Close menu">
+    <div className="mobile-menu-overlay premium-mobile-overlay" onClick={onClose}>
+      <aside className="mobile-menu premium-mobile-drawer" onClick={(event) => event.stopPropagation()}>
+        <div className="mobile-menu-header premium-mobile-header">
+          <Link to="/" className="premium-logo-link" onClick={onClose} aria-label="MakhzanXpert home">
+            <img src={logoImage} alt="MakhzanXpert" className="premium-logo" />
+          </Link>
+          <button className="premium-icon-button close-menu" type="button" onClick={onClose} aria-label="Close menu">
             x
           </button>
         </div>
 
-        <SearchBar
-          value={searchValue}
-          onChange={onSearchChange}
-          onSubmit={onSearchSubmit}
-          placeholder="Search shoes"
-        />
-
-        <nav className="mobile-nav-list">
+        <nav className="mobile-nav-list premium-mobile-nav" aria-label="Mobile navigation">
           <NavLink to="/" className="mobile-nav-link" onClick={onClose}>
             Home
           </NavLink>
@@ -36,16 +31,16 @@ export default function MobileMenu({ open, onClose, searchValue, onSearchChange,
             Products
           </NavLink>
           <Link to="/cart" className="mobile-nav-link" onClick={onClose}>
-            Cart {totalItems > 0 ? `- ${totalItems}` : ''}
+            Cart <span>{totalItems}</span>
           </Link>
-          <NavLink to="/admin/login" className="mobile-nav-link" onClick={onClose}>
+          <NavLink to="/admin/login" className="mobile-nav-link subtle-mobile-link" onClick={onClose}>
             Admin
           </NavLink>
         </nav>
 
-        <div className="mobile-menu-actions">
-          <ThemeToggle />
+        <div className="mobile-menu-actions premium-mobile-actions">
           <LanguageToggle />
+          <ThemeToggle />
         </div>
       </aside>
     </div>

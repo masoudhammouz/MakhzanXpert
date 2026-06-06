@@ -5,7 +5,7 @@ export default function ThemeToggle() {
 
   return (
     <button className="icon-button theme-toggle" type="button" onClick={toggleTheme} aria-label="Toggle theme">
-      {theme === 'dark' ? '☀️' : '🌙'}
+      <span className="theme-toggle-dot" aria-hidden="true" />
       <span>{theme === 'dark' ? 'Light' : 'Dark'}</span>
     </button>
   );
