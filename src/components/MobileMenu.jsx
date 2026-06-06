@@ -1,11 +1,24 @@
+import { useEffect } from 'react';
 import { Link, NavLink } from 'react-router-dom';
 import { useCart } from '../context/CartContext.jsx';
-import logoImage from '../assets/makhzanxpert-logo.png';
 import LanguageToggle from './LanguageToggle.jsx';
 import ThemeToggle from './ThemeToggle.jsx';
 
 export default function MobileMenu({ open, onClose }) {
   const { totalItems } = useCart();
+
+  useEffect(() => {
+    if (!open) {
+      return undefined;
+    }
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [open]);
 
   if (!open) {
     return null;
@@ -15,11 +28,9 @@ export default function MobileMenu({ open, onClose }) {
     <div className="mobile-menu-overlay premium-mobile-overlay" onClick={onClose}>
       <aside className="mobile-menu premium-mobile-drawer" onClick={(event) => event.stopPropagation()}>
         <div className="mobile-menu-header premium-mobile-header">
-          <Link to="/" className="premium-logo-link" onClick={onClose} aria-label="MakhzanXpert home">
-            <img src={logoImage} alt="MakhzanXpert" className="premium-logo" />
-          </Link>
+          <span className="premium-mobile-title">Menu</span>
           <button className="premium-icon-button close-menu" type="button" onClick={onClose} aria-label="Close menu">
-            x
+            <span aria-hidden="true">x</span>
           </button>
         </div>
 
