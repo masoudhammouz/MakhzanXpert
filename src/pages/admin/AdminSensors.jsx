@@ -1,4 +1,4 @@
-import { collection, getDocs } from 'firebase/firestore';
+import { collection, getDocs, limit, onSnapshot, orderBy, query } from 'firebase/firestore';
 import { useEffect, useMemo, useState } from 'react';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
@@ -57,9 +57,18 @@ function getDeviceStatus(device) {
   return lastSeenMs && Date.now() - lastSeenMs <= ONLINE_WINDOW_MS ? 'Online' : 'Offline';
 }
 
+function getActivityStatusClass(status) {
+  const normalizedStatus = String(status || '').toLowerCase();
+  if (normalizedStatus === 'success') return 'status-available';
+  if (normalizedStatus === 'warning') return 'status-low-stock';
+  if (normalizedStatus === 'error') return 'status-unavailable';
+  return 'status-ready';
+}
+
 function AdminSensors() {
   const [readings, setReadings] = useState([]);
   const [devices, setDevices] = useState([]);
+  const [activities, setActivities] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [lastRefresh, setLastRefresh] = useState(null);
@@ -106,6 +115,21 @@ function AdminSensors() {
       mounted = false;
       window.clearInterval(intervalId);
     };
+  }, []);
+
+  useEffect(() => {
+    const activityQuery = query(collection(db, 'systemActivity'), orderBy('createdAt', 'desc'), limit(5));
+    const unsubscribe = onSnapshot(
+      activityQuery,
+      (snapshot) => {
+        setActivities(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      },
+      () => {
+        setActivities([]);
+      },
+    );
+
+    return unsubscribe;
   }, []);
 
   const latest = readings[0];
@@ -264,12 +288,29 @@ function AdminSensors() {
         <div className="section-header">
           <div>
             <h2>System Activity</h2>
-            <p>Waiting for warehouse events...</p>
+            <p>Latest 5 warehouse events from systemActivity.</p>
           </div>
         </div>
-        <div className="system-activity-placeholder">
-          Waiting for warehouse events...
-        </div>
+        {activities.length === 0 ? (
+          <div className="system-activity-placeholder">
+            Waiting for warehouse events...
+          </div>
+        ) : (
+          <div className="sensor-activity-list">
+            {activities.map((activity) => (
+              <article className="sensor-activity-item" key={activity.id}>
+                <span className={`status-badge ${getActivityStatusClass(activity.status)}`}>
+                  {activity.status || 'info'}
+                </span>
+                <div>
+                  <strong>{activity.message || '-'}</strong>
+                  <p>{activity.sourceDevice || '-'} / {activity.activityType || '-'}</p>
+                </div>
+                <time>{formatDate(activity.createdAt)}</time>
+              </article>
+            ))}
+          </div>
+        )}
       </section>
     </div>
   );

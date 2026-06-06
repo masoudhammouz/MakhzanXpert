@@ -5,6 +5,32 @@ import { useAuth } from '../../context/AuthContext.jsx';
 import { db } from '../../firebase/firebase.js';
 import seedProducts, { resetProducts } from '../../utils/seedProducts.js';
 
+function formatActivityDate(value) {
+  const timestamp = value?.toMillis ? value.toMillis() : 0;
+  if (!timestamp) return '-';
+
+  return new Intl.DateTimeFormat('en-US', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(timestamp));
+}
+
+function getActivityStatusClass(status) {
+  const normalizedStatus = String(status || '').toLowerCase();
+  if (normalizedStatus === 'success') return 'status-available';
+  if (normalizedStatus === 'warning') return 'status-low-stock';
+  if (normalizedStatus === 'error') return 'status-unavailable';
+  return 'status-ready';
+}
+
+function getCommandStatusClass(status) {
+  const normalizedStatus = String(status || '').toLowerCase();
+  if (normalizedStatus === 'executing') return 'command-status-executing';
+  if (normalizedStatus === 'completed') return 'command-status-completed';
+  if (normalizedStatus === 'failed') return 'command-status-failed';
+  return 'command-status-pending';
+}
+
 function AdminDashboard() {
   const { currentUser, logout } = useAuth();
   const navigate = useNavigate();
@@ -14,6 +40,7 @@ function AdminDashboard() {
   const [resetting, setResetting] = useState(false);
   const [latestReading, setLatestReading] = useState(null);
   const [lastActivity, setLastActivity] = useState(null);
+  const [latestCommand, setLatestCommand] = useState(null);
 
   useEffect(() => {
     const readingsQuery = query(collection(db, 'sensorReadings'), orderBy('createdAt', 'desc'), limit(1));
@@ -36,6 +63,19 @@ function AdminDashboard() {
         setLastActivity(snapshot.docs[0]?.data() || null);
       },
       () => setLastActivity(null),
+    );
+
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    const commandsQuery = query(collection(db, 'commands'), orderBy('createdAt', 'desc'), limit(1));
+    const unsubscribe = onSnapshot(
+      commandsQuery,
+      (snapshot) => {
+        setLatestCommand(snapshot.docs[0]?.data() || null);
+      },
+      () => setLatestCommand(null),
     );
 
     return unsubscribe;
@@ -139,8 +179,35 @@ function AdminDashboard() {
         </article>
         <article className="metric-card admin-metric-card">
           <p className="metric-label">Last Activity</p>
-          <p className="metric-value">{lastActivity?.status || 'No Data'}</p>
-          <p className="metric-note">{lastActivity?.message || 'No system activity received yet.'}</p>
+          <p className="metric-value dashboard-activity-value">{lastActivity?.message || 'No Data'}</p>
+          {lastActivity ? (
+            <>
+              <span className={`status-badge ${getActivityStatusClass(lastActivity.status)}`}>
+                {lastActivity.status || 'info'}
+              </span>
+              <p className="metric-note">
+                {lastActivity.sourceDevice || '-'} / {lastActivity.activityType || '-'} / {formatActivityDate(lastActivity.createdAt)}
+              </p>
+            </>
+          ) : (
+            <p className="metric-note">No system activity received yet.</p>
+          )}
+        </article>
+        <article className="metric-card admin-metric-card">
+          <p className="metric-label">Latest Command</p>
+          <p className="metric-value dashboard-activity-value">{latestCommand?.command || latestCommand?.commandType || 'No Data'}</p>
+          {latestCommand ? (
+            <>
+              <span className={`status-badge ${getCommandStatusClass(latestCommand.status)}`}>
+                {latestCommand.status || 'pending'}
+              </span>
+              <p className="metric-note">
+                {latestCommand.targetDevice || '-'} / {formatActivityDate(latestCommand.createdAt)}
+              </p>
+            </>
+          ) : (
+            <p className="metric-note">No warehouse commands created yet.</p>
+          )}
         </article>
       </div>
 

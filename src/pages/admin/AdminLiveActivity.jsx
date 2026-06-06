@@ -5,17 +5,11 @@ import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
 
 const SAMPLE_ACTIVITIES = [
-  ['Dispenser', 'machine', 'Dispenser started', 'info'],
-  ['Dispenser', 'machine', 'Box released', 'success'],
-  ['Conveyor Belt', 'motion', 'Conveyor running', 'info'],
-  ['Camera Scanner', 'camera', 'Camera scanning label', 'info'],
-  ['Camera Scanner', 'camera', 'Label detected', 'success'],
-  ['Raspberry Pi Camera', 'matching', 'Product matched', 'success'],
-  ['Lift System', 'motion', 'Lift moving to location 4', 'info'],
-  ['Lift System', 'retrieval', 'Product retrieved', 'success'],
-  ['Order System', 'order', 'Order ready', 'success'],
-  ['MQ135 Sensor', 'sensor', 'Gas level warning', 'warning'],
-  ['DHT Sensor', 'sensor', 'Humidity high', 'warning'],
+  ['ESP Main Controller', 'device', 'ESP Main Controller online', 'success'],
+  ['Sensor Hub', 'sensor', 'Sensor readings updated', 'info'],
+  ['Conveyor', 'conveyor', 'Conveyor ready', 'success'],
+  ['Camera Scanner', 'camera', 'Camera scanner idle', 'info'],
+  ['Lift System', 'lift', 'Lift system waiting', 'warning'],
 ];
 
 function formatDate(value) {
@@ -28,9 +22,10 @@ function formatDate(value) {
 }
 
 function getStatusClass(status) {
-  if (status === 'success') return 'status-available';
-  if (status === 'warning') return 'status-low-stock';
-  if (status === 'error') return 'status-unavailable';
+  const normalizedStatus = String(status || '').toLowerCase();
+  if (normalizedStatus === 'success') return 'status-available';
+  if (normalizedStatus === 'warning') return 'status-low-stock';
+  if (normalizedStatus === 'error') return 'status-unavailable';
   return 'status-ready';
 }
 
@@ -62,16 +57,17 @@ function AdminLiveActivity() {
     setError('');
 
     try {
-      const sample = SAMPLE_ACTIVITIES[Math.floor(Math.random() * SAMPLE_ACTIVITIES.length)];
-      await addDoc(collection(db, 'systemActivity'), {
-        sourceDevice: sample[0],
-        activityType: sample[1],
-        message: sample[2],
-        status: sample[3],
-        relatedOrderId: '',
-        relatedCommandId: '',
-        createdAt: serverTimestamp(),
-      });
+      await Promise.all(
+        SAMPLE_ACTIVITIES.map((sample) => addDoc(collection(db, 'systemActivity'), {
+          sourceDevice: sample[0],
+          activityType: sample[1],
+          message: sample[2],
+          status: sample[3],
+          relatedOrderId: '',
+          relatedCommandId: '',
+          createdAt: serverTimestamp(),
+        })),
+      );
     } catch {
       setError('Unable to seed activity.');
     } finally {
@@ -106,7 +102,10 @@ function AdminLiveActivity() {
                   <div>
                     <span className={`status-badge ${getStatusClass(activity.status)}`}>{activity.status || 'info'}</span>
                     <h2>{activity.message || '-'}</h2>
-                    <p>{activity.sourceDevice || '-'} / {activity.activityType || '-'}</p>
+                    <p>
+                      <strong>{activity.sourceDevice || '-'}</strong>
+                      <span>{activity.activityType || '-'}</span>
+                    </p>
                   </div>
                   <time>{formatDate(activity.createdAt)}</time>
                 </article>
