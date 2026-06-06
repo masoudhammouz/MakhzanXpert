@@ -1,152 +1,275 @@
-import { addDoc, collection, limit, onSnapshot, orderBy, query, serverTimestamp } from 'firebase/firestore';
+import { collection, getDocs } from 'firebase/firestore';
 import { useEffect, useMemo, useState } from 'react';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
 
+const REFRESH_INTERVAL_MS = 5000;
+const ONLINE_WINDOW_MS = 30000;
+
+function getDateValue(value) {
+  if (!value) return null;
+  if (value.toDate) return value.toDate();
+  if (value.toMillis) return new Date(value.toMillis());
+  if (value instanceof Date) return value;
+
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function getTimestampMs(value) {
+  return getDateValue(value)?.getTime() || 0;
+}
+
 function formatDate(value) {
-  const timestamp = value?.toMillis ? value.toMillis() : 0;
-  if (!timestamp) return '-';
+  const date = getDateValue(value);
+  if (!date) return '-';
+
   return new Intl.DateTimeFormat('en-US', {
     dateStyle: 'medium',
-    timeStyle: 'short',
-  }).format(new Date(timestamp));
+    timeStyle: 'medium',
+  }).format(date);
+}
+
+function displayValue(value, suffix = '') {
+  if (value === null || value === undefined || value === '') return '-';
+  return `${value}${suffix}`;
+}
+
+function getReadingTimestamp(reading) {
+  return reading.createdAt || reading.timestamp || reading.time || reading.recordedAt;
+}
+
+function getDeviceLastSeen(device) {
+  if (!device) return null;
+  return device.lastSeen || device.updatedAt || device.timestamp || device.createdAt;
+}
+
+function getDeviceStatus(device) {
+  if (!device) return 'Offline';
+
+  const explicitStatus = String(device.status || '').toLowerCase();
+  if (['online', 'offline'].includes(explicitStatus)) {
+    return explicitStatus === 'online' ? 'Online' : 'Offline';
+  }
+
+  const lastSeenMs = getTimestampMs(getDeviceLastSeen(device));
+  return lastSeenMs && Date.now() - lastSeenMs <= ONLINE_WINDOW_MS ? 'Online' : 'Offline';
 }
 
 function AdminSensors() {
   const [readings, setReadings] = useState([]);
+  const [devices, setDevices] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [seeding, setSeeding] = useState(false);
+  const [lastRefresh, setLastRefresh] = useState(null);
 
   useEffect(() => {
-    const readingsQuery = query(collection(db, 'sensorReadings'), orderBy('createdAt', 'desc'), limit(25));
-    const unsubscribe = onSnapshot(
-      readingsQuery,
-      (snapshot) => {
-        setReadings(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-        setLoading(false);
-      },
-      () => {
-        setError('Unable to listen for sensor readings.');
-        setLoading(false);
-      },
-    );
+    let mounted = true;
 
-    return unsubscribe;
+    const fetchSensorData = async () => {
+      try {
+        const [readingsSnapshot, devicesSnapshot] = await Promise.all([
+          getDocs(collection(db, 'sensorReadings')),
+          getDocs(collection(db, 'devices')),
+        ]);
+
+        if (!mounted) return;
+
+        const nextReadings = readingsSnapshot.docs
+          .map((item) => ({ id: item.id, ...item.data() }))
+          .sort((a, b) => getTimestampMs(getReadingTimestamp(b)) - getTimestampMs(getReadingTimestamp(a)))
+          .slice(0, 20);
+        const nextDevices = devicesSnapshot.docs
+          .map((item) => ({ id: item.id, ...item.data() }))
+          .sort((a, b) => getTimestampMs(getDeviceLastSeen(b)) - getTimestampMs(getDeviceLastSeen(a)));
+
+        setReadings(nextReadings);
+        setDevices(nextDevices);
+        setLastRefresh(new Date());
+        setError('');
+      } catch {
+        if (mounted) {
+          setError('Unable to refresh live sensor data from Firestore.');
+        }
+      } finally {
+        if (mounted) {
+          setLoading(false);
+        }
+      }
+    };
+
+    fetchSensorData();
+    const intervalId = window.setInterval(fetchSensorData, REFRESH_INTERVAL_MS);
+
+    return () => {
+      mounted = false;
+      window.clearInterval(intervalId);
+    };
   }, []);
 
   const latest = readings[0];
+  const primaryDevice = devices[0];
+  const deviceStatus = getDeviceStatus(primaryDevice);
 
   const summary = useMemo(() => ({
-    temperature: latest?.temperature ?? '-',
-    humidity: latest?.humidity ?? '-',
-    mq3: latest?.mq3 ?? '-',
-    mq135: latest?.mq135 ?? '-',
-    gasStatus: latest?.gasStatus || 'No data',
-    environmentStatus: latest?.environmentStatus || 'No data',
+    temperature: latest?.temperature,
+    humidity: latest?.humidity,
+    mq3: latest?.mq3,
+    mq135: latest?.mq135,
   }), [latest]);
 
-  const handleSeedReading = async () => {
-    setSeeding(true);
-    setError('');
-
-    try {
-      await addDoc(collection(db, 'sensorReadings'), {
-        deviceId: 'esp-main-001',
-        deviceName: 'ESP Main Controller',
-        temperature: Number((22 + Math.random() * 6).toFixed(1)),
-        humidity: Number((45 + Math.random() * 20).toFixed(1)),
-        mq3: Math.floor(120 + Math.random() * 80),
-        mq135: Math.floor(180 + Math.random() * 120),
-        gasStatus: Math.random() > 0.75 ? 'warning' : 'normal',
-        environmentStatus: Math.random() > 0.75 ? 'humidity high' : 'stable',
-        createdAt: serverTimestamp(),
-      });
-    } catch {
-      setError('Unable to seed sensor reading.');
-    } finally {
-      setSeeding(false);
-    }
-  };
+  const statusCards = [
+    {
+      label: 'Temperature',
+      value: displayValue(summary.temperature, summary.temperature !== undefined ? ' °C' : ''),
+      note: 'Latest warehouse temperature',
+    },
+    {
+      label: 'Humidity',
+      value: displayValue(summary.humidity, summary.humidity !== undefined ? '%' : ''),
+      note: 'Latest relative humidity',
+    },
+    {
+      label: 'Air Quality (MQ135)',
+      value: displayValue(summary.mq135),
+      note: 'MQ135 air quality sensor',
+    },
+    {
+      label: 'Gas Detection (MQ3)',
+      value: displayValue(summary.mq3),
+      note: 'MQ3 gas sensor',
+    },
+  ];
 
   return (
     <div className="admin-sensors-page">
       <section className="admin-page-heading">
         <div>
           <p className="section-eyebrow">Live sensors</p>
-          <h1>Sensors</h1>
-          <p>Firebase-ready monitoring for ESP, Arduino, Raspberry Pi, camera, dispenser, conveyor, lift, and gas sensors.</p>
+          <h1>Sensors Dashboard</h1>
+          <p>Live Firestore monitoring for warehouse environment readings and connected device state.</p>
         </div>
-        <button className="button button-primary" type="button" onClick={handleSeedReading} disabled={seeding}>
-          {seeding ? 'Seeding...' : 'Seed Sensor Reading'}
-        </button>
+        <div className="sensor-refresh-meta" aria-live="polite">
+          <span className="status-badge status-ready">Refresh: 5s</span>
+          <span>{lastRefresh ? `Updated ${formatDate(lastRefresh)}` : 'Waiting for first refresh'}</span>
+        </div>
       </section>
 
-      <section className="inventory-summary-grid" aria-label="Latest sensor summary">
+      {error && <p className="admin-form-error">{error}</p>}
+
+      <section className="inventory-summary-grid" aria-label="Latest sensor values">
         <article className="admin-summary-card">
-          <p className="metric-label">Latest Temperature</p>
-          <p className="metric-value">{summary.temperature}{summary.temperature !== '-' ? ' C' : ''}</p>
+          <p className="metric-label">Temperature °C</p>
+          <p className="metric-value">{displayValue(summary.temperature, summary.temperature !== undefined ? ' °C' : '')}</p>
+          <p className="metric-note">Latest sensorReadings document.</p>
         </article>
         <article className="admin-summary-card">
-          <p className="metric-label">Latest Humidity</p>
-          <p className="metric-value">{summary.humidity}{summary.humidity !== '-' ? '%' : ''}</p>
+          <p className="metric-label">Humidity %</p>
+          <p className="metric-value">{displayValue(summary.humidity, summary.humidity !== undefined ? '%' : '')}</p>
+          <p className="metric-note">Latest sensorReadings document.</p>
         </article>
         <article className="admin-summary-card">
           <p className="metric-label">MQ3</p>
-          <p className="metric-value">{summary.mq3}</p>
+          <p className="metric-value">{displayValue(summary.mq3)}</p>
+          <p className="metric-note">Gas detection reading.</p>
         </article>
         <article className="admin-summary-card">
           <p className="metric-label">MQ135</p>
-          <p className="metric-value">{summary.mq135}</p>
+          <p className="metric-value">{displayValue(summary.mq135)}</p>
+          <p className="metric-note">Air quality reading.</p>
         </article>
       </section>
 
+      <section className="inventory-summary-grid" aria-label="Sensor status cards">
+        {statusCards.map((card) => (
+          <article className="admin-summary-card sensor-status-card" key={card.label}>
+            <p className="metric-label">{card.label}</p>
+            <p className="metric-value">{card.value}</p>
+            <p className="metric-note">{card.note}</p>
+          </article>
+        ))}
+      </section>
+
       <section className="admin-inventory-panel">
-        <div className="sensor-status-row">
-          <span className="status-badge status-ready">Gas: {summary.gasStatus}</span>
-          <span className="status-badge status-available">Environment: {summary.environmentStatus}</span>
+        <div className="section-header">
+          <div>
+            <h2>Device Status</h2>
+            <p>Current device information from the devices collection.</p>
+          </div>
+        </div>
+
+        <div className="device-status-grid">
+          <article className="device-status-card">
+            <span className={deviceStatus === 'Online' ? 'status-badge status-available' : 'status-badge status-unavailable'}>
+              {deviceStatus}
+            </span>
+            <div>
+              <p className="metric-label">Device Name</p>
+              <p className="device-status-value">{primaryDevice?.deviceName || primaryDevice?.name || primaryDevice?.id || '-'}</p>
+            </div>
+          </article>
+          <article className="device-status-card">
+            <p className="metric-label">Last Seen</p>
+            <p className="device-status-value">{formatDate(getDeviceLastSeen(primaryDevice))}</p>
+          </article>
+          <article className="device-status-card">
+            <p className="metric-label">Current Task</p>
+            <p className="device-status-value">{primaryDevice?.currentTask || primaryDevice?.task || primaryDevice?.activeTask || 'Idle'}</p>
+          </article>
+        </div>
+      </section>
+
+      <section className="admin-inventory-panel">
+        <div className="section-header">
+          <div>
+            <h2>Sensor History</h2>
+            <p>Latest 20 readings from sensorReadings.</p>
+          </div>
         </div>
 
         {loading ? (
-          <LoadingState message="Loading sensor readings..." />
+          <LoadingState message="Loading live sensor data..." />
         ) : readings.length === 0 ? (
-          <EmptyState title="No sensor readings yet" description="Seed a test reading or wait for a device to write sensorReadings." />
+          <EmptyState title="No sensor readings yet" description="Waiting for devices to write sensorReadings." />
         ) : (
-          <>
-            {error && <p className="admin-form-error">{error}</p>}
-            <div className="inventory-table-wrap">
-              <table className="inventory-table sensors-table">
-                <thead>
-                  <tr>
-                    <th>Device</th>
-                    <th>Temperature</th>
-                    <th>Humidity</th>
-                    <th>MQ3</th>
-                    <th>MQ135</th>
-                    <th>Gas Status</th>
-                    <th>Environment</th>
-                    <th>Created At</th>
+          <div className="inventory-table-wrap">
+            <table className="inventory-table sensors-table">
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Temperature</th>
+                  <th>Humidity</th>
+                  <th>MQ3</th>
+                  <th>MQ135</th>
+                </tr>
+              </thead>
+              <tbody>
+                {readings.map((reading) => (
+                  <tr key={reading.id}>
+                    <td>{formatDate(getReadingTimestamp(reading))}</td>
+                    <td>{displayValue(reading.temperature, reading.temperature !== undefined ? ' °C' : '')}</td>
+                    <td>{displayValue(reading.humidity, reading.humidity !== undefined ? '%' : '')}</td>
+                    <td>{displayValue(reading.mq3)}</td>
+                    <td>{displayValue(reading.mq135)}</td>
                   </tr>
-                </thead>
-                <tbody>
-                  {readings.map((reading) => (
-                    <tr key={reading.id}>
-                      <td className="inventory-product-name">{reading.deviceName || reading.deviceId || '-'}</td>
-                      <td>{reading.temperature ?? '-'}</td>
-                      <td>{reading.humidity ?? '-'}</td>
-                      <td>{reading.mq3 ?? '-'}</td>
-                      <td>{reading.mq135 ?? '-'}</td>
-                      <td>{reading.gasStatus || '-'}</td>
-                      <td>{reading.environmentStatus || '-'}</td>
-                      <td>{formatDate(reading.createdAt)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
+      </section>
+
+      <section className="admin-inventory-panel">
+        <div className="section-header">
+          <div>
+            <h2>System Activity</h2>
+            <p>Waiting for warehouse events...</p>
+          </div>
+        </div>
+        <div className="system-activity-placeholder">
+          Waiting for warehouse events...
+        </div>
       </section>
     </div>
   );

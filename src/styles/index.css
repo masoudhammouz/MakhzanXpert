@@ -2675,6 +2675,61 @@ button {
   gap: 0.75rem;
 }
 
+.sensor-refresh-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.65rem;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  font-weight: 800;
+}
+
+.sensor-status-card {
+  display: grid;
+  min-height: 150px;
+  align-content: space-between;
+}
+
+.device-status-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.device-status-card {
+  display: grid;
+  gap: 0.75rem;
+  align-content: start;
+  min-height: 130px;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-page);
+}
+
+.device-status-value {
+  margin: 0.3rem 0 0;
+  color: var(--text-primary);
+  font-size: 1.05rem;
+  font-weight: 900;
+  overflow-wrap: anywhere;
+}
+
+.system-activity-placeholder {
+  display: grid;
+  place-items: center;
+  min-height: 160px;
+  padding: 1.25rem;
+  border: 1px dashed var(--border);
+  border-radius: 14px;
+  background: var(--bg-page);
+  color: var(--text-secondary);
+  font-weight: 800;
+  text-align: center;
+}
+
 .live-activity-feed {
   display: grid;
   gap: 0.85rem;
@@ -3013,8 +3068,13 @@ html.dark .location-low {
 
   .locations-toolbar,
   .warehouse-grid,
+  .device-status-grid,
   .location-details-grid {
     grid-template-columns: 1fr;
+  }
+
+  .sensor-refresh-meta {
+    justify-content: flex-start;
   }
 }
 
