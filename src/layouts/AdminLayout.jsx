@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from 'react-router-dom';
+import { Link, NavLink, Outlet } from 'react-router-dom';
 import LanguageToggle from '../components/LanguageToggle.jsx';
 import ThemeToggle from '../components/ThemeToggle.jsx';
 
@@ -25,6 +25,11 @@ function AdminLayout() {
             <p className="admin-sidebar-subtitle">Admin</p>
           </div>
         </div>
+
+        <Link to="/" className="admin-store-link" aria-label="Go to customer store">
+          <span aria-hidden="true">Store</span>
+          Customer Store
+        </Link>
 
         <nav className="admin-sidebar-nav" aria-label="Admin navigation">
           {adminLinks.map((link) => (
