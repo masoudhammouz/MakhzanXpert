@@ -36,6 +36,11 @@ function displayValue(value, suffix = '') {
   return `${value}${suffix}`;
 }
 
+function displaySensorValue(value, suffix = '') {
+  if (value === null || value === undefined || value === '') return '--';
+  return `${value}${suffix}`;
+}
+
 function getReadingTimestamp(reading) {
   return reading.createdAt || reading.timestamp || reading.time || reading.recordedAt;
 }
@@ -78,17 +83,17 @@ function AdminSensors() {
 
     const fetchSensorData = async () => {
       try {
+        const readingsQuery = query(collection(db, 'sensorReadings'), orderBy('createdAt', 'desc'), limit(20));
+
         const [readingsSnapshot, devicesSnapshot] = await Promise.all([
-          getDocs(collection(db, 'sensorReadings')),
+          getDocs(readingsQuery),
           getDocs(collection(db, 'devices')),
         ]);
 
         if (!mounted) return;
 
         const nextReadings = readingsSnapshot.docs
-          .map((item) => ({ id: item.id, ...item.data() }))
-          .sort((a, b) => getTimestampMs(getReadingTimestamp(b)) - getTimestampMs(getReadingTimestamp(a)))
-          .slice(0, 20);
+          .map((item) => ({ id: item.id, ...item.data() }));
         const nextDevices = devicesSnapshot.docs
           .map((item) => ({ id: item.id, ...item.data() }))
           .sort((a, b) => getTimestampMs(getDeviceLastSeen(b)) - getTimestampMs(getDeviceLastSeen(a)));
@@ -141,7 +146,26 @@ function AdminSensors() {
     humidity: latest?.humidity,
     mq3: latest?.mq3,
     mq135: latest?.mq135,
+    waterValue: latest?.waterValue,
+    waterDetected: latest?.waterDetected,
+    waterStatus: latest?.waterStatus,
+    motion: latest?.motion,
+    motionStatus: latest?.motionStatus,
   }), [latest]);
+
+  const waterDetectionStatus = summary.waterDetected === true
+    ? 'WATER DETECTED'
+    : summary.waterDetected === false
+      ? 'DRY'
+      : 'No data';
+  const waterSensorNote = summary.waterStatus
+    ? `${waterDetectionStatus} / ${summary.waterStatus}`
+    : waterDetectionStatus;
+  const motionValue = summary.motion === 1
+    ? 'Motion Detected'
+    : summary.motion === 0
+      ? 'No Motion'
+      : 'No data';
 
   const statusCards = [
     {
@@ -163,6 +187,16 @@ function AdminSensors() {
       label: 'Gas Detection (MQ3)',
       value: displayValue(summary.mq3),
       note: 'MQ3 gas sensor',
+    },
+    {
+      label: 'Water Sensor',
+      value: displaySensorValue(summary.waterValue),
+      note: waterSensorNote,
+    },
+    {
+      label: 'Motion Sensor',
+      value: motionValue,
+      note: summary.motionStatus || 'No data',
     },
   ];
 
@@ -202,6 +236,16 @@ function AdminSensors() {
           <p className="metric-label">MQ135</p>
           <p className="metric-value">{displayValue(summary.mq135)}</p>
           <p className="metric-note">Air quality reading.</p>
+        </article>
+        <article className="admin-summary-card">
+          <p className="metric-label">Water Sensor</p>
+          <p className="metric-value">{displaySensorValue(summary.waterValue)}</p>
+          <p className="metric-note">{waterSensorNote}</p>
+        </article>
+        <article className="admin-summary-card">
+          <p className="metric-label">Motion Sensor</p>
+          <p className="metric-value">{motionValue}</p>
+          <p className="metric-note">{summary.motionStatus || 'No data'}</p>
         </article>
       </section>
 
