@@ -202,7 +202,7 @@ function AdminDashboard() {
                 {latestCommand.status || 'pending'}
               </span>
               <p className="metric-note">
-                {latestCommand.targetDevice || '-'} / {formatActivityDate(latestCommand.createdAt)}
+                {latestCommand.deviceId || '-'} / {formatActivityDate(latestCommand.createdAt)}
               </p>
             </>
           ) : (

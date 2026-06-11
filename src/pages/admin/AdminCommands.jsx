@@ -4,60 +4,32 @@ import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
 
+const ESP_DEVICE_ID = 'esp-main-01';
+
 const COMMANDS = [
   {
-    command: 'CONVEYOR_START',
-    name: 'Conveyor Start',
+    command: 'BELT_START',
+    name: 'Belt Start',
     description: 'Start the warehouse conveyor line.',
-    targetDevice: 'Conveyor',
+    deviceId: ESP_DEVICE_ID,
   },
   {
-    command: 'CONVEYOR_STOP',
-    name: 'Conveyor Stop',
+    command: 'BELT_STOP',
+    name: 'Belt Stop',
     description: 'Stop the warehouse conveyor line.',
-    targetDevice: 'Conveyor',
+    deviceId: ESP_DEVICE_ID,
   },
   {
-    command: 'CAMERA_START',
-    name: 'Camera Start',
+    command: 'CAMERA',
+    name: 'Camera',
     description: 'Activate the camera scanner.',
-    targetDevice: 'Camera Scanner',
+    deviceId: ESP_DEVICE_ID,
   },
   {
-    command: 'CAMERA_STOP',
-    name: 'Camera Stop',
-    description: 'Stop the camera scanner.',
-    targetDevice: 'Camera Scanner',
-  },
-  {
-    command: 'SCAN_LABEL',
+    command: 'SCAN',
     name: 'Scan Label',
     description: 'Request a label scan from the camera system.',
-    targetDevice: 'Camera Scanner',
-  },
-  {
-    command: 'STORAGE_START',
-    name: 'Storage Start',
-    description: 'Start the storage handling system.',
-    targetDevice: 'Storage System',
-  },
-  {
-    command: 'STORAGE_STOP',
-    name: 'Storage Stop',
-    description: 'Stop the storage handling system.',
-    targetDevice: 'Storage System',
-  },
-  {
-    command: 'RETRIEVE_PRODUCT',
-    name: 'Retrieve Product',
-    description: 'Queue a product retrieval command for warehouse hardware.',
-    targetDevice: 'Lift System',
-  },
-  {
-    command: 'EMERGENCY_STOP',
-    name: 'Emergency Stop',
-    description: 'Immediately request all warehouse hardware to stop.',
-    targetDevice: 'All Devices',
+    deviceId: ESP_DEVICE_ID,
   },
 ];
 
@@ -126,13 +98,13 @@ function AdminCommands() {
 
       await setDoc(commandRef, {
         commandId: commandRef.id,
+        deviceId: ESP_DEVICE_ID,
         command: commandConfig.command,
-        targetDevice: commandConfig.targetDevice,
         status: 'pending',
+        payload: {},
+        response: '',
         createdAt: serverTimestamp(),
         executedAt: null,
-        response: '',
-        payload: {},
       });
     } catch {
       setError(`Unable to create ${commandConfig.command} command.`);
@@ -147,7 +119,7 @@ function AdminCommands() {
         <div>
           <p className="section-eyebrow">Warehouse commands</p>
           <h1>Commands</h1>
-          <p>Create pending command documents for warehouse hardware. ESP integration is not connected yet.</p>
+          <p>Create ESP-compatible pending command documents for warehouse hardware.</p>
         </div>
       </section>
 
@@ -174,15 +146,15 @@ function AdminCommands() {
 
       <section className="command-card-grid" aria-label="Supported warehouse commands">
         {COMMANDS.map((item) => (
-          <article className={item.command === 'EMERGENCY_STOP' ? 'command-card emergency-command-card' : 'command-card'} key={item.command}>
+          <article className="command-card" key={item.command}>
             <div>
-              <p className="command-target">{item.targetDevice}</p>
+              <p className="command-target">{item.deviceId}</p>
               <h2>{item.name}</h2>
               <p>{item.description}</p>
               <code>{item.command}</code>
             </div>
             <button
-              className={item.command === 'EMERGENCY_STOP' ? 'button button-danger' : 'button button-primary'}
+              className="button button-primary"
               type="button"
               onClick={() => handleExecuteCommand(item)}
               disabled={Boolean(executingCommand)}
@@ -212,7 +184,7 @@ function AdminCommands() {
                 <tr>
                   <th>Command</th>
                   <th>Status</th>
-                  <th>Target Device</th>
+                  <th>Device ID</th>
                   <th>Created At</th>
                   <th>Executed At</th>
                 </tr>
@@ -226,7 +198,7 @@ function AdminCommands() {
                         {item.status || 'pending'}
                       </span>
                     </td>
-                    <td>{item.targetDevice || '-'}</td>
+                    <td>{item.deviceId || '-'}</td>
                     <td>{formatDate(item.createdAt)}</td>
                     <td>{formatDate(item.executedAt)}</td>
                   </tr>

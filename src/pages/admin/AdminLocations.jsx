@@ -188,8 +188,8 @@ function AdminLocations() {
           </label>
           <div className="warehouse-command-preview" aria-label="Future ESP command examples">
             <p className="spec-label">Future command structure</p>
-            <code>{'{ command: "RETRIEVE_PRODUCT", locationId: 4 }'}</code>
-            <code>{'{ command: "STORE_PRODUCT", locationId: 7 }'}</code>
+            <code>{'{ deviceId: "esp-main-01", command: "SITE 4", status: "pending" }'}</code>
+            <code>{'{ deviceId: "esp-main-01", command: "SITE 7", status: "pending" }'}</code>
           </div>
         </div>
 

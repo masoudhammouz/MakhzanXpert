@@ -8,6 +8,7 @@ import { formatCurrency } from '../../utils/formatCurrency.js';
 const ORDER_STATUSES = ['pending', 'preparing', 'retrieving', 'ready', 'completed', 'cancelled'];
 
 const STATUS_FLOW = ['pending', 'preparing', 'retrieving', 'ready', 'completed'];
+const ESP_DEVICE_ID = 'esp-main-01';
 
 const SAMPLE_ORDERS = [
   {
@@ -209,19 +210,30 @@ function AdminOrders() {
           continue;
         }
 
+        const locationId = Number(location.locationId);
+
+        if (!Number.isInteger(locationId) || locationId < 1 || locationId > 9) {
+          missingItems.push(`${[item.brand, item.model || item.name, item.color, item.size].filter(Boolean).join(' ')} has invalid location ${location.locationId}`);
+          continue;
+        }
+
         commandWrites.push(addDoc(collection(db, 'commands'), {
-          commandType: 'RETRIEVE_PRODUCT',
-          orderId: order.orderId || order.id,
-          productId: item.productId || '',
-          brand: item.brand || '',
-          model: item.model || item.name || '',
-          color: item.color || '',
-          size: item.size || '',
-          quantity: Number(item.quantity || 0),
-          locationId: Number(location.locationId),
+          deviceId: ESP_DEVICE_ID,
+          command: `SITE ${locationId}`,
           status: 'pending',
+          payload: {
+            orderId: order.orderId || order.id,
+            productId: item.productId || '',
+            brand: item.brand || '',
+            model: item.model || item.name || '',
+            color: item.color || '',
+            size: item.size || '',
+            quantity: Number(item.quantity || 0),
+            locationId,
+          },
+          response: '',
           createdAt: serverTimestamp(),
-          completedAt: null,
+          executedAt: null,
         }));
       }
 
