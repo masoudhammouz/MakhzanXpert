@@ -6,57 +6,25 @@ import { db } from '../../firebase/firebase.js';
 
 const ESP_DEVICE_ID = 'esp-main-01';
 
-const COMMANDS = [
-  {
-    command: 'BELT_START',
-    name: 'Belt Start',
-    description: 'Start the warehouse conveyor line.',
-    deviceId: ESP_DEVICE_ID,
-  },
-  {
-    command: 'BELT_STOP',
-    name: 'Belt Stop',
-    description: 'Stop the warehouse conveyor line.',
-    deviceId: ESP_DEVICE_ID,
-  },
-  {
-    command: 'CAMERA',
-    name: 'Camera',
-    description: 'Activate the camera scanner.',
-    deviceId: ESP_DEVICE_ID,
-  },
-  {
-    command: 'SCAN',
-    name: 'Scan Label',
-    description: 'Request a label scan from the camera system.',
-    deviceId: ESP_DEVICE_ID,
-  },
-];
-
 const RAW_POSITIONS = [
-  { command: 'GO 1', label: 'P1 IN' },
-  { command: 'GO 2', label: 'P1 OUT' },
-  { command: 'GO 3', label: 'P2 IN' },
-  { command: 'GO 4', label: 'P2 OUT' },
-  { command: 'GO 5', label: 'P3 IN' },
-  { command: 'GO 6', label: 'P3 OUT' },
-  { command: 'GO 7', label: 'P4 IN' },
-  { command: 'GO 8', label: 'P4 OUT' },
-  { command: 'GO 9', label: 'P5 IN' },
-  { command: 'GO 10', label: 'P5 OUT' },
-  { command: 'GO 11', label: 'P6 IN' },
-  { command: 'GO 12', label: 'P6 OUT' },
-  { command: 'GO 13', label: 'P7 IN' },
-  { command: 'GO 14', label: 'P7 OUT' },
-  { command: 'GO 15', label: 'P8 IN' },
-  { command: 'GO 16', label: 'P8 OUT' },
-  { command: 'GO 17', label: 'P9 IN' },
-  { command: 'GO 18', label: 'P9 OUT' },
-];
-
-const LIFTER_HOME_COMMANDS = [
-  { command: 'HOME', label: 'HOME' },
-  { command: 'START', label: 'STARTING POINT' },
+  { position: 1, label: 'GO 1' },
+  { position: 2, label: 'GO 2' },
+  { position: 3, label: 'GO 3' },
+  { position: 4, label: 'GO 4' },
+  { position: 5, label: 'GO 5' },
+  { position: 6, label: 'GO 6' },
+  { position: 7, label: 'GO 7' },
+  { position: 8, label: 'GO 8' },
+  { position: 9, label: 'GO 9' },
+  { position: 10, label: 'GO 10' },
+  { position: 11, label: 'GO 11' },
+  { position: 12, label: 'GO 12' },
+  { position: 13, label: 'GO 13' },
+  { position: 14, label: 'GO 14' },
+  { position: 15, label: 'GO 15' },
+  { position: 16, label: 'GO 16' },
+  { position: 17, label: 'GO 17' },
+  { position: 18, label: 'GO 18' },
 ];
 
 function getTimestampValue(value) {
@@ -78,9 +46,10 @@ function formatDate(value) {
 
 function getCommandStatusClass(status) {
   const normalizedStatus = String(status || '').toLowerCase();
-  if (normalizedStatus === 'executing') return 'command-status-executing';
-  if (normalizedStatus === 'completed') return 'command-status-completed';
+  if (normalizedStatus === 'sent_to_arduino') return 'command-status-executing';
+  if (['done', 'executed'].includes(normalizedStatus)) return 'command-status-completed';
   if (normalizedStatus === 'failed') return 'command-status-failed';
+  if (normalizedStatus === 'error') return 'command-status-failed';
   return 'command-status-pending';
 }
 
@@ -111,29 +80,28 @@ function AdminCommands() {
   const summary = useMemo(() => ({
     total: commands.length,
     pending: commands.filter((item) => item.status === 'pending').length,
-    executing: commands.filter((item) => item.status === 'executing').length,
-    completed: commands.filter((item) => item.status === 'completed').length,
+    sent: commands.filter((item) => item.status === 'sent_to_arduino').length,
+    done: commands.filter((item) => ['done', 'executed'].includes(item.status)).length,
   }), [commands]);
 
   const handleExecuteCommand = async (commandConfig) => {
-    setExecutingCommand(commandConfig.command);
+    setExecutingCommand(commandConfig.arduinoCommand);
     setError('');
 
     try {
       const commandRef = doc(collection(db, 'commands'));
 
       await setDoc(commandRef, {
-        commandId: commandRef.id,
-        deviceId: ESP_DEVICE_ID,
-        command: commandConfig.command,
+        type: 'GO',
+        position: commandConfig.position,
+        arduinoCommand: commandConfig.arduinoCommand,
         status: 'pending',
-        payload: commandConfig.payload || {},
-        response: '',
+        source: 'website',
+        deviceId: ESP_DEVICE_ID,
         createdAt: serverTimestamp(),
-        executedAt: null,
       });
     } catch {
-      setError(`Unable to create ${commandConfig.command} command.`);
+      setError(`Unable to create ${commandConfig.arduinoCommand} command.`);
     } finally {
       setExecutingCommand('');
     }
@@ -161,89 +129,41 @@ function AdminCommands() {
           <p className="metric-value">{summary.pending}</p>
         </article>
         <article className="admin-summary-card">
-          <p className="metric-label">Executing</p>
-          <p className="metric-value">{summary.executing}</p>
+          <p className="metric-label">Sent to Arduino</p>
+          <p className="metric-value">{summary.sent}</p>
         </article>
         <article className="admin-summary-card">
-          <p className="metric-label">Completed</p>
-          <p className="metric-value">{summary.completed}</p>
+          <p className="metric-label">Done</p>
+          <p className="metric-value">{summary.done}</p>
         </article>
-      </section>
-
-      <section className="command-card-grid" aria-label="Supported warehouse commands">
-        {COMMANDS.map((item) => (
-          <article className="command-card" key={item.command}>
-            <div>
-              <p className="command-target">{item.deviceId}</p>
-              <h2>{item.name}</h2>
-              <p>{item.description}</p>
-              <code>{item.command}</code>
-            </div>
-            <button
-              className="button button-primary"
-              type="button"
-              onClick={() => handleExecuteCommand(item)}
-              disabled={Boolean(executingCommand)}
-            >
-              {executingCommand === item.command ? 'Creating...' : 'Execute'}
-            </button>
-          </article>
-        ))}
       </section>
 
       <section className="admin-inventory-panel" aria-label="Direct lifter position control">
         <div className="section-header">
           <div>
             <h2>Direct Lifter Position Control</h2>
-            <p>Send raw Arduino lifter position commands directly to {ESP_DEVICE_ID}.</p>
+            <p>Send GO 1 through GO 18 commands to {ESP_DEVICE_ID}.</p>
           </div>
         </div>
 
         <div className="command-card-grid">
-          {LIFTER_HOME_COMMANDS.map((item) => (
-            <article className="command-card" key={item.command}>
-              <div>
-                <p className="command-target">{ESP_DEVICE_ID}</p>
-                <h2>{item.label}</h2>
-                <code>{item.command}</code>
-              </div>
-              <button
-                className="button button-primary"
-                type="button"
-                onClick={() => handleExecuteCommand({
-                  command: item.command,
-                  payload: {
-                    source: 'admin_direct_lifter_control',
-                    positionLabel: item.label,
-                  },
-                })}
-                disabled={Boolean(executingCommand)}
-              >
-                {executingCommand === item.command ? 'Creating...' : 'Execute'}
-              </button>
-            </article>
-          ))}
-
           {RAW_POSITIONS.map((item) => (
-            <article className="command-card" key={item.command}>
+            <article className="command-card" key={item.position}>
               <div>
                 <p className="command-target">{ESP_DEVICE_ID}</p>
                 <h2>{item.label}</h2>
-                <code>{item.command}</code>
+                <code>GO {item.position}</code>
               </div>
               <button
                 className="button button-primary"
                 type="button"
                 onClick={() => handleExecuteCommand({
-                  command: item.command,
-                  payload: {
-                    source: 'admin_direct_lifter_control',
-                    positionLabel: item.label,
-                  },
+                  position: item.position,
+                  arduinoCommand: `GO ${item.position}`,
                 })}
                 disabled={Boolean(executingCommand)}
               >
-                {executingCommand === item.command ? 'Creating...' : 'Execute'}
+                {executingCommand === `GO ${item.position}` ? 'Creating...' : 'Execute'}
               </button>
             </article>
           ))}
@@ -268,16 +188,17 @@ function AdminCommands() {
               <thead>
                 <tr>
                   <th>Command</th>
+                  <th>Position</th>
                   <th>Status</th>
                   <th>Device ID</th>
                   <th>Created At</th>
-                  <th>Executed At</th>
                 </tr>
               </thead>
               <tbody>
                 {commands.map((item) => (
                   <tr key={item.id}>
-                    <td className="inventory-product-name">{item.command || '-'}</td>
+                    <td className="inventory-product-name">{item.arduinoCommand || '-'}</td>
+                    <td>{item.position || '-'}</td>
                     <td>
                       <span className={`status-badge ${getCommandStatusClass(item.status)}`}>
                         {item.status || 'pending'}
@@ -285,7 +206,6 @@ function AdminCommands() {
                     </td>
                     <td>{item.deviceId || '-'}</td>
                     <td>{formatDate(item.createdAt)}</td>
-                    <td>{formatDate(item.executedAt)}</td>
                   </tr>
                 ))}
               </tbody>

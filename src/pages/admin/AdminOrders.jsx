@@ -169,7 +169,7 @@ function AdminOrders() {
     }
   };
 
-  const findLocationForItem = async (item) => {
+  const findPositionForItem = async (item) => {
     const locationsQuery = query(
       collection(db, 'locations'),
       where('brand', '==', item.brand || ''),
@@ -179,13 +179,13 @@ function AdminOrders() {
     );
     const snapshot = await getDocs(locationsQuery);
     return snapshot.docs
-      .map((locationDoc) => ({ id: locationDoc.id, ...locationDoc.data() }))
-      .find((location) =>
-        location.isOccupied &&
-        sameText(location.brand, item.brand) &&
-        sameText(location.model, item.model || item.name) &&
-        sameText(location.color, item.color) &&
-        sameText(location.size, item.size),
+      .map((positionDoc) => ({ id: positionDoc.id, ...positionDoc.data() }))
+      .find((position) =>
+        (position.status === 'full' || position.isOccupied) &&
+        sameText(position.brand, item.brand) &&
+        sameText(position.model, item.model || item.name) &&
+        sameText(position.color, item.color) &&
+        sameText(position.size, item.size),
       );
   };
 
@@ -204,36 +204,31 @@ function AdminOrders() {
       const missingItems = [];
 
       for (const item of items) {
-        const location = await findLocationForItem(item);
-        if (!location) {
+        const storedPosition = await findPositionForItem(item);
+        if (!storedPosition) {
           missingItems.push([item.brand, item.model || item.name, item.color, item.size].filter(Boolean).join(' '));
           continue;
         }
 
-        const locationId = Number(location.locationId);
+        const position = Number(storedPosition.position || storedPosition.id);
 
-        if (!Number.isInteger(locationId) || locationId < 1 || locationId > 9) {
-          missingItems.push(`${[item.brand, item.model || item.name, item.color, item.size].filter(Boolean).join(' ')} has invalid location ${location.locationId}`);
+        if (!Number.isInteger(position) || position < 1 || position > 18) {
+          missingItems.push(`${[item.brand, item.model || item.name, item.color, item.size].filter(Boolean).join(' ')} has invalid position ${position || '-'}`);
           continue;
         }
 
         commandWrites.push(addDoc(collection(db, 'commands'), {
-          deviceId: ESP_DEVICE_ID,
-          command: `SITE ${locationId}`,
+          type: 'GO',
+          position,
+          arduinoCommand: `GO ${position}`,
           status: 'pending',
-          payload: {
-            orderId: order.orderId || order.id,
-            productId: item.productId || '',
-            brand: item.brand || '',
-            model: item.model || item.name || '',
-            color: item.color || '',
-            size: item.size || '',
-            quantity: Number(item.quantity || 0),
-            locationId,
-          },
-          response: '',
+          source: 'website',
+          deviceId: ESP_DEVICE_ID,
+          brand: item.brand || '',
+          model: item.model || item.name || '',
+          color: item.color || '',
+          size: item.size || '',
           createdAt: serverTimestamp(),
-          executedAt: null,
         }));
       }
 
@@ -250,10 +245,10 @@ function AdminOrders() {
       }
 
       if (missingItems.length > 0) {
-        setError(`No matching warehouse location found for: ${missingItems.join(', ')}.`);
+        setError(`No matching warehouse position found for: ${missingItems.join(', ')}.`);
       }
     } catch {
-      setError('Unable to prepare order. Please check warehouse locations and try again.');
+      setError('Unable to prepare order. Please check warehouse positions and try again.');
     } finally {
       setPreparingId('');
     }

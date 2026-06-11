@@ -25,9 +25,9 @@ function getActivityStatusClass(status) {
 
 function getCommandStatusClass(status) {
   const normalizedStatus = String(status || '').toLowerCase();
-  if (normalizedStatus === 'executing') return 'command-status-executing';
-  if (normalizedStatus === 'completed') return 'command-status-completed';
-  if (normalizedStatus === 'failed') return 'command-status-failed';
+  if (normalizedStatus === 'sent_to_arduino') return 'command-status-executing';
+  if (['done', 'executed'].includes(normalizedStatus)) return 'command-status-completed';
+  if (['error', 'failed'].includes(normalizedStatus)) return 'command-status-failed';
   return 'command-status-pending';
 }
 
@@ -195,7 +195,7 @@ function AdminDashboard() {
         </article>
         <article className="metric-card admin-metric-card">
           <p className="metric-label">Latest Command</p>
-          <p className="metric-value dashboard-activity-value">{latestCommand?.command || 'No Data'}</p>
+          <p className="metric-value dashboard-activity-value">{latestCommand?.arduinoCommand || 'No Data'}</p>
           {latestCommand ? (
             <>
               <span className={`status-badge ${getCommandStatusClass(latestCommand.status)}`}>

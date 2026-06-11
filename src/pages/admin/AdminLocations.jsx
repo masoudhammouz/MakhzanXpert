@@ -1,45 +1,39 @@
 import { useEffect, useMemo, useState } from 'react';
-import { collection, doc, getDocs, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, serverTimestamp, setDoc } from 'firebase/firestore';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
 
 const WAREHOUSE_GRID = [
-  [9, 8, 7],
-  [6, 5, 4],
-  [3, 2, 1],
+  [18, 17, 16, 15, 14, 13],
+  [12, 11, 10, 9, 8, 7],
+  [6, 5, 4, 3, 2, 1],
 ];
 
-const SORTING_MODES = [
-  { label: 'Brand', value: 'BRAND' },
-  { label: 'Size', value: 'SIZE' },
-  { label: 'Color', value: 'COLOR' },
-  { label: 'Model', value: 'MODEL' },
-  { label: 'Brand + Size', value: 'BRAND_SIZE' },
-  { label: 'Color + Size', value: 'COLOR_SIZE' },
-  { label: 'Model + Size', value: 'MODEL_SIZE' },
-];
+const TOTAL_POSITIONS = 18;
 
-function createEmptyLocation(locationId, sortingMode = 'BRAND') {
+const DEFAULT_SYSTEM_SETTINGS = {
+  sortingMode: 'brand',
+  priority: ['brand'],
+  totalPositions: TOTAL_POSITIONS,
+  commandType: 'GO',
+};
+
+function createEmptyLocation(position) {
   return {
-    locationId,
-    isOccupied: false,
-    productId: '',
+    status: 'empty',
+    position,
     brand: '',
     model: '',
     color: '',
     size: '',
-    quantity: 0,
-    sortingMode,
-    assignedGroup: '',
-    lastUpdated: null,
+    updatedAt: null,
   };
 }
 
 function getLocationStatus(location) {
-  if (!location?.isOccupied) return { label: 'Empty', className: 'location-empty' };
-  if (Number(location.quantity || 0) <= 3) return { label: 'Low Stock', className: 'location-low' };
-  return { label: 'Occupied', className: 'location-occupied' };
+  if (location?.status === 'full' || location?.isOccupied) return { label: 'Full', className: 'location-occupied' };
+  return { label: 'Empty', className: 'location-empty' };
 }
 
 function getProductName(location) {
@@ -67,23 +61,53 @@ function formatDate(value) {
 
 function AdminLocations() {
   const [locations, setLocations] = useState([]);
-  const [sortingMode, setSortingMode] = useState('BRAND');
   const [loading, setLoading] = useState(true);
   const [seeding, setSeeding] = useState(false);
   const [error, setError] = useState('');
   const [selectedLocation, setSelectedLocation] = useState(null);
+
+  const initializeWarehouse = async () => {
+    await setDoc(doc(db, 'settings', 'system'), DEFAULT_SYSTEM_SETTINGS, { merge: true });
+
+    const writes = Array.from({ length: TOTAL_POSITIONS }, async (_, index) => {
+      const position = index + 1;
+      const locationRef = doc(db, 'locations', String(position));
+      const locationSnapshot = await getDoc(locationRef);
+
+      if (!locationSnapshot.exists()) {
+        return setDoc(locationRef, {
+          ...createEmptyLocation(position),
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      const current = locationSnapshot.data();
+      return setDoc(locationRef, {
+        status: current.status || (current.isOccupied ? 'full' : 'empty'),
+        position: current.position || position,
+        brand: current.brand || '',
+        model: current.model || '',
+        color: current.color || '',
+        size: current.size || '',
+        updatedAt: current.updatedAt || current.lastUpdated || serverTimestamp(),
+      }, { merge: true });
+    });
+
+    await Promise.all(writes);
+  };
 
   const loadLocations = async () => {
     setLoading(true);
     setError('');
 
     try {
-      const locationsQuery = query(collection(db, 'locations'), orderBy('locationId', 'asc'));
-      const snapshot = await getDocs(locationsQuery);
-      const items = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      await initializeWarehouse();
+      const snapshot = await getDocs(collection(db, 'locations'));
+      const items = snapshot.docs
+        .map((item) => ({ id: item.id, ...item.data() }))
+        .sort((left, right) => Number(left.position || left.id) - Number(right.position || right.id));
+
       setLocations(items);
-      const firstMode = items.find((item) => item.sortingMode)?.sortingMode;
-      if (firstMode) setSortingMode(firstMode);
     } catch {
       setError('Unable to load warehouse locations.');
     } finally {
@@ -98,21 +122,20 @@ function AdminLocations() {
   const locationsById = useMemo(() => {
     const map = new Map();
     locations.forEach((location) => {
-      map.set(Number(location.locationId), location);
+      map.set(Number(location.position || location.id), location);
     });
-    for (let id = 1; id <= 9; id += 1) {
-      if (!map.has(id)) map.set(id, createEmptyLocation(id, sortingMode));
+    for (let id = 1; id <= TOTAL_POSITIONS; id += 1) {
+      if (!map.has(id)) map.set(id, createEmptyLocation(id));
     }
     return map;
-  }, [locations, sortingMode]);
+  }, [locations]);
 
   const summary = useMemo(() => {
     const currentLocations = Array.from(locationsById.values());
     return {
-      total: 9,
-      occupied: currentLocations.filter((location) => location.isOccupied).length,
-      empty: currentLocations.filter((location) => !location.isOccupied).length,
-      lowStock: currentLocations.filter((location) => location.isOccupied && Number(location.quantity || 0) <= 3).length,
+      total: TOTAL_POSITIONS,
+      full: currentLocations.filter((location) => location.status === 'full' || location.isOccupied).length,
+      empty: currentLocations.filter((location) => location.status !== 'full' && !location.isOccupied).length,
     };
   }, [locationsById]);
 
@@ -121,16 +144,7 @@ function AdminLocations() {
     setError('');
 
     try {
-      const writes = Array.from({ length: 9 }, (_, index) => {
-        const locationId = index + 1;
-        const locationRef = doc(db, 'locations', String(locationId));
-        return setDoc(locationRef, {
-          ...createEmptyLocation(locationId, sortingMode),
-          lastUpdated: serverTimestamp(),
-        }, { merge: true });
-      });
-
-      await Promise.all(writes);
+      await initializeWarehouse();
       await loadLocations();
     } catch {
       setError('Unable to seed warehouse locations.');
@@ -139,17 +153,13 @@ function AdminLocations() {
     }
   };
 
-  const handleSortingModeChange = (event) => {
-    setSortingMode(event.target.value);
-  };
-
   return (
     <div className="admin-locations-page">
       <section className="admin-page-heading">
         <div>
           <p className="section-eyebrow">Warehouse structure</p>
-          <h1>Locations Management</h1>
-          <p>Prepare the 9-location warehouse layer for future ESP, camera, dispenser, retrieval, and sorting systems.</p>
+          <h1>Positions Management</h1>
+          <p>Prepare the 18-position warehouse layer for GO commands.</p>
         </div>
         <button className="button button-primary" type="button" onClick={handleSeedLocations} disabled={seeding}>
           {seeding ? 'Seeding...' : 'Seed Locations'}
@@ -158,38 +168,25 @@ function AdminLocations() {
 
       <section className="inventory-summary-grid" aria-label="Warehouse summary">
         <article className="admin-summary-card">
-          <p className="metric-label">Total Locations</p>
+          <p className="metric-label">Total Positions</p>
           <p className="metric-value">{summary.total}</p>
         </article>
         <article className="admin-summary-card">
-          <p className="metric-label">Occupied</p>
-          <p className="metric-value">{summary.occupied}</p>
+          <p className="metric-label">Full</p>
+          <p className="metric-value">{summary.full}</p>
         </article>
         <article className="admin-summary-card">
           <p className="metric-label">Empty</p>
           <p className="metric-value">{summary.empty}</p>
         </article>
-        <article className="admin-summary-card">
-          <p className="metric-label">Low Stock</p>
-          <p className="metric-value">{summary.lowStock}</p>
-          <p className="metric-note">Quantity less than or equal to 3.</p>
-        </article>
       </section>
 
       <section className="admin-inventory-panel">
         <div className="locations-toolbar">
-          <label className="warehouse-mode-selector">
-            Sorting Mode
-            <select value={sortingMode} onChange={handleSortingModeChange}>
-              {SORTING_MODES.map((mode) => (
-                <option key={mode.value} value={mode.value}>{mode.label}</option>
-              ))}
-            </select>
-          </label>
           <div className="warehouse-command-preview" aria-label="Future ESP command examples">
             <p className="spec-label">Future command structure</p>
-            <code>{'{ deviceId: "esp-main-01", command: "SITE 4", status: "pending" }'}</code>
-            <code>{'{ deviceId: "esp-main-01", command: "SITE 7", status: "pending" }'}</code>
+            <code>{'{ type: "GO", position: 4, arduinoCommand: "GO 4" }'}</code>
+            <code>{'{ type: "GO", position: 18, arduinoCommand: "GO 18" }'}</code>
           </div>
         </div>
 
@@ -199,22 +196,21 @@ function AdminLocations() {
           <EmptyState title="Locations unavailable" description={error} />
         ) : (
           <div className="warehouse-grid" aria-label="Warehouse layout grid">
-            {WAREHOUSE_GRID.flat().map((locationId) => {
-              const location = locationsById.get(locationId);
+            {WAREHOUSE_GRID.flat().map((position) => {
+              const location = locationsById.get(position);
               const status = getLocationStatus(location);
 
               return (
                 <button
-                  key={locationId}
+                  key={position}
                   className={`warehouse-location-card ${status.className}`}
                   type="button"
                   onClick={() => setSelectedLocation(location)}
                 >
-                  <span className="warehouse-location-number">Location {locationId}</span>
+                  <span className="warehouse-location-number">Position {position}</span>
                   <span className="status-badge">{status.label}</span>
                   <strong>{getProductName(location)}</strong>
-                  <span>Quantity: {Number(location.quantity || 0)}</span>
-                  <span>Group: {location.assignedGroup || 'Unassigned'}</span>
+                  <span>Status: {location.status || 'empty'}</span>
                 </button>
               );
             })}
@@ -227,8 +223,8 @@ function AdminLocations() {
           <section className="order-details-modal location-details-modal" onClick={(event) => event.stopPropagation()}>
             <div className="order-modal-header">
               <div>
-                <p className="section-eyebrow">Location details</p>
-                <h2>Location {selectedLocation.locationId}</h2>
+                <p className="section-eyebrow">Position details</p>
+                <h2>Position {selectedLocation.position}</h2>
               </div>
               <button className="icon-button" type="button" onClick={() => setSelectedLocation(null)} aria-label="Close location details">
                 Close
@@ -253,24 +249,12 @@ function AdminLocations() {
                 <p className="spec-value">{selectedLocation.size || '-'}</p>
               </article>
               <article>
-                <p className="spec-label">Quantity</p>
-                <p className="spec-value">{Number(selectedLocation.quantity || 0)}</p>
-              </article>
-              <article>
-                <p className="spec-label">Occupied Status</p>
-                <p className="spec-value">{selectedLocation.isOccupied ? 'Occupied' : 'Empty'}</p>
-              </article>
-              <article>
-                <p className="spec-label">Sorting Mode</p>
-                <p className="spec-value">{selectedLocation.sortingMode || sortingMode}</p>
-              </article>
-              <article>
-                <p className="spec-label">Assigned Group</p>
-                <p className="spec-value">{selectedLocation.assignedGroup || 'Unassigned'}</p>
+                <p className="spec-label">Status</p>
+                <p className="spec-value">{selectedLocation.status || 'empty'}</p>
               </article>
               <article className="location-detail-wide">
                 <p className="spec-label">Last Updated</p>
-                <p className="spec-value">{formatDate(selectedLocation.lastUpdated)}</p>
+                <p className="spec-value">{formatDate(selectedLocation.updatedAt || selectedLocation.lastUpdated)}</p>
               </article>
             </div>
           </section>
