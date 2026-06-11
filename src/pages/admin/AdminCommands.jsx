@@ -33,6 +33,32 @@ const COMMANDS = [
   },
 ];
 
+const RAW_POSITIONS = [
+  { command: 'GO 1', label: 'P1 IN' },
+  { command: 'GO 2', label: 'P1 OUT' },
+  { command: 'GO 3', label: 'P2 IN' },
+  { command: 'GO 4', label: 'P2 OUT' },
+  { command: 'GO 5', label: 'P3 IN' },
+  { command: 'GO 6', label: 'P3 OUT' },
+  { command: 'GO 7', label: 'P4 IN' },
+  { command: 'GO 8', label: 'P4 OUT' },
+  { command: 'GO 9', label: 'P5 IN' },
+  { command: 'GO 10', label: 'P5 OUT' },
+  { command: 'GO 11', label: 'P6 IN' },
+  { command: 'GO 12', label: 'P6 OUT' },
+  { command: 'GO 13', label: 'P7 IN' },
+  { command: 'GO 14', label: 'P7 OUT' },
+  { command: 'GO 15', label: 'P8 IN' },
+  { command: 'GO 16', label: 'P8 OUT' },
+  { command: 'GO 17', label: 'P9 IN' },
+  { command: 'GO 18', label: 'P9 OUT' },
+];
+
+const LIFTER_HOME_COMMANDS = [
+  { command: 'HOME', label: 'HOME' },
+  { command: 'START', label: 'STARTING POINT' },
+];
+
 function getTimestampValue(value) {
   if (value?.toMillis) return value.toMillis();
   if (value instanceof Date) return value.getTime();
@@ -101,7 +127,7 @@ function AdminCommands() {
         deviceId: ESP_DEVICE_ID,
         command: commandConfig.command,
         status: 'pending',
-        payload: {},
+        payload: commandConfig.payload || {},
         response: '',
         createdAt: serverTimestamp(),
         executedAt: null,
@@ -165,6 +191,65 @@ function AdminCommands() {
         ))}
       </section>
 
+      <section className="admin-inventory-panel" aria-label="Direct lifter position control">
+        <div className="section-header">
+          <div>
+            <h2>Direct Lifter Position Control</h2>
+            <p>Send raw Arduino lifter position commands directly to {ESP_DEVICE_ID}.</p>
+          </div>
+        </div>
+
+        <div className="command-card-grid">
+          {LIFTER_HOME_COMMANDS.map((item) => (
+            <article className="command-card" key={item.command}>
+              <div>
+                <p className="command-target">{ESP_DEVICE_ID}</p>
+                <h2>{item.label}</h2>
+                <code>{item.command}</code>
+              </div>
+              <button
+                className="button button-primary"
+                type="button"
+                onClick={() => handleExecuteCommand({
+                  command: item.command,
+                  payload: {
+                    source: 'admin_direct_lifter_control',
+                    positionLabel: item.label,
+                  },
+                })}
+                disabled={Boolean(executingCommand)}
+              >
+                {executingCommand === item.command ? 'Creating...' : 'Execute'}
+              </button>
+            </article>
+          ))}
+
+          {RAW_POSITIONS.map((item) => (
+            <article className="command-card" key={item.command}>
+              <div>
+                <p className="command-target">{ESP_DEVICE_ID}</p>
+                <h2>{item.label}</h2>
+                <code>{item.command}</code>
+              </div>
+              <button
+                className="button button-primary"
+                type="button"
+                onClick={() => handleExecuteCommand({
+                  command: item.command,
+                  payload: {
+                    source: 'admin_direct_lifter_control',
+                    positionLabel: item.label,
+                  },
+                })}
+                disabled={Boolean(executingCommand)}
+              >
+                {executingCommand === item.command ? 'Creating...' : 'Execute'}
+              </button>
+            </article>
+          ))}
+        </div>
+      </section>
+
       <section className="admin-inventory-panel">
         <div className="section-header">
           <div>
@@ -192,7 +277,7 @@ function AdminCommands() {
               <tbody>
                 {commands.map((item) => (
                   <tr key={item.id}>
-                    <td className="inventory-product-name">{item.command || item.commandType || '-'}</td>
+                    <td className="inventory-product-name">{item.command || '-'}</td>
                     <td>
                       <span className={`status-badge ${getCommandStatusClass(item.status)}`}>
                         {item.status || 'pending'}
