@@ -35,6 +35,7 @@ function displaySensorValue(value, suffix = '') {
 }
 
 function getReadingTimestamp(reading) {
+  if (!reading) return null;
   return reading.createdAt || reading.timestamp || reading.time || reading.recordedAt;
 }
 
@@ -329,7 +330,7 @@ function AdminSensors() {
             <span className={`status-orb ${waterTone}`}>W</span>
             <div>
               <strong className={waterTone}>{waterDetectionStatus}</strong>
-              <p>{summary.waterStatus || (summary.waterDetected === true ? 'Water Detected' : 'Dry')}</p>
+              <p>{summary.waterStatus || (summary.waterDetected === true ? 'Water Detected' : summary.waterDetected === false ? 'Dry' : 'No data')}</p>
             </div>
           </div>
           <footer>Last Update: {getRelativeTime(lastSensorUpdate)}</footer>
@@ -347,7 +348,7 @@ function AdminSensors() {
             <span className={`status-orb ${motionTone}`}>M</span>
             <div>
               <strong className={motionTone}>{motionValue}</strong>
-              <p>{summary.motionStatus || (summary.motion === 1 ? 'Motion Detected' : 'No Motion')}</p>
+              <p>{summary.motionStatus || (summary.motion === 1 ? 'Motion Detected' : summary.motion === 0 ? 'No Motion' : 'No data')}</p>
             </div>
           </div>
           <footer>Last Update: {getRelativeTime(lastSensorUpdate)}</footer>
