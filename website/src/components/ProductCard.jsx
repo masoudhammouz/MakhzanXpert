@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom';
 import placeholderImage from '../assets/placeholder-shoe.svg';
 import { formatCurrency } from '../utils/formatCurrency.js';
-import { isCustomerPurchasableProduct } from '../utils/productVisibility.js';
+import { buildProductSlug, isCustomerPurchasableProduct } from '../utils/productVisibility.js';
 
 function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
@@ -15,10 +15,11 @@ export default function ProductCard({ product }) {
   const title = getProductTitle(product);
   const available = isProductAvailable(product);
   const badgeClass = available ? 'status-badge status-available' : 'status-badge status-unavailable';
+  const productUrl = `/products/${product.slug || buildProductSlug(product)}`;
 
   return (
     <article className="product-card">
-      <Link to={`/product/${product.id}`} className="product-card-media" aria-label={`View ${title}`}>
+      <Link to={productUrl} className="product-card-media" aria-label={`View ${title}`}>
         <img
           src={product.imageUrl || placeholderImage}
           alt={title}
@@ -39,7 +40,7 @@ export default function ProductCard({ product }) {
 
         <div>
           <h3>
-            <Link to={`/product/${product.id}`} className="product-title-link">{title}</Link>
+            <Link to={productUrl} className="product-title-link">{title}</Link>
           </h3>
           <p className="product-meta">{product.model || title}</p>
         </div>
@@ -61,7 +62,7 @@ export default function ProductCard({ product }) {
           </div>
         </div>
 
-        <Link to={`/product/${product.id}`} className="button button-secondary product-action" aria-label={`View details for ${title}`}>
+        <Link to={productUrl} className="button button-secondary product-action" aria-label={`View details for ${title}`}>
           View Details
         </Link>
       </div>

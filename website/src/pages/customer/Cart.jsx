@@ -2,6 +2,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import placeholderImage from '../../assets/placeholder-shoe.svg';
 import { useCart } from '../../context/CartContext.jsx';
 import { formatCurrency } from '../../utils/formatCurrency.js';
+import { buildProductSlug } from '../../utils/productVisibility.js';
 
 function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
@@ -46,10 +47,11 @@ export default function Cart() {
           {items.map((item) => {
             const title = getProductTitle(item);
             const itemSubtotal = Number(item.price || 0) * Number(item.quantity || 0);
+            const productUrl = `/products/${item.slug || buildProductSlug(item)}`;
 
             return (
               <article key={item.id} className="cart-item">
-                <Link to={`/product/${item.id}`} className="cart-item-media" aria-label={`View ${title}`}>
+                <Link to={productUrl} className="cart-item-media" aria-label={`View ${title}`}>
                   <img
                     src={item.imageUrl || placeholderImage}
                     alt={title}
@@ -63,7 +65,7 @@ export default function Cart() {
                 <div className="cart-item-body">
                   <p className="product-brand">{item.brand || 'Brand'}</p>
                   <h2>
-                    <Link to={`/product/${item.id}`}>{title}</Link>
+                    <Link to={productUrl}>{title}</Link>
                   </h2>
                   <p className="product-meta">{item.model || title}</p>
 

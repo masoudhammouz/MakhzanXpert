@@ -1,4 +1,5 @@
-import { addDoc, collection, deleteDoc, getDocs, serverTimestamp } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDocs, serverTimestamp, setDoc } from 'firebase/firestore';
+import { buildNormalizedSku, buildProductSlug } from './productVisibility.js';
 
 const sampleProducts = [
   {
@@ -124,14 +125,24 @@ const sampleProducts = [
 ];
 
 async function seedProducts(db) {
-  const collectionRef = collection(db, 'products');
-  const promises = sampleProducts.map((product) =>
-    addDoc(collectionRef, {
+  const promises = sampleProducts.map((product) => {
+    const normalizedSku = buildNormalizedSku(product);
+    const slug = buildProductSlug(product);
+
+    return setDoc(doc(db, 'products', normalizedSku), {
       ...product,
+      id: normalizedSku,
+      normalizedSku,
+      slug,
+      stock: Number(product.quantity || 0),
+      inventoryCount: Number(product.quantity || 0),
+      availableStock: Number(product.quantity || 0),
+      status: 'active',
+      needsDetails: false,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
-    }),
-  );
+    }, { merge: true });
+  });
 
   await Promise.all(promises);
 }

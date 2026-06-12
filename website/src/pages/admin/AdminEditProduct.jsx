@@ -1,10 +1,27 @@
-import { doc, getDoc, serverTimestamp, updateDoc } from 'firebase/firestore';
+import { addDoc, collection, doc, getDoc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import ProductForm from '../../components/ProductForm.jsx';
 import { db } from '../../firebase/firebase.js';
+import { buildProductSlug } from '../../utils/productVisibility.js';
+
+async function logProductActivity(type, message) {
+  const data = {
+    type,
+    activityType: type,
+    message,
+    source: 'website',
+    sourceDevice: 'admin',
+    status: 'info',
+    createdAt: serverTimestamp(),
+  };
+  await Promise.all([
+    addDoc(collection(db, 'systemActivity'), data),
+    addDoc(collection(db, 'activityLog'), data),
+  ]);
+}
 
 function AdminEditProduct() {
   const { id } = useParams();
@@ -43,10 +60,20 @@ function AdminEditProduct() {
     setError('');
 
     try {
+      const nextNeedsDetails = !updatedProduct.isAvailable;
+      const nextStatus = updatedProduct.isAvailable ? 'active' : 'pending_details';
       await updateDoc(doc(db, 'products', id), {
         ...updatedProduct,
+        id,
+        normalizedSku: product.normalizedSku || id,
+        slug: updatedProduct.slug || buildProductSlug(updatedProduct),
+        needsDetails: nextNeedsDetails,
+        status: nextStatus,
         updatedAt: serverTimestamp(),
       });
+      if (nextStatus === 'active' && !nextNeedsDetails) {
+        await logProductActivity('PRODUCT_DETAILS_COMPLETED', `${id} completed and activated.`);
+      }
       navigate('/admin/inventory');
     } catch {
       setError('Unable to update product. Please try again.');

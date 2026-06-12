@@ -109,6 +109,11 @@ function AdminInventory() {
     });
   }, [availabilityFilter, brandFilter, categoryFilter, products, searchText]);
 
+  const pendingDetailsProducts = useMemo(
+    () => products.filter(isDraftProduct),
+    [products],
+  );
+
   const handleView = (product) => {
     alert(`Viewing ${getProductTitle(product)} is a placeholder action.`);
   };
@@ -165,6 +170,50 @@ function AdminInventory() {
           <p className="metric-value">{summary.needsDetailsItems}</p>
         </article>
       </section>
+
+      {pendingDetailsProducts.length > 0 && (
+        <section className="admin-inventory-panel pending-details-panel">
+          <div className="section-header">
+            <div>
+              <h2>Pending Details</h2>
+              <p>Products scanned from labels that need price, category, images, and description before publishing.</p>
+            </div>
+          </div>
+
+          <div className="inventory-table-wrap">
+            <table className="inventory-table">
+              <thead>
+                <tr>
+                  <th>Product</th>
+                  <th>SKU</th>
+                  <th>Size</th>
+                  <th>Color</th>
+                  <th>Quantity</th>
+                  <th>Available</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pendingDetailsProducts.map((product) => (
+                  <tr key={product.id}>
+                    <td className="inventory-product-name">{getProductTitle(product)}</td>
+                    <td>{product.normalizedSku || product.id}</td>
+                    <td>{product.size || '-'}</td>
+                    <td>{product.color || '-'}</td>
+                    <td>{Number(product.quantity || 0)}</td>
+                    <td>{getSellableStock(product)}</td>
+                    <td>
+                      <div className="inventory-actions">
+                        <button type="button" onClick={() => handleEdit(product)}>Complete</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       <section className="admin-inventory-panel">
         <div className="inventory-toolbar">

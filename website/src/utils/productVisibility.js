@@ -13,13 +13,27 @@ export function buildNormalizedSku(product) {
     .join('_');
 }
 
+export function normalizeSlugPart(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'unknown';
+}
+
+export function buildProductSlug(product) {
+  return ['brand', 'model', 'color', 'size']
+    .map((field) => normalizeSlugPart(product?.[field]))
+    .join('-');
+}
+
 export function isDraftProduct(product) {
   return Boolean(product?.needsDetails) || ['draft', 'pending_details'].includes(product?.status);
 }
 
 export function isPublishedProduct(product) {
-  if (!product) return false;
-  return !isDraftProduct(product) && ['active', 'published', undefined, null, ''].includes(product.status);
+  return Boolean(product) && product.status === 'active' && !isDraftProduct(product);
 }
 
 export function getSellableStock(product) {
@@ -30,7 +44,13 @@ export function getSellableStock(product) {
 }
 
 export function isCustomerVisibleProduct(product) {
-  return isPublishedProduct(product) && Boolean(product?.isAvailable) && getSellableStock(product) > 0;
+  return (
+    isPublishedProduct(product) &&
+    Boolean(product?.isAvailable) &&
+    product?.price !== null &&
+    product?.price !== undefined &&
+    getSellableStock(product) > 0
+  );
 }
 
 export function isCustomerPurchasableProduct(product) {

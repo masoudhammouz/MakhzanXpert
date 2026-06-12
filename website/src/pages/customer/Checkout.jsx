@@ -4,7 +4,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useCart } from '../../context/CartContext.jsx';
 import { db } from '../../firebase/firebase.js';
 import { formatCurrency } from '../../utils/formatCurrency.js';
-import { getSellableStock, isCustomerPurchasableProduct } from '../../utils/productVisibility.js';
+import { buildProductSlug, getSellableStock, isCustomerPurchasableProduct } from '../../utils/productVisibility.js';
 
 function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
@@ -53,6 +53,7 @@ function Checkout() {
     try {
       const orderItems = items.map((item) => ({
         productId: item.id,
+        slug: item.slug || buildProductSlug(item),
         brand: item.brand || '',
         model: item.model || item.name || '',
         category: item.category || '',

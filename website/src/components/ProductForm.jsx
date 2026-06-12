@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { buildNormalizedSku } from '../utils/productVisibility.js';
+import { buildNormalizedSku, buildProductSlug } from '../utils/productVisibility.js';
 
 const PRODUCT_CATEGORIES = ['Sneakers', 'Running', 'Casual', 'Boots', 'Sandals'];
 
@@ -37,7 +37,7 @@ function validateProduct(values) {
   const requiredFields = ['brand', 'model', 'size', 'color', 'quantity'];
 
   if (values.isAvailable) {
-    requiredFields.push('category', 'price');
+    requiredFields.push('category', 'price', 'imageUrl', 'description');
   }
 
   requiredFields.forEach((field) => {
@@ -100,6 +100,7 @@ function ProductForm({ initialProduct, mode = 'add', onSubmit, saving = false, e
       description: values.description.trim(),
       isAvailable: Boolean(values.isAvailable) && Number(values.quantity) > 0,
       normalizedSku: buildNormalizedSku(values),
+      slug: buildProductSlug(values),
       status: values.isAvailable ? 'active' : 'pending_details',
       needsDetails: !values.isAvailable,
       createdFromLabel: Boolean(values.createdFromLabel),

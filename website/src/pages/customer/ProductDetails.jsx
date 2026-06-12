@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { collection, doc, getDoc, getDocs, orderBy, query } from 'firebase/firestore';
+import { collection, getDocs, limit, orderBy, query, where } from 'firebase/firestore';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import ProductCard from '../../components/ProductCard.jsx';
@@ -19,7 +19,7 @@ function isProductAvailable(product) {
 }
 
 export default function ProductDetails() {
-  const { id } = useParams();
+  const { slug } = useParams();
   const navigate = useNavigate();
   const { addToCart } = useCart();
   const [product, setProduct] = useState(null);
@@ -33,10 +33,11 @@ export default function ProductDetails() {
       setError('');
 
       try {
-        const productRef = doc(db, 'products', id);
-        const productSnap = await getDoc(productRef);
+        const productQuery = query(collection(db, 'products'), where('slug', '==', slug), limit(1));
+        const productResult = await getDocs(productQuery);
+        const productSnap = productResult.docs[0];
 
-        if (!productSnap.exists()) {
+        if (!productSnap) {
           setProduct(null);
           setAllProducts([]);
           return;
@@ -56,8 +57,8 @@ export default function ProductDetails() {
       }
     }
 
-    if (id) loadProduct();
-  }, [id]);
+    if (slug) loadProduct();
+  }, [slug]);
 
   const relatedProducts = useMemo(() => {
     if (!product?.category) return [];
