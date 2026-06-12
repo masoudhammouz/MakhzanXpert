@@ -23,9 +23,16 @@ function isAvailable(product) {
   return Boolean(product.isAvailable) && !isDraftProduct(product) && getSellableStock(product) > 0;
 }
 
+function getInventoryStock(product) {
+  if (product?.stock !== undefined && product?.stock !== null) {
+    return Number(product.stock || 0);
+  }
+  return Number(product?.quantity || 0);
+}
+
 function getStatus(product) {
   if (isDraftProduct(product)) return { label: 'Needs details', className: 'status-low-stock' };
-  const quantity = getSellableStock(product);
+  const quantity = getInventoryStock(product);
   if (!isAvailable(product)) return { label: 'Out of stock', className: 'status-unavailable' };
   if (quantity <= 3) return { label: 'Low stock', className: 'status-low-stock' };
   return { label: 'Available', className: 'status-available' };
@@ -72,9 +79,9 @@ function AdminInventory() {
 
   const summary = useMemo(() => {
     const totalProducts = products.length;
-    const totalStock = products.reduce((sum, product) => sum + Number(product.quantity || 0), 0);
-    const lowStockItems = products.filter((product) => Number(product.quantity || 0) > 0 && Number(product.quantity || 0) <= 3).length;
-    const outOfStockItems = products.filter((product) => !isAvailable(product) && !isDraftProduct(product)).length;
+    const totalStock = products.reduce((sum, product) => sum + getInventoryStock(product), 0);
+    const lowStockItems = products.filter((product) => getInventoryStock(product) > 0 && getInventoryStock(product) <= 3).length;
+    const outOfStockItems = products.filter((product) => getInventoryStock(product) === 0 && !isDraftProduct(product)).length;
     const needsDetailsItems = products.filter(isDraftProduct).length;
 
     return { totalProducts, totalStock, lowStockItems, outOfStockItems, needsDetailsItems };
@@ -305,7 +312,7 @@ function AdminInventory() {
                         <td>{product.size || '-'}</td>
                         <td>{product.color || '-'}</td>
                         <td>{formatCurrency(product.price)}</td>
-                        <td>{Number(product.quantity || 0)}</td>
+                        <td>{getInventoryStock(product)}</td>
                         <td>{getSellableStock(product)}</td>
                         <td>{product.location || 'Unassigned'}</td>
                         <td>

@@ -3,7 +3,6 @@ import { useNavigate } from 'react-router-dom';
 import { collection, limit, onSnapshot, orderBy, query } from 'firebase/firestore';
 import { useAuth } from '../../context/AuthContext.jsx';
 import { db } from '../../firebase/firebase.js';
-import seedProducts, { resetProducts } from '../../utils/seedProducts.js';
 
 function formatActivityDate(value) {
   const timestamp = value?.toMillis ? value.toMillis() : 0;
@@ -32,12 +31,9 @@ function getCommandStatusClass(status) {
 }
 
 function AdminDashboard() {
-  const { currentUser, logout } = useAuth();
+  const { logout } = useAuth();
   const navigate = useNavigate();
   const [error, setError] = useState('');
-  const [seedMessage, setSeedMessage] = useState('');
-  const [seeding, setSeeding] = useState(false);
-  const [resetting, setResetting] = useState(false);
   const [latestReading, setLatestReading] = useState(null);
   const [lastActivity, setLastActivity] = useState(null);
   const [latestCommand, setLatestCommand] = useState(null);
@@ -92,36 +88,6 @@ function AdminDashboard() {
     }
   };
 
-  const handleSeedProducts = async () => {
-    setSeedMessage('');
-    setError('');
-    setSeeding(true);
-
-    try {
-      await seedProducts(db);
-      setSeedMessage('Sample products seeded successfully. Refresh the products page to view them.');
-    } catch {
-      setError('Unable to seed sample products. Please check Firestore configuration.');
-    } finally {
-      setSeeding(false);
-    }
-  };
-
-  const handleResetProducts = async () => {
-    setSeedMessage('');
-    setError('');
-    setResetting(true);
-
-    try {
-      await resetProducts(db);
-      setSeedMessage('Sample products reset successfully. Product catalog is now cleared.');
-    } catch {
-      setError('Unable to reset products. Please check Firestore configuration.');
-    } finally {
-      setResetting(false);
-    }
-  };
-
   return (
     <div className="admin-dashboard-page">
       <section className="dashboard-hero card admin-dashboard-hero">
@@ -139,7 +105,6 @@ function AdminDashboard() {
       </section>
 
       {error && <div className="error-message">{error}</div>}
-      {seedMessage && <div className="success-message">{seedMessage}</div>}
 
       <div className="dashboard-grid admin-metrics-grid">
         <article className="metric-card admin-metric-card">
@@ -253,17 +218,6 @@ function AdminDashboard() {
             <span>Yesterday</span>
             <p>Admin signed in from trusted device.</p>
           </div>
-        </div>
-      </section>
-
-      <section className="card admin-dashboard-footer">
-        <div className="dashboard-actions">
-          <button className="button-primary" type="button" onClick={handleSeedProducts} disabled={seeding || resetting}>
-            {seeding ? 'Seeding…' : 'Seed Products'}
-          </button>
-          <button className="button-secondary" type="button" onClick={handleResetProducts} disabled={seeding || resetting}>
-            {resetting ? 'Resetting…' : 'Reset Products'}
-          </button>
         </div>
       </section>
     </div>
