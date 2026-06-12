@@ -5,17 +5,19 @@ import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
 
 const WAREHOUSE_GRID = [
-  [18, 17, 16, 15, 14, 13],
-  [12, 11, 10, 9, 8, 7],
-  [6, 5, 4, 3, 2, 1],
+  [9, 8, 7],
+  [6, 5, 4],
+  [3, 2, 1],
 ];
 
-const TOTAL_POSITIONS = 18;
+const TOTAL_LOCATIONS = 9;
+const TOTAL_MOVEMENT_POINTS = 18;
 
 const DEFAULT_SYSTEM_SETTINGS = {
   sortingMode: 'brand',
   priority: ['brand'],
-  totalPositions: TOTAL_POSITIONS,
+  totalLocations: TOTAL_LOCATIONS,
+  totalPositions: TOTAL_MOVEMENT_POINTS,
   commandType: 'GO',
 };
 
@@ -69,7 +71,7 @@ function AdminLocations() {
   const initializeWarehouse = async () => {
     await setDoc(doc(db, 'settings', 'system'), DEFAULT_SYSTEM_SETTINGS, { merge: true });
 
-    const writes = Array.from({ length: TOTAL_POSITIONS }, async (_, index) => {
+    const writes = Array.from({ length: TOTAL_LOCATIONS }, async (_, index) => {
       const position = index + 1;
       const locationRef = doc(db, 'locations', String(position));
       const locationSnapshot = await getDoc(locationRef);
@@ -124,7 +126,7 @@ function AdminLocations() {
     locations.forEach((location) => {
       map.set(Number(location.position || location.id), location);
     });
-    for (let id = 1; id <= TOTAL_POSITIONS; id += 1) {
+    for (let id = 1; id <= TOTAL_LOCATIONS; id += 1) {
       if (!map.has(id)) map.set(id, createEmptyLocation(id));
     }
     return map;
@@ -133,7 +135,7 @@ function AdminLocations() {
   const summary = useMemo(() => {
     const currentLocations = Array.from(locationsById.values());
     return {
-      total: TOTAL_POSITIONS,
+      total: TOTAL_LOCATIONS,
       full: currentLocations.filter((location) => location.status === 'full' || location.isOccupied).length,
       empty: currentLocations.filter((location) => location.status !== 'full' && !location.isOccupied).length,
     };
@@ -159,7 +161,7 @@ function AdminLocations() {
         <div>
           <p className="section-eyebrow">Warehouse structure</p>
           <h1>Positions Management</h1>
-          <p>Prepare the 18-position warehouse layer for GO commands.</p>
+          <p>Prepare the 9 physical warehouse locations for GO movement commands.</p>
         </div>
         <button className="button button-primary" type="button" onClick={handleSeedLocations} disabled={seeding}>
           {seeding ? 'Seeding...' : 'Seed Locations'}
@@ -185,8 +187,8 @@ function AdminLocations() {
         <div className="locations-toolbar">
           <div className="warehouse-command-preview" aria-label="Future ESP command examples">
             <p className="spec-label">Future command structure</p>
-            <code>{'{ type: "GO", position: 4, arduinoCommand: "GO 4" }'}</code>
-            <code>{'{ type: "GO", position: 18, arduinoCommand: "GO 18" }'}</code>
+            <code>{'Location 1: IN GO 1 / OUT GO 2'}</code>
+            <code>{'Location 9: IN GO 17 / OUT GO 18'}</code>
           </div>
         </div>
 

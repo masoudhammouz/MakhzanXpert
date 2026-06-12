@@ -10,6 +10,10 @@ const ORDER_STATUSES = ['pending', 'preparing', 'retrieving', 'ready', 'complete
 const STATUS_FLOW = ['pending', 'preparing', 'retrieving', 'ready', 'completed'];
 const ESP_DEVICE_ID = 'esp-main-01';
 
+function physicalLocationToOutMovement(locationNumber) {
+  return locationNumber * 2;
+}
+
 const SAMPLE_ORDERS = [
   {
     id: 'sample-1001',
@@ -210,10 +214,11 @@ function AdminOrders() {
           continue;
         }
 
-        const position = Number(storedPosition.position || storedPosition.id);
+        const physicalLocation = Number(storedPosition.position || storedPosition.id);
+        const position = physicalLocationToOutMovement(physicalLocation);
 
-        if (!Number.isInteger(position) || position < 1 || position > 18) {
-          missingItems.push(`${[item.brand, item.model || item.name, item.color, item.size].filter(Boolean).join(' ')} has invalid position ${position || '-'}`);
+        if (!Number.isInteger(physicalLocation) || physicalLocation < 1 || physicalLocation > 9) {
+          missingItems.push(`${[item.brand, item.model || item.name, item.color, item.size].filter(Boolean).join(' ')} has invalid location ${physicalLocation || '-'}`);
           continue;
         }
 
