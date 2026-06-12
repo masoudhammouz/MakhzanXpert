@@ -6,11 +6,13 @@ import LoadingState from '../../components/LoadingState.jsx';
 import placeholderImage from '../../assets/placeholder-shoe.svg';
 import { db } from '../../firebase/firebase.js';
 import { formatCurrency } from '../../utils/formatCurrency.js';
+import { getSellableStock, isDraftProduct } from '../../utils/productVisibility.js';
 
 const AVAILABILITY_OPTIONS = [
   { label: 'All', value: 'all' },
   { label: 'Available', value: 'available' },
   { label: 'Out of stock', value: 'out-of-stock' },
+  { label: 'Needs details', value: 'needs-details' },
 ];
 
 function getProductTitle(product) {
@@ -18,11 +20,12 @@ function getProductTitle(product) {
 }
 
 function isAvailable(product) {
-  return Boolean(product.isAvailable) && Number(product.quantity || 0) > 0;
+  return Boolean(product.isAvailable) && !isDraftProduct(product) && getSellableStock(product) > 0;
 }
 
 function getStatus(product) {
-  const quantity = Number(product.quantity || 0);
+  if (isDraftProduct(product)) return { label: 'Needs details', className: 'status-low-stock' };
+  const quantity = getSellableStock(product);
   if (!isAvailable(product)) return { label: 'Out of stock', className: 'status-unavailable' };
   if (quantity <= 3) return { label: 'Low stock', className: 'status-low-stock' };
   return { label: 'Available', className: 'status-available' };
@@ -71,9 +74,10 @@ function AdminInventory() {
     const totalProducts = products.length;
     const totalStock = products.reduce((sum, product) => sum + Number(product.quantity || 0), 0);
     const lowStockItems = products.filter((product) => Number(product.quantity || 0) > 0 && Number(product.quantity || 0) <= 3).length;
-    const outOfStockItems = products.filter((product) => !isAvailable(product)).length;
+    const outOfStockItems = products.filter((product) => !isAvailable(product) && !isDraftProduct(product)).length;
+    const needsDetailsItems = products.filter(isDraftProduct).length;
 
-    return { totalProducts, totalStock, lowStockItems, outOfStockItems };
+    return { totalProducts, totalStock, lowStockItems, outOfStockItems, needsDetailsItems };
   }, [products]);
 
   const filteredProducts = useMemo(() => {
@@ -98,7 +102,8 @@ function AdminInventory() {
       const matchesAvailability =
         availabilityFilter === 'all' ||
         (availabilityFilter === 'available' && isAvailable(product)) ||
-        (availabilityFilter === 'out-of-stock' && !isAvailable(product));
+        (availabilityFilter === 'out-of-stock' && !isAvailable(product) && !isDraftProduct(product)) ||
+        (availabilityFilter === 'needs-details' && isDraftProduct(product));
 
       return matchesSearch && matchesCategory && matchesBrand && matchesAvailability;
     });
@@ -154,6 +159,10 @@ function AdminInventory() {
         <article className="admin-summary-card">
           <p className="metric-label">Out of Stock Items</p>
           <p className="metric-value">{summary.outOfStockItems}</p>
+        </article>
+        <article className="admin-summary-card">
+          <p className="metric-label">Needs Details</p>
+          <p className="metric-value">{summary.needsDetailsItems}</p>
         </article>
       </section>
 
@@ -217,6 +226,7 @@ function AdminInventory() {
                     <th>Color</th>
                     <th>Price</th>
                     <th>Quantity</th>
+                    <th>Available</th>
                     <th>Location</th>
                     <th>Status</th>
                     <th>Actions</th>
@@ -247,6 +257,7 @@ function AdminInventory() {
                         <td>{product.color || '-'}</td>
                         <td>{formatCurrency(product.price)}</td>
                         <td>{Number(product.quantity || 0)}</td>
+                        <td>{getSellableStock(product)}</td>
                         <td>{product.location || 'Unassigned'}</td>
                         <td>
                           <span className={`status-badge ${status.className}`}>{status.label}</span>

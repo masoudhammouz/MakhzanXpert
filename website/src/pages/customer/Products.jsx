@@ -7,6 +7,7 @@ import ProductCard from '../../components/ProductCard.jsx';
 import SearchBar from '../../components/SearchBar.jsx';
 import SectionHeader from '../../components/SectionHeader.jsx';
 import { db } from '../../firebase/firebase.js';
+import { getSellableStock, isCustomerVisibleProduct } from '../../utils/productVisibility.js';
 
 const PRODUCT_CATEGORIES = ['Sneakers', 'Running', 'Casual', 'Boots', 'Sandals'];
 
@@ -17,7 +18,7 @@ function getCreatedAtValue(product) {
 }
 
 function isProductAvailable(product) {
-  return Boolean(product.isAvailable) && Number(product.quantity || 0) > 0;
+  return isCustomerVisibleProduct(product);
 }
 
 function getProductTitle(product) {
@@ -48,7 +49,9 @@ function Products() {
       try {
         const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
         const snapshot = await getDocs(productsQuery);
-        const items = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+        const items = snapshot.docs
+          .map((doc) => ({ id: doc.id, ...doc.data() }))
+          .filter(isCustomerVisibleProduct);
         setProducts(items);
       } catch (fetchError) {
         setError('Unable to load products. Please try again later.');
@@ -87,7 +90,7 @@ function Products() {
     if (availabilityFilter === 'available') {
       result = result.filter(isProductAvailable);
     } else if (availabilityFilter === 'out-of-stock') {
-      result = result.filter((product) => !isProductAvailable(product));
+      result = result.filter((product) => getSellableStock(product) <= 0);
     }
 
     if (sortBy === 'price-low') {

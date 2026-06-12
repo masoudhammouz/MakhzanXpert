@@ -35,6 +35,7 @@ function createEmptyLocation(position) {
 
 function getLocationStatus(location) {
   if (location?.status === 'full' || location?.isOccupied) return { label: 'Full', className: 'location-occupied' };
+  if (location?.status === 'reserved') return { label: 'Reserved', className: 'location-reserved' };
   return { label: 'Empty', className: 'location-empty' };
 }
 
@@ -137,7 +138,8 @@ function AdminLocations() {
     return {
       total: TOTAL_LOCATIONS,
       full: currentLocations.filter((location) => location.status === 'full' || location.isOccupied).length,
-      empty: currentLocations.filter((location) => location.status !== 'full' && !location.isOccupied).length,
+      reserved: currentLocations.filter((location) => location.status === 'reserved').length,
+      empty: currentLocations.filter((location) => !['full', 'reserved'].includes(location.status) && !location.isOccupied).length,
     };
   }, [locationsById]);
 
@@ -176,6 +178,10 @@ function AdminLocations() {
         <article className="admin-summary-card">
           <p className="metric-label">Full</p>
           <p className="metric-value">{summary.full}</p>
+        </article>
+        <article className="admin-summary-card">
+          <p className="metric-label">Reserved</p>
+          <p className="metric-value">{summary.reserved}</p>
         </article>
         <article className="admin-summary-card">
           <p className="metric-label">Empty</p>

@@ -1,13 +1,14 @@
 import { Link } from 'react-router-dom';
 import placeholderImage from '../assets/placeholder-shoe.svg';
 import { formatCurrency } from '../utils/formatCurrency.js';
+import { isCustomerPurchasableProduct } from '../utils/productVisibility.js';
 
 function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
 }
 
 function isProductAvailable(product) {
-  return Boolean(product.isAvailable) && Number(product.quantity || 0) > 0;
+  return isCustomerPurchasableProduct(product);
 }
 
 export default function ProductCard({ product }) {

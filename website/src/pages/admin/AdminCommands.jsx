@@ -47,6 +47,7 @@ function formatDate(value) {
 function getCommandStatusClass(status) {
   const normalizedStatus = String(status || '').toLowerCase();
   if (normalizedStatus === 'sent_to_arduino') return 'command-status-executing';
+  if (normalizedStatus === 'running') return 'command-status-executing';
   if (['done', 'executed'].includes(normalizedStatus)) return 'command-status-completed';
   if (normalizedStatus === 'failed') return 'command-status-failed';
   if (normalizedStatus === 'error') return 'command-status-failed';
@@ -113,7 +114,7 @@ function AdminCommands() {
         <div>
           <p className="section-eyebrow">Warehouse commands</p>
           <h1>Commands</h1>
-          <p>Create ESP-compatible pending command documents for warehouse hardware.</p>
+          <p>Create pending manual GO documents for Raspberry Pi to execute through the ESP32 bridge.</p>
         </div>
       </section>
 
@@ -142,7 +143,7 @@ function AdminCommands() {
         <div className="section-header">
           <div>
             <h2>Direct Lifter Position Control</h2>
-            <p>Send GO 1 through GO 18 commands to {ESP_DEVICE_ID}.</p>
+            <p>Send GO 1 through GO 18 test commands. These are movement positions, not storage locations.</p>
           </div>
         </div>
 

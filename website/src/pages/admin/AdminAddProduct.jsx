@@ -1,8 +1,9 @@
-import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
+import { doc, serverTimestamp, setDoc } from 'firebase/firestore';
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ProductForm from '../../components/ProductForm.jsx';
 import { db } from '../../firebase/firebase.js';
+import { buildNormalizedSku } from '../../utils/productVisibility.js';
 
 function AdminAddProduct() {
   const navigate = useNavigate();
@@ -14,11 +15,13 @@ function AdminAddProduct() {
     setError('');
 
     try {
-      await addDoc(collection(db, 'products'), {
+      const normalizedSku = product.normalizedSku || buildNormalizedSku(product);
+      await setDoc(doc(db, 'products', normalizedSku), {
         ...product,
+        normalizedSku,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      });
+      }, { merge: true });
       navigate('/admin/inventory');
     } catch {
       setError('Unable to add product. Please try again.');

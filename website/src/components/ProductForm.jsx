@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { buildNormalizedSku } from '../utils/productVisibility.js';
 
 const PRODUCT_CATEGORIES = ['Sneakers', 'Running', 'Casual', 'Boots', 'Sandals'];
 
@@ -15,6 +16,8 @@ const EMPTY_PRODUCT = {
   imageUrl: '',
   description: '',
   isAvailable: true,
+  status: 'active',
+  needsDetails: false,
 };
 
 function normalizeInitialProduct(product) {
@@ -24,12 +27,18 @@ function normalizeInitialProduct(product) {
     price: product?.price ?? '',
     quantity: product?.quantity ?? '',
     isAvailable: product?.isAvailable ?? Number(product?.quantity || 0) > 0,
+    status: product?.status ?? (product?.needsDetails ? 'pending_details' : 'active'),
+    needsDetails: Boolean(product?.needsDetails),
   };
 }
 
 function validateProduct(values) {
   const errors = {};
-  const requiredFields = ['brand', 'model', 'category', 'size', 'color', 'price', 'quantity'];
+  const requiredFields = ['brand', 'model', 'size', 'color', 'quantity'];
+
+  if (values.isAvailable) {
+    requiredFields.push('category', 'price');
+  }
 
   requiredFields.forEach((field) => {
     if (values[field] === '' || values[field] === null || values[field] === undefined) {
@@ -40,7 +49,7 @@ function validateProduct(values) {
   const price = Number(values.price);
   const quantity = Number(values.quantity);
 
-  if (values.price !== '' && Number.isNaN(price)) {
+  if (values.price !== '' && values.price !== null && Number.isNaN(price)) {
     errors.price = 'Price must be a number';
   }
 
@@ -81,15 +90,19 @@ function ProductForm({ initialProduct, mode = 'add', onSubmit, saving = false, e
     await onSubmit({
       brand: values.brand.trim(),
       model: values.model.trim(),
-      category: values.category,
+      category: values.category.trim(),
       size: values.size.trim(),
       color: values.color.trim(),
-      price: Number(values.price),
+      price: values.price === '' || values.price === null ? null : Number(values.price),
       quantity: Number(values.quantity),
       location: values.location.trim(),
       imageUrl: values.imageUrl.trim(),
       description: values.description.trim(),
       isAvailable: Boolean(values.isAvailable) && Number(values.quantity) > 0,
+      normalizedSku: buildNormalizedSku(values),
+      status: values.isAvailable ? 'active' : 'pending_details',
+      needsDetails: !values.isAvailable,
+      createdFromLabel: Boolean(values.createdFromLabel),
     });
   };
 
@@ -122,6 +135,7 @@ function ProductForm({ initialProduct, mode = 'add', onSubmit, saving = false, e
           <label>
             Category
             <select name="category" value={values.category} onChange={handleChange}>
+              <option value="">Select category</option>
               {PRODUCT_CATEGORIES.map((category) => (
                 <option key={category} value={category}>{category}</option>
               ))}
@@ -172,6 +186,13 @@ function ProductForm({ initialProduct, mode = 'add', onSubmit, saving = false, e
             <input name="isAvailable" type="checkbox" checked={values.isAvailable} onChange={handleChange} />
             Available for customers
           </label>
+
+          {values.needsDetails && (
+            <div className="admin-form-wide pending-details-note">
+              <strong>Needs details</strong>
+              <span>Complete price, category, images, and description before making it available for customers.</span>
+            </div>
+          )}
         </div>
 
         {hasPreview && (

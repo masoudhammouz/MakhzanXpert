@@ -40,7 +40,7 @@ function AdminLayout() {
               className={({ isActive }) => (isActive ? 'admin-sidebar-link active' : 'admin-sidebar-link')}
             >
               {link.label}
-              {!['Dashboard', 'Inventory', 'Orders', 'Locations', 'Commands', 'Sensors', 'Live Activity'].includes(link.label) && <span>Placeholder</span>}
+              {!['Dashboard', 'Inventory', 'Orders', 'Locations', 'Commands', 'Sensors', 'Live Activity', 'Control Panel'].includes(link.label) && <span>Placeholder</span>}
             </NavLink>
           ))}
         </nav>

@@ -2,269 +2,150 @@
 
 ## Overview
 
-MakhzanXpert uses Firebase Firestore as the website command/status bus, and the ESP32 as the hardware bridge.
+MakhzanXpert now uses the Raspberry Pi as the local controller and source of truth for placement, retrieval, and queues.
 
 ```text
-Website (React + Firebase)
-            |
-            v
-Firebase Firestore
-            |
-            v
-ESP32 bridge
-            |
-            v
-Arduino Mega over UART
+Website -> Firebase Firestore -> Raspberry Pi
+                                  |
+                                  v
+                              ESP32 /go
+                                  |
+                                  v
+                         Arduino Mega over UART
 ```
 
-Additional input path:
+Return/status path:
 
 ```text
-Raspberry Pi OCR -> ESP32 HTTP label endpoint -> Firebase/Arduino Mega
+Arduino Mega -> ESP32 -> Raspberry Pi -> SQLite/Firebase -> Website
+Arduino sensor JSON -> ESP32 -> Firebase -> Website
 ```
 
-Return path:
+## Responsibilities
 
-```text
-Arduino Mega -> ESP32 -> Firebase Firestore -> Website
-```
+### Website / Firebase
 
-## Repository Structure
+- Admin settings and monitoring.
+- Inventory and physical location display.
+- Manual GO command history.
+- Pick request creation.
+- Queue/status/activity visibility.
 
-```text
-arduino/
-  mega_controller.ino
+Important collections/documents:
 
-esp32/
-  esp32_firebase_bridge.ino
-
-raspberry/
-  raspberry_ocr_firebase.py
-
-website/
-  React/Vite/Firebase application
-
-docs/
-  system documentation
-```
-
-The ESP32, Arduino Mega, and Raspberry Pi OCR source files are now included.
-
-## Website Responsibilities
-
-The website is a React/Vite app using Firebase Auth and Firestore.
-
-Primary responsibilities:
-
-- Customer product browsing and checkout.
-- Admin authentication.
-- Product inventory management.
-- Order management.
-- Warehouse physical location initialization and display.
-- Manual command creation.
-- Sensor and device monitoring.
-- System activity display.
-
-Important website files:
-
-- `website/src/firebase/firebase.js`: initializes Firebase app, Auth, and Firestore.
-- `website/src/firebase/firebaseConfig.js`: Firebase project config for `makhzanxpert`.
-- `website/src/pages/admin/AdminCommands.jsx`: creates and displays command documents.
-- `website/src/pages/admin/AdminLocations.jsx`: initializes `settings/system` and physical `locations/1` through `locations/9`.
-- `website/src/pages/admin/AdminOrders.jsx`: creates warehouse movement commands from orders.
-- `website/src/pages/admin/AdminSensors.jsx`: reads `sensorReadings`, `devices`, and `systemActivity`.
-- `website/src/pages/admin/AdminDashboard.jsx`: reads latest sensor, activity, and command summaries.
-- `website/src/pages/customer/Checkout.jsx`: writes customer `orders`.
-
-## Firebase Responsibilities
-
-Firestore is the shared state and message layer.
-
-Current collections/documents used by website code:
-
-- `commands`
-- `locations`
 - `settings/system`
+- `locations/1` through `locations/9`
+- `scans`
+- `storeQueue`
+- `pickQueue`
+- `pickRequests`
+- `commands`
+- `activityLog`
+- `systemActivity`
 - `sensorReadings`
 - `devices`
-- `systemActivity`
-- `orders`
-- `products`
 
-Previously observed or requested but not currently used consistently:
+### Raspberry Pi
 
-- `activityLog`
-- `scans`
+The Raspberry Pi is the main brain of the warehouse system.
 
-## ESP32 Responsibilities
+- Runs camera OCR with the existing quality pipeline.
+- Keeps SQLite as the local source of truth.
+- Initializes 9 physical locations.
+- Reads `settings/system` from Firebase on startup.
+- Selects only empty storage locations and reserves them immediately.
+- Converts physical locations to movement positions:
+  - IN: `location_id * 2 - 1`
+  - OUT: `location_id * 2`
+- Manages `store_queue` and `pick_queue`.
+- Sends `GET http://<esp32-ip>/go?position=X&source=raspberry&queueId=Y`.
+- Syncs scans, queue status, inventory boxes, and locations to Firebase.
+- Polls `pickRequests` and turns matching boxes into pick tasks.
+- Polls manual `commands` documents so the Commands page can still test `GO 1` through `GO 18`.
 
-The ESP32 implementation in `esp32/esp32_firebase_bridge.ino` currently:
+SQLite tables:
 
-- Queries Firestore for pending commands:
+- `locations`
+- `boxes`
+- `store_queue`
+- `pick_queue`
+- `settings`
 
-```text
-commands where:
-  status == "pending"
-  deviceId == "esp-main-01"
-  type == "GO"
-```
+### ESP32
 
-- Reads movement `position`.
-- Builds UART command `GO X`.
-- Sends `GO X` to Arduino Mega over Serial2.
-- Marks command `status` as `sent_to_arduino` after sending.
-- Waits for Arduino response.
-- Marks command `status` as `done` when Arduino returns `DONE` or `DONE:X`.
-- Marks command `status` as `error` with `errorMessage` on timeout or Arduino error.
-- Updates the matching physical `locations/<1..9>` document after successful completion when the command contains product label data.
-- Writes device heartbeat/status into `devices/esp-main-01`.
-- Writes sensor readings into `sensorReadings`.
-- Exposes `POST /raspberry-label` for Raspberry Pi OCR.
-- Receives label data from Raspberry, reads Firestore settings/locations, chooses a free physical location, then converts that location to an IN movement command.
+The ESP32 is now a local HTTP-to-Serial bridge.
 
-## Location And Movement Model
+- Exposes `GET /go?position=X&source=raspberry&queueId=Y`.
+- Validates `position` is 1-18.
+- Sends `GO X` to Arduino Mega over `Serial2`.
+- Waits for `DONE`, `DONE:X`, or `ERROR:message`.
+- Returns JSON to Raspberry:
+  - `{"ok":true,"position":X}`
+  - `{"ok":false,"error":"message"}`
+- Writes device status and activity logs to Firebase when available.
+- Uploads Arduino sensor JSON to `sensorReadings`.
 
-The physical warehouse has 9 storage locations. Firestore `locations` documents represent these physical locations only:
+The ESP32 no longer selects locations and no longer treats labels as placement requests.
 
-```text
-locations/1
-locations/2
-...
-locations/9
-```
+### Arduino Mega
 
-Each physical location has two movement points:
+The Arduino Mega is mechanical control only.
 
-```text
-Location 1: IN = GO 1,  OUT = GO 2
-Location 2: IN = GO 3,  OUT = GO 4
-Location 3: IN = GO 5,  OUT = GO 6
-Location 4: IN = GO 7,  OUT = GO 8
-Location 5: IN = GO 9,  OUT = GO 10
-Location 6: IN = GO 11, OUT = GO 12
-Location 7: IN = GO 13, OUT = GO 14
-Location 8: IN = GO 15, OUT = GO 16
-Location 9: IN = GO 17, OUT = GO 18
-```
-
-Odd movement positions are IN movements. Even movement positions are OUT movements.
-
-## Arduino Mega Responsibilities
-
-The Arduino Mega implementation in `arduino/mega_controller.ino` currently:
-
-- Receives plain serial commands from ESP32 over `Serial1`.
-- Accepts the unified movement command language:
+Accepted commands:
 
 ```text
 GO 1
 GO 2
 ...
 GO 18
+HOME
+STATUS
+B
 ```
 
-- Executes the corresponding motor/lifter movement.
-- Replies with:
-
-```text
-DONE
-```
-
-or:
+Movement responses:
 
 ```text
 DONE:X
+ERROR:message
 ```
 
-or an error response if movement fails.
+## Physical Model
 
-## Raspberry Pi Responsibilities
-
-The Raspberry Pi implementation in `raspberry/raspberry_ocr_firebase.py` currently:
-
-- Read shoe labels through camera/OCR.
-- Determine brand/model/color/size.
-- Send only the confirmed OCR label directly to ESP32.
-- Never read or write Firebase.
-- Never select a target position.
-- Never send `GO X` directly.
-
-```json
-{
-  "brand": "...",
-  "model": "...",
-  "color": "...",
-  "size": "...",
-  "source": "raspberry"
-}
-```
-
-- Append local OCR/scan records into `raspberry_scans.jsonl`.
-- Never talk directly to Arduino Mega.
-
-## Sensor Flow
-
-Current website reads:
-
-- `sensorReadings`, ordered by `createdAt` descending.
-- `devices`.
-- `systemActivity`.
-
-Expected hardware flow:
+There are 9 real storage locations and 18 movement positions.
 
 ```text
-Arduino sensors or ESP32 sensors
-        |
-        v
-ESP32
-        |
-        v
-Firestore sensorReadings/devices
-        |
-        v
-Website dashboard/sensors page
+Location 1: GO 1 = IN,  GO 2 = OUT
+Location 2: GO 3 = IN,  GO 4 = OUT
+Location 3: GO 5 = IN,  GO 6 = OUT
+Location 4: GO 7 = IN,  GO 8 = OUT
+Location 5: GO 9 = IN,  GO 10 = OUT
+Location 6: GO 11 = IN, GO 12 = OUT
+Location 7: GO 13 = IN, GO 14 = OUT
+Location 8: GO 15 = IN, GO 16 = OUT
+Location 9: GO 17 = IN, GO 18 = OUT
 ```
 
-Known `sensorReadings` fields from current website and live inspection:
+Warehouse layout:
 
-- `temperature`
-- `humidity`
-- `mq3`
-- `mq135`
-- `waterValue`
-- `waterDetected`
-- `waterStatus`
-- `motion`
-- `motionStatus`
-- `gasStatus`
-- `environmentStatus`
-- `dhtOk`
-- `deviceId`
-- `deviceName`
-- `createdAt`
-- `x`
-- `y`
-- `z`
-- `belt`
+```text
+9 8 7
+6 5 4
+3 2 1
+```
 
-## Current Risks
+Neighbor map:
 
-- Raspberry and website now use different upstream paths: website creates Firestore command documents; Raspberry posts label data directly to ESP32.
-- Existing live Firestore data may still contain old command documents using older fields/names.
-- Activity naming is inconsistent: website uses `systemActivity`, while previous requirements referenced `activityLog`.
-- Location naming is partly legacy in UI/CSS (`locations`, `warehouse-location-card`), but Firestore locations now mean physical locations 1-9.
-- Sensor page polls `sensorReadings` and `devices` every 5 seconds with `getDocs`, which can become a Firestore read bottleneck.
-- Raspberry HTTP requests block while ESP32 waits for Arduino `DONE:X`, so the Raspberry request timeout must cover the real movement duration.
-- Prototype IR placement verification only exists for physical locations 7, 8, and 9. Locations 1 through 6 rely on Arduino `DONE:X`.
-- ESP32 currently updates warehouse location state after OCR placement, but it does not increase matching `products` stock/quantity. The required stock update should match by `brand + model + color + size`.
-- Belt relay behavior is currently toggle-based. `BELT_START` and `BELT_STOP` should remain labels unless deterministic relay state logic is designed.
+```text
+1: [2,4]
+2: [1,3,5]
+3: [2,6]
+4: [1,5,7]
+5: [2,4,6,8]
+6: [3,5,9]
+7: [4,8]
+8: [5,7,9]
+9: [6,8]
+```
 
-## Recommended Improvements
-
-- Compile and validate ESP32 and Arduino firmware on their target boards.
-- Define one shared protocol document and keep it versioned.
-- Add Firestore security rules and indexes documentation.
-- Add migration/cleanup script for old `commands` documents.
-- Prefer real-time listeners for device/sensor views where practical.
-- Add a small shared constants file for website command statuses and Firestore field names.
-- Consider moving Raspberry HTTP handling to a non-blocking ESP32 command queue if long hardware movements cause client timeouts.
+`GO 1` through `GO 18` are movement positions, not warehouse locations.

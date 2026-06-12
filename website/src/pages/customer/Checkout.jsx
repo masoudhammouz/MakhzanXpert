@@ -4,6 +4,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useCart } from '../../context/CartContext.jsx';
 import { db } from '../../firebase/firebase.js';
 import { formatCurrency } from '../../utils/formatCurrency.js';
+import { getSellableStock, isCustomerPurchasableProduct } from '../../utils/productVisibility.js';
 
 function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
@@ -72,7 +73,12 @@ function Checkout() {
             throw new Error(`${getProductTitle(cartItem)} is no longer available.`);
           }
 
-          const currentQuantity = Number(snapshot.data().quantity || 0);
+          const productData = { id: snapshot.id, ...snapshot.data() };
+          if (!isCustomerPurchasableProduct(productData)) {
+            throw new Error(`${getProductTitle(cartItem)} is not available for checkout.`);
+          }
+
+          const currentQuantity = getSellableStock(productData);
           const orderedQuantity = Number(cartItem.quantity || 0);
           if (currentQuantity < orderedQuantity) {
             throw new Error(`Only ${currentQuantity} left for ${getProductTitle(cartItem)}.`);
@@ -96,11 +102,13 @@ function Checkout() {
 
         productSnapshots.forEach((snapshot, index) => {
           const cartItem = items[index];
-          const currentQuantity = Number(snapshot.data().quantity || 0);
+          const productData = { id: snapshot.id, ...snapshot.data() };
+          const currentQuantity = getSellableStock(productData);
           const orderedQuantity = Number(cartItem.quantity || 0);
           const nextQuantity = currentQuantity - orderedQuantity;
+          const stockField = productData.availableStock === undefined || productData.availableStock === null ? 'quantity' : 'availableStock';
           transaction.update(productRefs[index], {
-            quantity: increment(-orderedQuantity),
+            [stockField]: increment(-orderedQuantity),
             isAvailable: nextQuantity > 0,
             updatedAt: serverTimestamp(),
           });

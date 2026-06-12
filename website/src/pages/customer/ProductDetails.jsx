@@ -8,13 +8,14 @@ import placeholderImage from '../../assets/placeholder-shoe.svg';
 import { formatCurrency } from '../../utils/formatCurrency.js';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useCart } from '../../context/CartContext.jsx';
+import { getSellableStock, isCustomerPurchasableProduct, isCustomerVisibleProduct } from '../../utils/productVisibility.js';
 
 function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
 }
 
 function isProductAvailable(product) {
-  return Boolean(product.isAvailable) && Number(product.quantity || 0) > 0;
+  return isCustomerPurchasableProduct(product);
 }
 
 export default function ProductDetails() {
@@ -43,8 +44,11 @@ export default function ProductDetails() {
 
         const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
         const productsSnap = await getDocs(productsQuery);
-        setProduct({ id: productSnap.id, ...productSnap.data() });
-        setAllProducts(productsSnap.docs.map((item) => ({ id: item.id, ...item.data() })));
+        const loadedProduct = { id: productSnap.id, ...productSnap.data() };
+        setProduct(isCustomerVisibleProduct(loadedProduct) ? loadedProduct : null);
+        setAllProducts(productsSnap.docs
+          .map((item) => ({ id: item.id, ...item.data() }))
+          .filter(isCustomerVisibleProduct));
       } catch (err) {
         setError('Unable to load product.');
       } finally {
@@ -133,7 +137,7 @@ export default function ProductDetails() {
               </div>
               <div>
                 <p className="spec-label">Quantity available</p>
-                <p className="spec-value">{Number(product.quantity || 0)}</p>
+                <p className="spec-value">{getSellableStock(product)}</p>
               </div>
               <div>
                 <p className="spec-label">Availability</p>

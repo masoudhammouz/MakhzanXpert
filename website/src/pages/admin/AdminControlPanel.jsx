@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { collection, doc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
+import { addDoc, collection, doc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
 import { db } from '../../firebase/firebase.js';
 
 const SYSTEM_SETTINGS_REF = doc(db, 'settings', 'system');
@@ -16,6 +16,15 @@ const SORTING_OPTIONS = [
   { value: 'model_size', label: 'Model + Size' },
   { value: 'color_size', label: 'Color + Size' },
   { value: 'custom', label: 'Custom' },
+  { value: 'nearest_empty', label: 'Nearest Empty' },
+  { value: 'most_requested', label: 'Most Requested' },
+];
+
+const PICK_TYPES = [
+  { value: 'single', label: 'Box ID' },
+  { value: 'size', label: 'Size' },
+  { value: 'model', label: 'Model' },
+  { value: 'brand', label: 'Brand' },
 ];
 
 const DEFAULT_SETTINGS = {
@@ -93,6 +102,10 @@ function AdminControlPanel() {
   const [sortingMode, setSortingMode] = useState(DEFAULT_SETTINGS.sortingMode);
   const [locations, setLocations] = useState([]);
   const [latestScan, setLatestScan] = useState(null);
+  const [storeQueue, setStoreQueue] = useState([]);
+  const [pickQueue, setPickQueue] = useState([]);
+  const [pickType, setPickType] = useState('single');
+  const [pickValue, setPickValue] = useState('');
   const [firebaseOnline, setFirebaseOnline] = useState(false);
   const [saving, setSaving] = useState('');
   const [notice, setNotice] = useState('');
@@ -138,9 +151,25 @@ function AdminControlPanel() {
       () => setLatestScan(null),
     );
 
+    const storeQueueQuery = query(collection(db, 'storeQueue'), orderBy('updatedAt', 'desc'), limit(25));
+    const unsubscribeStoreQueue = onSnapshot(
+      storeQueueQuery,
+      (snapshot) => setStoreQueue(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+      () => setStoreQueue([]),
+    );
+
+    const pickQueueQuery = query(collection(db, 'pickQueue'), orderBy('updatedAt', 'desc'), limit(25));
+    const unsubscribePickQueue = onSnapshot(
+      pickQueueQuery,
+      (snapshot) => setPickQueue(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+      () => setPickQueue([]),
+    );
+
     return () => {
       unsubscribeLocations();
       unsubscribeScans();
+      unsubscribeStoreQueue();
+      unsubscribePickQueue();
     };
   }, []);
 
@@ -157,6 +186,18 @@ function AdminControlPanel() {
       empty: 9 - occupied,
     };
   }, [locations]);
+
+  const queueSummary = useMemo(() => {
+    const combined = [...storeQueue, ...pickQueue];
+    const countByStatus = (status) => combined.filter((item) => item.status === status).length;
+
+    return {
+      waiting: countByStatus('waiting'),
+      running: countByStatus('running'),
+      done: countByStatus('done'),
+      error: countByStatus('error'),
+    };
+  }, [pickQueue, storeQueue]);
 
   const updateSettings = async (updates, actionLabel) => {
     setSaving(actionLabel);
@@ -200,6 +241,36 @@ function AdminControlPanel() {
       lastControlAction: action,
       controlRequestedAt: serverTimestamp(),
     }, action.replaceAll('_', ' '));
+  };
+
+  const handlePickRequest = async (event) => {
+    event.preventDefault();
+    const trimmedValue = pickValue.trim();
+    if (!trimmedValue) {
+      setError('Enter a value for the pick request.');
+      return;
+    }
+
+    setSaving('Pick Request');
+    setError('');
+    setNotice('');
+
+    try {
+      await addDoc(collection(db, 'pickRequests'), {
+        requestType: pickType,
+        queryValue: trimmedValue,
+        status: 'waiting',
+        source: 'website',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      setPickValue('');
+      setNotice('Pick request sent to Raspberry Pi.');
+    } catch {
+      setError('Unable to create pick request.');
+    } finally {
+      setSaving('');
+    }
   };
 
   return (
@@ -338,6 +409,61 @@ function AdminControlPanel() {
         <Link className="button button-secondary control-view-locations" to="/admin/locations">
           View Locations
         </Link>
+      </section>
+
+      <section className="control-dashboard-grid">
+        <article className="control-card">
+          <div className="control-card-heading compact">
+            <h2>Queue Status</h2>
+          </div>
+          <div className="control-detail-grid">
+            <div>
+              <span>Waiting</span>
+              <strong>{queueSummary.waiting}</strong>
+            </div>
+            <div>
+              <span>Running</span>
+              <strong>{queueSummary.running}</strong>
+            </div>
+            <div>
+              <span>Done</span>
+              <strong>{queueSummary.done}</strong>
+            </div>
+            <div>
+              <span>Error</span>
+              <strong>{queueSummary.error}</strong>
+            </div>
+          </div>
+        </article>
+
+        <article className="control-card">
+          <div className="control-card-heading compact">
+            <h2>Pick Request</h2>
+          </div>
+          <form className="pick-request-form" onSubmit={handlePickRequest}>
+            <label className="control-field" htmlFor="pick-request-type">
+              <span>Request By</span>
+              <select id="pick-request-type" value={pickType} onChange={(event) => setPickType(event.target.value)}>
+                {PICK_TYPES.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+            <label className="control-field" htmlFor="pick-request-value">
+              <span>Value</span>
+              <input
+                id="pick-request-value"
+                value={pickValue}
+                onChange={(event) => setPickValue(event.target.value)}
+                placeholder={pickType === 'single' ? 'BOX-...' : `Enter ${pickType}`}
+                type="text"
+              />
+            </label>
+            <button className="button button-primary" type="submit" disabled={Boolean(saving)}>
+              Request Pick
+            </button>
+          </form>
+        </article>
       </section>
 
       <section className="control-dashboard-grid lower">

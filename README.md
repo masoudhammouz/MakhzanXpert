@@ -1,6 +1,6 @@
 # MakhzanXpert
 
-MakhzanXpert is a warehouse automation project with a React/Firebase website, an ESP32 bridge, an Arduino Mega motion controller, and a Raspberry Pi OCR station.
+MakhzanXpert is a warehouse automation project with a React/Firebase website, a Raspberry Pi OCR and queue controller, an ESP32 HTTP bridge, and an Arduino Mega mechanical controller.
 
 ## Repository Layout
 
@@ -20,20 +20,29 @@ MakhzanXpert/
     └── command_map.md
 ```
 
-The ESP32, Arduino Mega, and Raspberry Pi OCR source files are now included.
-
-## Current Architecture
+## Final Architecture
 
 ```text
-Website -> Firebase Firestore -> ESP32 bridge -> Arduino Mega over UART
-Raspberry Pi OCR -> ESP32 bridge HTTP label endpoint -> Firebase/Arduino Mega
+Website / Firebase -> Raspberry Pi -> ESP32 /go -> Arduino Mega
 ```
 
-Return path:
+The Raspberry Pi is the main brain:
 
-```text
-Arduino Mega -> ESP32 -> Firebase -> Website
-```
+- Runs camera OCR.
+- Uses SQLite as local source of truth.
+- Selects and reserves storage locations.
+- Manages store and pick queues.
+- Sends `GO 1` through `GO 18` to ESP32 over HTTP.
+- Syncs status, queues, scans, and inventory state to Firebase.
+
+The ESP32 is a bridge:
+
+- Receives `GET /go?position=X&source=raspberry&queueId=Y`.
+- Sends `GO X` to Arduino Mega over Serial2.
+- Waits for Arduino `DONE`, `DONE:X`, or `ERROR:message`.
+- Returns JSON to the Raspberry Pi.
+
+The Arduino Mega is mechanical only.
 
 ## Website
 
@@ -53,28 +62,26 @@ cd website
 npm run build
 ```
 
-## Main Firestore Collections
+## Firebase Collections
 
-- `commands`
-- `locations`
 - `settings/system`
+- `locations`
+- `scans`
+- `storeQueue`
+- `pickQueue`
+- `pickRequests`
+- `commands`
+- `inventory/boxes`
 - `sensorReadings`
 - `devices`
+- `activityLog`
 - `systemActivity`
 - `orders`
 - `products`
 
-More detail is documented in:
+## Movement Model
 
-- `docs/system_architecture.md`
-- `docs/communication_protocol.md`
-- `docs/command_map.md`
-
-## Current Command Direction
-
-The desired unified movement language is `GO 1` through `GO 18`.
-
-The physical warehouse has 9 storage locations. Each physical location has two movement points:
+There are 9 real storage locations and 18 movement positions.
 
 ```text
 Location 1: IN = GO 1,  OUT = GO 2
@@ -88,27 +95,10 @@ Location 8: IN = GO 15, OUT = GO 16
 Location 9: IN = GO 17, OUT = GO 18
 ```
 
-Website commands are represented in Firestore with:
+Do not treat `GO 1` through `GO 18` as warehouse locations. Warehouse locations are only `1` through `9`.
 
-```js
-{
-  type: "GO",
-  position: 1,
-  arduinoCommand: "GO 1",
-  status: "pending",
-  source: "website",
-  deviceId: "esp-main-01",
-  createdAt: serverTimestamp()
-}
-```
+More detail is in:
 
-## Important Notes
-
-- Movement points `1` through `18` are universal across Website, ESP32, and Arduino Mega.
-- Firebase `locations/1` through `locations/9` represent physical storage locations, not movement points.
-- The website currently creates `commands` documents from manual admin controls and order preparation.
-- ESP32 and Arduino implementations are included and follow the `GO 1` through `GO 18` command path.
-- Raspberry Pi no longer connects to Firebase directly and no longer chooses positions. It sends confirmed OCR labels to ESP32 with `POST /raspberry-label`; ESP32 reads Firebase locations/settings, selects a free position, then sends `GO X` to Arduino Mega.
-- Prototype IR placement verification exists only for physical locations 7, 8, and 9. Locations 1 through 6 are treated as successful when Arduino returns `DONE:X`.
-- The relay belt command is currently a hardware toggle. `BELT_START` and `BELT_STOP` should be treated as UI labels until deterministic relay state logic is designed and tested.
-- ESP32 updates warehouse `locations`, but it does not currently increase product stock/quantity in the `products` collection after OCR placement.
+- `docs/system_architecture.md`
+- `docs/communication_protocol.md`
+- `docs/command_map.md`
