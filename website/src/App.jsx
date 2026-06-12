@@ -18,6 +18,7 @@ import AdminLocations from './pages/admin/AdminLocations.jsx';
 import AdminCommands from './pages/admin/AdminCommands.jsx';
 import AdminSensors from './pages/admin/AdminSensors.jsx';
 import AdminLiveActivity from './pages/admin/AdminLiveActivity.jsx';
+import AdminControlPanel from './pages/admin/AdminControlPanel.jsx';
 import RequireAuth from './components/RequireAuth.jsx';
 
 function App() {
@@ -106,8 +107,15 @@ function App() {
             </RequireAuth>
           }
         />
+        <Route
+          path="control-panel"
+          element={
+            <RequireAuth>
+              <AdminControlPanel />
+            </RequireAuth>
+          }
+        />
         {[
-          ['control-panel', 'Control Panel'],
           ['logs', 'Logs'],
         ].map(([path, title]) => (
           <Route
