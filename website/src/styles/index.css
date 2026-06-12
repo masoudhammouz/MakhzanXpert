@@ -2498,6 +2498,43 @@ button {
   gap: 0.65rem;
 }
 
+.automation-status-panel {
+  display: grid;
+  align-content: center;
+  gap: 0.45rem;
+  min-height: 152px;
+  padding: 1.15rem;
+  border: 1px solid rgba(15, 118, 110, 0.18);
+  border-radius: 16px;
+  background: var(--bg-page);
+}
+
+.automation-status-panel span {
+  color: var(--text-secondary);
+  font-size: 0.76rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.automation-status-panel strong {
+  font-size: 2rem;
+  font-weight: 950;
+}
+
+.automation-status-panel strong.enabled {
+  color: #0f766e;
+}
+
+.automation-status-panel strong.disabled {
+  color: #64748b;
+}
+
+.automation-status-panel p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-weight: 700;
+}
+
 .control-status-line {
   display: flex;
   align-items: center;
@@ -2635,41 +2672,8 @@ button {
   background: var(--bg-page);
 }
 
-.control-position-grid {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 0.75rem;
-}
-
-.control-position-cell {
-  min-height: 82px;
-  display: grid;
-  align-content: center;
-  gap: 0.25rem;
-  padding: 0.8rem;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: #f8fafc;
-  text-align: center;
-}
-
-.control-position-cell span {
-  color: var(--text-primary);
-  font-weight: 900;
-}
-
-.control-position-cell strong {
-  color: var(--text-secondary);
-  font-size: 0.76rem;
-}
-
-.control-position-cell.occupied {
-  border-color: rgba(15, 118, 110, 0.38);
-  background: rgba(15, 118, 110, 0.13);
-}
-
-.control-position-cell.occupied strong {
-  color: #0f766e;
+.control-view-locations {
+  justify-self: start;
 }
 
 .control-toggle-list {
@@ -3953,10 +3957,6 @@ html.dark .location-low {
     flex: 1 1 160px;
   }
 
-  .control-position-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
   .overview-item {
     padding-right: 0;
     padding-bottom: 0.85rem;
@@ -4000,8 +4000,7 @@ html.dark .location-low {
 }
 
 @media (max-width: 520px) {
-  .control-detail-grid,
-  .control-position-grid {
+  .control-detail-grid {
     grid-template-columns: 1fr;
   }
 

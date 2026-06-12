@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { collection, doc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
 import { db } from '../../firebase/firebase.js';
 
@@ -72,17 +73,6 @@ function normalizeStatus(value, fallback = 'Offline') {
   return normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
-function getDeviceTimestamp(device) {
-  return device?.lastSeen || device?.updatedAt || device?.timestamp || device?.createdAt;
-}
-
-function getDeviceOnline(device) {
-  const status = String(device?.status || '').toLowerCase();
-  if (['online', 'connected', 'active'].includes(status)) return true;
-  if (['offline', 'disconnected', 'inactive'].includes(status)) return false;
-  return isRecent(getDeviceTimestamp(device));
-}
-
 function getScanTimestamp(scan) {
   return scan?.createdAt || scan?.updatedAt || scan?.timestamp || scan?.scanTime;
 }
@@ -98,31 +88,11 @@ function getSelectedMovement(scan) {
   return '--';
 }
 
-function getMovementPositionStatus(position, locationsByPhysicalId) {
-  const physicalLocation = Math.ceil(position / 2);
-  const location = locationsByPhysicalId.get(physicalLocation);
-  return location?.status === 'full' || location?.isOccupied ? 'occupied' : 'empty';
-}
-
-function StatusLine({ label, online }) {
-  return (
-    <div className="control-status-line">
-      <span>{label}</span>
-      <strong className={online ? 'online' : 'offline'}>
-        <span className="control-status-dot" aria-hidden="true" />
-        {online ? 'Online' : 'Offline'}
-      </strong>
-    </div>
-  );
-}
-
 function AdminControlPanel() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [sortingMode, setSortingMode] = useState(DEFAULT_SETTINGS.sortingMode);
   const [locations, setLocations] = useState([]);
-  const [devices, setDevices] = useState([]);
   const [latestScan, setLatestScan] = useState(null);
-  const [latestActivity, setLatestActivity] = useState(null);
   const [firebaseOnline, setFirebaseOnline] = useState(false);
   const [saving, setSaving] = useState('');
   const [notice, setNotice] = useState('');
@@ -159,14 +129,6 @@ function AdminControlPanel() {
       () => setLocations([]),
     );
 
-    const unsubscribeDevices = onSnapshot(
-      collection(db, 'devices'),
-      (snapshot) => {
-        setDevices(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-      },
-      () => setDevices([]),
-    );
-
     const scansQuery = query(collection(db, 'scans'), orderBy('createdAt', 'desc'), limit(1));
     const unsubscribeScans = onSnapshot(
       scansQuery,
@@ -176,57 +138,25 @@ function AdminControlPanel() {
       () => setLatestScan(null),
     );
 
-    const activityQuery = query(collection(db, 'systemActivity'), orderBy('createdAt', 'desc'), limit(1));
-    const unsubscribeActivity = onSnapshot(
-      activityQuery,
-      (snapshot) => {
-        setLatestActivity(snapshot.docs[0] ? { id: snapshot.docs[0].id, ...snapshot.docs[0].data() } : null);
-      },
-      () => setLatestActivity(null),
-    );
-
     return () => {
       unsubscribeLocations();
-      unsubscribeDevices();
       unsubscribeScans();
-      unsubscribeActivity();
     };
   }, []);
 
-  const deviceStatus = useMemo(() => {
-    const esp32 = devices.find((device) => device.id === 'esp-main-01' || device.deviceId === 'esp-main-01') || devices[0];
-    const latestScanOnline = isRecent(getScanTimestamp(latestScan));
-    const latestActivityText = `${latestActivity?.type || ''} ${latestActivity?.message || ''} ${latestActivity?.status || ''}`.toLowerCase();
-
-    return {
-      esp32: getDeviceOnline(esp32),
-      arduino: getDeviceOnline(esp32) && (latestActivityText.includes('arduino') || latestActivityText.includes('done') || latestActivityText.includes('sent')),
-      raspberry: latestScanOnline || String(latestScan?.source || '').toLowerCase() === 'raspberry',
-      firebase: firebaseOnline,
-    };
-  }, [devices, firebaseOnline, latestActivity, latestScan]);
-
-  const locationsByPhysicalId = useMemo(() => {
-    const map = new Map();
-    locations.forEach((location) => {
-      const id = Number(location.position || location.id);
-      if (id >= 1 && id <= 9) map.set(id, location);
-    });
-    return map;
-  }, [locations]);
-
   const warehouseSummary = useMemo(() => {
-    const statuses = Array.from({ length: TOTAL_MOVEMENT_POSITIONS }, (_, index) => {
-      const position = index + 1;
-      return getMovementPositionStatus(position, locationsByPhysicalId);
+    const physicalLocations = Array.from({ length: 9 }, (_, index) => {
+      const locationId = index + 1;
+      return locations.find((location) => Number(location.position || location.id) === locationId);
     });
+    const occupied = physicalLocations.filter((location) => location?.status === 'full' || location?.isOccupied).length;
 
     return {
-      total: TOTAL_MOVEMENT_POSITIONS,
-      occupied: statuses.filter((status) => status === 'occupied').length,
-      empty: statuses.filter((status) => status === 'empty').length,
+      total: 9,
+      occupied,
+      empty: 9 - occupied,
     };
-  }, [locationsByPhysicalId]);
+  }, [locations]);
 
   const updateSettings = async (updates, actionLabel) => {
     setSaving(actionLabel);
@@ -315,11 +245,12 @@ function AdminControlPanel() {
         </div>
 
         <div className="control-system-grid">
-          <div className="control-status-stack">
-            <StatusLine label="ESP32" online={deviceStatus.esp32} />
-            <StatusLine label="Arduino" online={deviceStatus.arduino} />
-            <StatusLine label="Raspberry Pi" online={deviceStatus.raspberry} />
-            <StatusLine label="Firebase" online={deviceStatus.firebase} />
+          <div className="automation-status-panel">
+            <span>Automation Status</span>
+            <strong className={settings.automationEnabled ? 'enabled' : 'disabled'}>
+              {settings.automationEnabled ? 'Enabled' : 'Disabled'}
+            </strong>
+            <p>{firebaseOnline ? 'Settings synced with Firestore.' : 'Waiting for Firestore settings.'}</p>
           </div>
           <p className="control-description">
             When automation is enabled: Worker places cartons into dispenser. System automatically scans labels,
@@ -358,7 +289,7 @@ function AdminControlPanel() {
           <div className="control-detail-grid">
             <div>
               <span>Camera Status</span>
-              <strong>{normalizeStatus(latestScan?.cameraStatus || (deviceStatus.raspberry ? 'online' : 'offline'))}</strong>
+              <strong>{normalizeStatus(latestScan?.cameraStatus || (isRecent(getScanTimestamp(latestScan)) ? 'online' : 'No data'), 'No data')}</strong>
             </div>
             <div>
               <span>OCR Status</span>
@@ -381,7 +312,7 @@ function AdminControlPanel() {
               <strong>{latestScan?.size || '--'}</strong>
             </div>
             <div>
-              <span>Selected Position</span>
+              <span>Last Selected Command</span>
               <strong>{getSelectedMovement(latestScan)}</strong>
             </div>
             <div>
@@ -395,28 +326,18 @@ function AdminControlPanel() {
       <section className="control-card warehouse-control-card">
         <div className="control-card-heading">
           <div>
-            <h2>Warehouse Overview</h2>
-            <p>Movement position occupancy mapped from physical warehouse locations.</p>
+            <h2>Warehouse Summary</h2>
+            <p>Physical storage overview. Open Locations for the full warehouse grid.</p>
           </div>
           <div className="control-summary-row">
-            <span>Total Positions <strong>{warehouseSummary.total}</strong></span>
-            <span>Occupied Positions <strong>{warehouseSummary.occupied}</strong></span>
-            <span>Empty Positions <strong>{warehouseSummary.empty}</strong></span>
+            <span>Total Locations <strong>{warehouseSummary.total}</strong></span>
+            <span>Occupied <strong>{warehouseSummary.occupied}</strong></span>
+            <span>Empty <strong>{warehouseSummary.empty}</strong></span>
           </div>
         </div>
-        <div className="control-position-grid" aria-label="Warehouse movement positions">
-          {Array.from({ length: TOTAL_MOVEMENT_POSITIONS }, (_, index) => {
-            const position = index + 1;
-            const status = getMovementPositionStatus(position, locationsByPhysicalId);
-
-            return (
-              <div className={`control-position-cell ${status}`} key={position}>
-                <span>GO {position}</span>
-                <strong>{status === 'occupied' ? 'Occupied' : 'Empty'}</strong>
-              </div>
-            );
-          })}
-        </div>
+        <Link className="button button-secondary control-view-locations" to="/admin/locations">
+          View Locations
+        </Link>
       </section>
 
       <section className="control-dashboard-grid lower">
