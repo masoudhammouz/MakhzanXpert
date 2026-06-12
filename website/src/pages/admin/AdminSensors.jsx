@@ -1,7 +1,5 @@
 import { collection, getDocs, limit, onSnapshot, orderBy, query } from 'firebase/firestore';
 import { useEffect, useMemo, useState } from 'react';
-import EmptyState from '../../components/EmptyState.jsx';
-import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
 
 const REFRESH_INTERVAL_MS = 5000;
@@ -31,11 +29,6 @@ function formatDate(value) {
   }).format(date);
 }
 
-function displayValue(value, suffix = '') {
-  if (value === null || value === undefined || value === '') return '-';
-  return `${value}${suffix}`;
-}
-
 function displaySensorValue(value, suffix = '') {
   if (value === null || value === undefined || value === '') return '--';
   return `${value}${suffix}`;
@@ -50,24 +43,38 @@ function getDeviceLastSeen(device) {
   return device.lastSeen || device.updatedAt || device.timestamp || device.createdAt;
 }
 
-function getDeviceStatus(device) {
-  if (!device) return 'Offline';
+function getRelativeTime(value) {
+  const timestamp = getTimestampMs(value);
+  if (!timestamp) return 'No data';
 
-  const explicitStatus = String(device.status || '').toLowerCase();
-  if (['online', 'offline'].includes(explicitStatus)) {
-    return explicitStatus === 'online' ? 'Online' : 'Offline';
-  }
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 5) return 'just now';
+  if (seconds < 60) return `${seconds}s ago`;
 
-  const lastSeenMs = getTimestampMs(getDeviceLastSeen(device));
-  return lastSeenMs && Date.now() - lastSeenMs <= ONLINE_WINDOW_MS ? 'Online' : 'Offline';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ago`;
 }
 
-function getActivityStatusClass(status) {
-  const normalizedStatus = String(status || '').toLowerCase();
-  if (normalizedStatus === 'success') return 'status-available';
-  if (normalizedStatus === 'warning') return 'status-low-stock';
-  if (normalizedStatus === 'error') return 'status-unavailable';
-  return 'status-ready';
+function getSensorConnectivity(latestReading) {
+  const timestamp = getTimestampMs(getReadingTimestamp(latestReading));
+  return timestamp && Date.now() - timestamp <= ONLINE_WINDOW_MS ? 'Online' : 'Offline';
+}
+
+function getTrend(current, previous, suffix = '') {
+  if (typeof current !== 'number' || typeof previous !== 'number') {
+    return { label: 'No trend', direction: 'flat' };
+  }
+
+  const delta = current - previous;
+  if (Math.abs(delta) < 0.1) return { label: `Stable 0${suffix}`, direction: 'flat' };
+
+  return {
+    label: `${delta > 0 ? '+' : ''}${delta.toFixed(1)}${suffix}`,
+    direction: delta > 0 ? 'up' : 'down',
+  };
 }
 
 function AdminSensors() {
@@ -138,8 +145,10 @@ function AdminSensors() {
   }, []);
 
   const latest = readings[0];
-  const primaryDevice = devices[0];
-  const deviceStatus = getDeviceStatus(primaryDevice);
+  const previous = readings[1];
+  const sensorConnectivity = getSensorConnectivity(latest);
+  const sensorOnline = sensorConnectivity === 'Online';
+  const lastSensorUpdate = getReadingTimestamp(latest);
 
   const summary = useMemo(() => ({
     temperature: latest?.temperature,
@@ -154,51 +163,28 @@ function AdminSensors() {
   }), [latest]);
 
   const waterDetectionStatus = summary.waterDetected === true
-    ? 'WATER DETECTED'
+    ? 'Water Detected'
     : summary.waterDetected === false
-      ? 'DRY'
+      ? 'Dry'
       : 'No data';
-  const waterSensorNote = summary.waterStatus
-    ? `${waterDetectionStatus} / ${summary.waterStatus}`
-    : waterDetectionStatus;
   const motionValue = summary.motion === 1
     ? 'Motion Detected'
     : summary.motion === 0
       ? 'No Motion'
       : 'No data';
 
-  const statusCards = [
-    {
-      label: 'Temperature',
-      value: displayValue(summary.temperature, summary.temperature !== undefined ? ' °C' : ''),
-      note: 'Latest warehouse temperature',
-    },
-    {
-      label: 'Humidity',
-      value: displayValue(summary.humidity, summary.humidity !== undefined ? '%' : ''),
-      note: 'Latest relative humidity',
-    },
-    {
-      label: 'Air Quality (MQ135)',
-      value: displayValue(summary.mq135),
-      note: 'MQ135 air quality sensor',
-    },
-    {
-      label: 'Gas Detection (MQ3)',
-      value: displayValue(summary.mq3),
-      note: 'MQ3 gas sensor',
-    },
-    {
-      label: 'Water Sensor',
-      value: displaySensorValue(summary.waterValue),
-      note: waterSensorNote,
-    },
-    {
-      label: 'Motion Sensor',
-      value: motionValue,
-      note: summary.motionStatus || 'No data',
-    },
-  ];
+  const temperatureTrend = getTrend(summary.temperature, previous?.temperature, '°C');
+  const humidityTrend = getTrend(summary.humidity, previous?.humidity, '%');
+  const highTemperature = typeof summary.temperature === 'number' && summary.temperature >= 45;
+  const gasWarning = Number(summary.mq3 || 0) >= 1500 || Number(summary.mq135 || 0) >= 1500;
+  const gasAlert = Number(summary.mq3 || 0) >= 2500 || Number(summary.mq135 || 0) >= 2500;
+  const fireAlert = gasAlert || (gasWarning && highTemperature);
+  const fireWarning = !fireAlert && (gasWarning || highTemperature);
+  const fireStatus = fireAlert ? 'Fire Alert' : fireWarning ? 'Warning' : latest ? 'Normal' : 'No data';
+  const fireTone = fireAlert ? 'danger' : fireWarning ? 'warning' : latest ? 'success' : 'muted';
+  const riskLevel = fireAlert ? 'High' : fireWarning ? 'Medium' : latest ? 'Low' : 'No data';
+  const waterTone = summary.waterDetected === true ? 'danger' : summary.waterDetected === false ? 'success' : 'muted';
+  const motionTone = summary.motion === 1 ? 'warning' : summary.motion === 0 ? 'success' : 'muted';
 
   return (
     <div className="admin-sensors-page">
@@ -206,156 +192,168 @@ function AdminSensors() {
         <div>
           <p className="section-eyebrow">Live sensors</p>
           <h1>Sensors Dashboard</h1>
-          <p>Live Firestore monitoring for warehouse environment readings and connected device state.</p>
+          <p>Real-time warehouse environmental monitoring.</p>
         </div>
         <div className="sensor-refresh-meta" aria-live="polite">
-          <span className="status-badge status-ready">Refresh: 5s</span>
-          <span>{lastRefresh ? `Updated ${formatDate(lastRefresh)}` : 'Waiting for first refresh'}</span>
+          <span className={`sensor-pill ${sensorOnline ? 'online' : 'offline'}`}>{sensorConnectivity}</span>
+          <span>{lastRefresh ? `Refreshed ${formatDate(lastRefresh)}` : 'Waiting for refresh'}</span>
         </div>
       </section>
 
       {error && <p className="admin-form-error">{error}</p>}
 
-      <section className="inventory-summary-grid" aria-label="Latest sensor values">
-        <article className="admin-summary-card">
-          <p className="metric-label">Temperature °C</p>
-          <p className="metric-value">{displayValue(summary.temperature, summary.temperature !== undefined ? ' °C' : '')}</p>
-          <p className="metric-note">Latest sensorReadings document.</p>
-        </article>
-        <article className="admin-summary-card">
-          <p className="metric-label">Humidity %</p>
-          <p className="metric-value">{displayValue(summary.humidity, summary.humidity !== undefined ? '%' : '')}</p>
-          <p className="metric-note">Latest sensorReadings document.</p>
-        </article>
-        <article className="admin-summary-card">
-          <p className="metric-label">MQ3</p>
-          <p className="metric-value">{displayValue(summary.mq3)}</p>
-          <p className="metric-note">Gas detection reading.</p>
-        </article>
-        <article className="admin-summary-card">
-          <p className="metric-label">MQ135</p>
-          <p className="metric-value">{displayValue(summary.mq135)}</p>
-          <p className="metric-note">Air quality reading.</p>
-        </article>
-        <article className="admin-summary-card">
-          <p className="metric-label">Water Sensor</p>
-          <p className="metric-value">{displaySensorValue(summary.waterValue)}</p>
-          <p className="metric-note">{waterSensorNote}</p>
-        </article>
-        <article className="admin-summary-card">
-          <p className="metric-label">Motion Sensor</p>
-          <p className="metric-value">{motionValue}</p>
-          <p className="metric-note">{summary.motionStatus || 'No data'}</p>
-        </article>
-      </section>
-
-      <section className="inventory-summary-grid" aria-label="Sensor status cards">
-        {statusCards.map((card) => (
-          <article className="admin-summary-card sensor-status-card" key={card.label}>
-            <p className="metric-label">{card.label}</p>
-            <p className="metric-value">{card.value}</p>
-            <p className="metric-note">{card.note}</p>
-          </article>
-        ))}
-      </section>
-
-      <section className="admin-inventory-panel">
-        <div className="section-header">
-          <div>
-            <h2>Device Status</h2>
-            <p>Current device information from the devices collection.</p>
-          </div>
-        </div>
-
-        <div className="device-status-grid">
-          <article className="device-status-card">
-            <span className={deviceStatus === 'Online' ? 'status-badge status-available' : 'status-badge status-unavailable'}>
-              {deviceStatus}
-            </span>
+      <section className="warehouse-overview-bar" aria-label="Warehouse Status">
+        <h2>Warehouse Status</h2>
+        <div className="warehouse-overview-grid">
+          <div className="overview-item">
+            <span className={`overview-icon ${fireTone}`}>F</span>
             <div>
-              <p className="metric-label">Device Name</p>
-              <p className="device-status-value">{primaryDevice?.deviceName || primaryDevice?.name || primaryDevice?.id || '-'}</p>
+              <p>Fire Status</p>
+              <strong className={fireTone}>{fireStatus}</strong>
             </div>
-          </article>
-          <article className="device-status-card">
-            <p className="metric-label">Last Seen</p>
-            <p className="device-status-value">{formatDate(getDeviceLastSeen(primaryDevice))}</p>
-          </article>
-          <article className="device-status-card">
-            <p className="metric-label">Current Task</p>
-            <p className="device-status-value">{primaryDevice?.currentTask || primaryDevice?.task || primaryDevice?.activeTask || 'Idle'}</p>
-          </article>
+          </div>
+          <div className="overview-item">
+            <span className={`overview-icon ${waterTone}`}>W</span>
+            <div>
+              <p>Water Status</p>
+              <strong className={waterTone}>{waterDetectionStatus}</strong>
+            </div>
+          </div>
+          <div className="overview-item">
+            <span className={`overview-icon ${motionTone}`}>M</span>
+            <div>
+              <p>Motion Status</p>
+              <strong className={motionTone}>{motionValue}</strong>
+            </div>
+          </div>
+          <div className="overview-item">
+            <span className={`overview-icon ${sensorOnline ? 'success' : 'danger'}`}>S</span>
+            <div>
+              <p>Sensor Connectivity</p>
+              <strong className={sensorOnline ? 'success' : 'danger'}>{sensorConnectivity}</strong>
+            </div>
+          </div>
+          <div className="overview-item">
+            <span className="overview-icon muted">T</span>
+            <div>
+              <p>Last Sensor Update</p>
+              <strong>{getRelativeTime(lastSensorUpdate)}</strong>
+            </div>
+          </div>
         </div>
       </section>
 
-      <section className="admin-inventory-panel">
-        <div className="section-header">
-          <div>
-            <h2>Sensor History</h2>
-            <p>Latest 20 readings from sensorReadings.</p>
+      <section className="sensor-dashboard-grid top-row" aria-label="Primary warehouse sensor cards">
+        <article className={`sensor-monitor-card fire ${fireTone}`}>
+          <header className="sensor-card-header">
+            <span className={`sensor-card-icon ${fireTone}`}>F</span>
+            <div>
+              <h2>Fire Monitoring System</h2>
+              <span className={`sensor-pill ${sensorOnline ? 'online' : 'offline'}`}>{sensorConnectivity}</span>
+            </div>
+          </header>
+          <div className="fire-status-block">
+            <p>Fire Status</p>
+            <strong className={fireTone}>{fireStatus}</strong>
           </div>
-        </div>
+          <div className="fire-metrics-grid">
+            <div>
+              <span>MQ3 Value</span>
+              <strong>{displaySensorValue(summary.mq3)}</strong>
+            </div>
+            <div>
+              <span>MQ135 Value</span>
+              <strong>{displaySensorValue(summary.mq135)}</strong>
+            </div>
+            <div>
+              <span>Risk Level</span>
+              <strong className={fireTone}>{riskLevel}</strong>
+            </div>
+          </div>
+          <footer>Last Update: {getRelativeTime(lastSensorUpdate)}</footer>
+        </article>
 
-        {loading ? (
-          <LoadingState message="Loading live sensor data..." />
-        ) : readings.length === 0 ? (
-          <EmptyState title="No sensor readings yet" description="Waiting for devices to write sensorReadings." />
-        ) : (
-          <div className="inventory-table-wrap">
-            <table className="inventory-table sensors-table">
-              <thead>
-                <tr>
-                  <th>Timestamp</th>
-                  <th>Temperature</th>
-                  <th>Humidity</th>
-                  <th>MQ3</th>
-                  <th>MQ135</th>
-                </tr>
-              </thead>
-              <tbody>
-                {readings.map((reading) => (
-                  <tr key={reading.id}>
-                    <td>{formatDate(getReadingTimestamp(reading))}</td>
-                    <td>{displayValue(reading.temperature, reading.temperature !== undefined ? ' °C' : '')}</td>
-                    <td>{displayValue(reading.humidity, reading.humidity !== undefined ? '%' : '')}</td>
-                    <td>{displayValue(reading.mq3)}</td>
-                    <td>{displayValue(reading.mq135)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+        <article className="sensor-monitor-card temperature">
+          <header className="sensor-card-header">
+            <span className="sensor-card-icon info thermometer-icon" aria-hidden="true"><span /></span>
+            <div>
+              <h2>Temperature</h2>
+              <span className={`sensor-pill ${sensorOnline ? 'online' : 'offline'}`}>{sensorConnectivity}</span>
+            </div>
+          </header>
+          <div className="large-reading">{displaySensorValue(summary.temperature, ' °C')}</div>
+          <dl className="sensor-details-list">
+            <div>
+              <dt>Temperature Trend</dt>
+              <dd className={temperatureTrend.direction}>{temperatureTrend.label}</dd>
+            </div>
+            <div>
+              <dt>Last Update</dt>
+              <dd>{getRelativeTime(lastSensorUpdate)}</dd>
+            </div>
+          </dl>
+        </article>
+
+        <article className="sensor-monitor-card humidity">
+          <header className="sensor-card-header">
+            <span className="sensor-card-icon purple humidity-icon" aria-hidden="true"><span /></span>
+            <div>
+              <h2>Humidity</h2>
+              <span className={`sensor-pill ${sensorOnline ? 'online' : 'offline'}`}>{sensorConnectivity}</span>
+            </div>
+          </header>
+          <div className="large-reading purple">{displaySensorValue(summary.humidity, '%')}</div>
+          <dl className="sensor-details-list">
+            <div>
+              <dt>Humidity Trend</dt>
+              <dd className={humidityTrend.direction}>{humidityTrend.label}</dd>
+            </div>
+            <div>
+              <dt>Last Update</dt>
+              <dd>{getRelativeTime(lastSensorUpdate)}</dd>
+            </div>
+          </dl>
+        </article>
       </section>
 
-      <section className="admin-inventory-panel">
-        <div className="section-header">
-          <div>
-            <h2>System Activity</h2>
-            <p>Latest 5 warehouse events from systemActivity.</p>
+      <section className="sensor-dashboard-grid bottom-row" aria-label="Secondary warehouse sensor cards">
+        <article className={`sensor-monitor-card water ${waterTone}`}>
+          <header className="sensor-card-header">
+            <span className={`sensor-card-icon ${waterTone}`}>W</span>
+            <div>
+              <h2>Water Monitoring</h2>
+              <span className={`sensor-pill ${sensorOnline ? 'online' : 'offline'}`}>{sensorConnectivity}</span>
+            </div>
+          </header>
+          <div className="binary-status">
+            <span className={`status-orb ${waterTone}`}>W</span>
+            <div>
+              <strong className={waterTone}>{waterDetectionStatus}</strong>
+              <p>{summary.waterStatus || (summary.waterDetected === true ? 'Water Detected' : 'Dry')}</p>
+            </div>
           </div>
-        </div>
-        {activities.length === 0 ? (
-          <div className="system-activity-placeholder">
-            Waiting for warehouse events...
+          <footer>Last Update: {getRelativeTime(lastSensorUpdate)}</footer>
+        </article>
+
+        <article className={`sensor-monitor-card motion ${motionTone}`}>
+          <header className="sensor-card-header">
+            <span className={`sensor-card-icon ${motionTone}`}>M</span>
+            <div>
+              <h2>Motion Detection</h2>
+              <span className={`sensor-pill ${sensorOnline ? 'online' : 'offline'}`}>{sensorConnectivity}</span>
+            </div>
+          </header>
+          <div className="binary-status">
+            <span className={`status-orb ${motionTone}`}>M</span>
+            <div>
+              <strong className={motionTone}>{motionValue}</strong>
+              <p>{summary.motionStatus || (summary.motion === 1 ? 'Motion Detected' : 'No Motion')}</p>
+            </div>
           </div>
-        ) : (
-          <div className="sensor-activity-list">
-            {activities.map((activity) => (
-              <article className="sensor-activity-item" key={activity.id}>
-                <span className={`status-badge ${getActivityStatusClass(activity.status)}`}>
-                  {activity.status || 'info'}
-                </span>
-                <div>
-                  <strong>{activity.message || '-'}</strong>
-                  <p>{activity.sourceDevice || '-'} / {activity.activityType || '-'}</p>
-                </div>
-                <time>{formatDate(activity.createdAt)}</time>
-              </article>
-            ))}
-          </div>
-        )}
+          <footer>Last Update: {getRelativeTime(lastSensorUpdate)}</footer>
+        </article>
       </section>
+
     </div>
   );
 }
