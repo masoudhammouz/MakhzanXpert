@@ -2,28 +2,14 @@ import { createContext, useContext, useEffect, useState } from 'react';
 
 const CartContext = createContext(null);
 
-const STORAGE_KEY = 'mx_cart_v1';
-
-function initializeCart() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch (e) {
-    console.error('Failed to load cart from storage', e);
-    return [];
-  }
-}
-
 export function CartProvider({ children }) {
-  const [items, setItems] = useState(initializeCart);
+  const [items, setItems] = useState([]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
-    } catch (e) {
-      console.error('Failed to save cart to storage', e);
-    }
-  }, [items]);
+    const handleCleanup = () => setItems([]);
+    window.addEventListener('makhzan:dev-cleanup', handleCleanup);
+    return () => window.removeEventListener('makhzan:dev-cleanup', handleCleanup);
+  }, []);
 
   const findIndex = (productId) => items.findIndex((it) => it.id === productId);
 

@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { collection, limit, onSnapshot, orderBy, query } from 'firebase/firestore';
 import { useAuth } from '../../context/AuthContext.jsx';
 import { db } from '../../firebase/firebase.js';
+import { getSellableStock, isDraftProduct } from '../../utils/productVisibility.js';
 
 function formatActivityDate(value) {
   const timestamp = value?.toMillis ? value.toMillis() : 0;
@@ -36,7 +37,13 @@ function AdminDashboard() {
   const [error, setError] = useState('');
   const [latestReading, setLatestReading] = useState(null);
   const [lastActivity, setLastActivity] = useState(null);
+  const [recentActivities, setRecentActivities] = useState([]);
   const [latestCommand, setLatestCommand] = useState(null);
+  const [dashboardStats, setDashboardStats] = useState({
+    totalProducts: 0,
+    pendingOrders: 0,
+    lowStock: 0,
+  });
 
   useEffect(() => {
     const readingsQuery = query(collection(db, 'sensorReadings'), orderBy('createdAt', 'desc'), limit(1));
@@ -65,6 +72,19 @@ function AdminDashboard() {
   }, []);
 
   useEffect(() => {
+    const activityQuery = query(collection(db, 'systemActivity'), orderBy('createdAt', 'desc'), limit(4));
+    const unsubscribe = onSnapshot(
+      activityQuery,
+      (snapshot) => {
+        setRecentActivities(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      },
+      () => setRecentActivities([]),
+    );
+
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
     const commandsQuery = query(collection(db, 'commands'), orderBy('createdAt', 'desc'), limit(1));
     const unsubscribe = onSnapshot(
       commandsQuery,
@@ -72,6 +92,45 @@ function AdminDashboard() {
         setLatestCommand(snapshot.docs[0]?.data() || null);
       },
       () => setLatestCommand(null),
+    );
+
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
+    const unsubscribe = onSnapshot(
+      productsQuery,
+      (snapshot) => {
+        const products = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+        setDashboardStats((current) => ({
+          ...current,
+          totalProducts: products.length,
+          lowStock: products.filter((product) => !isDraftProduct(product) && getSellableStock(product) > 0 && getSellableStock(product) <= 3).length,
+        }));
+      },
+      () => {
+        setDashboardStats((current) => ({ ...current, totalProducts: 0, lowStock: 0 }));
+      },
+    );
+
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    const ordersQuery = query(collection(db, 'orders'), orderBy('createdAt', 'desc'));
+    const unsubscribe = onSnapshot(
+      ordersQuery,
+      (snapshot) => {
+        const orders = snapshot.docs.map((item) => item.data());
+        setDashboardStats((current) => ({
+          ...current,
+          pendingOrders: orders.filter((order) => order.status === 'pending').length,
+        }));
+      },
+      () => {
+        setDashboardStats((current) => ({ ...current, pendingOrders: 0 }));
+      },
     );
 
     return unsubscribe;
@@ -109,17 +168,17 @@ function AdminDashboard() {
       <div className="dashboard-grid admin-metrics-grid">
         <article className="metric-card admin-metric-card">
           <p className="metric-label">Total Products</p>
-          <p className="metric-value">128</p>
+          <p className="metric-value">{dashboardStats.totalProducts}</p>
           <p className="metric-note">Currently catalogued in the inventory.</p>
         </article>
         <article className="metric-card admin-metric-card">
           <p className="metric-label">Pending Orders</p>
-          <p className="metric-value">16</p>
+          <p className="metric-value">{dashboardStats.pendingOrders}</p>
           <p className="metric-note">Orders waiting for fulfillment.</p>
         </article>
         <article className="metric-card admin-metric-card">
           <p className="metric-label">Low Stock</p>
-          <p className="metric-value">7</p>
+          <p className="metric-value">{dashboardStats.lowStock}</p>
           <p className="metric-note">Items below restock threshold.</p>
         </article>
         <article className="metric-card admin-metric-card">
@@ -197,27 +256,22 @@ function AdminDashboard() {
         <div className="section-header">
           <div>
             <h2>Recent activity</h2>
-            <p className="section-description">Placeholder activity stream for system events and operational updates.</p>
+            <p className="section-description">Latest system events and operational updates from Firebase.</p>
           </div>
         </div>
 
         <div className="activity-list">
-          <div className="activity-item">
-            <span>09:24</span>
-            <p>Product inventory sync completed.</p>
-          </div>
-          <div className="activity-item">
-            <span>08:57</span>
-            <p>New order #4082 entered the queue.</p>
-          </div>
-          <div className="activity-item">
-            <span>07:40</span>
-            <p>Machine sensor reported stable temperature.</p>
-          </div>
-          <div className="activity-item">
-            <span>Yesterday</span>
-            <p>Admin signed in from trusted device.</p>
-          </div>
+          {recentActivities.length === 0 ? (
+            <div className="activity-item">
+              <span>-</span>
+              <p>No recent activity.</p>
+            </div>
+          ) : recentActivities.map((activity) => (
+            <div className="activity-item" key={activity.id}>
+              <span>{formatActivityDate(activity.createdAt)}</span>
+              <p>{activity.message || '-'}</p>
+            </div>
+          ))}
         </div>
       </section>
     </div>

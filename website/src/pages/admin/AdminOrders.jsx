@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { addDoc, collection, doc, getDocs, orderBy, query, serverTimestamp, updateDoc, where } from 'firebase/firestore';
+import { addDoc, collection, doc, onSnapshot, orderBy, query, serverTimestamp, updateDoc, where, getDocs } from 'firebase/firestore';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
@@ -13,40 +13,6 @@ const ESP_DEVICE_ID = 'esp-main-01';
 function physicalLocationToOutMovement(locationNumber) {
   return locationNumber * 2;
 }
-
-const SAMPLE_ORDERS = [
-  {
-    id: 'sample-1001',
-    orderId: 'ORD-1001',
-    customerName: 'Omar Khalil',
-    customerPhone: '+970 599 000 101',
-    customerAddress: 'Ramallah, Al Tireh',
-    items: [
-      { productId: 'demo-1', brand: 'StridePro', model: 'XR-200', size: '9 US', color: 'Cloud White', price: 129.99, quantity: 1 },
-      { productId: 'demo-2', brand: 'RunFast', model: 'Court Classic', size: '9.5 US', color: 'White / Gum', price: 104.99, quantity: 1 },
-    ],
-    totalPrice: 234.98,
-    status: 'pending',
-    createdAt: new Date('2026-06-06T10:30:00'),
-    updatedAt: new Date('2026-06-06T10:30:00'),
-    isSample: true,
-  },
-  {
-    id: 'sample-1002',
-    orderId: 'ORD-1002',
-    customerName: 'Lina Nasser',
-    customerPhone: '+970 599 000 202',
-    customerAddress: 'Hebron, Ein Sarah',
-    items: [
-      { productId: 'demo-3', brand: 'TerraStep', model: 'Summit Guard', size: '10 US', color: 'Dark Brown', price: 164.5, quantity: 1 },
-    ],
-    totalPrice: 164.5,
-    status: 'ready',
-    createdAt: new Date('2026-06-05T15:15:00'),
-    updatedAt: new Date('2026-06-06T09:05:00'),
-    isSample: true,
-  },
-];
 
 function getTimestampValue(value) {
   if (value?.toMillis) return value.toMillis();
@@ -95,24 +61,24 @@ function AdminOrders() {
   const [preparingId, setPreparingId] = useState('');
 
   useEffect(() => {
-    async function loadOrders() {
-      setLoading(true);
-      setError('');
+    setLoading(true);
+    setError('');
 
-      try {
-        const ordersQuery = query(collection(db, 'orders'), orderBy('createdAt', 'desc'));
-        const snapshot = await getDocs(ordersQuery);
-        const firestoreOrders = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-        setOrders(firestoreOrders.length > 0 ? firestoreOrders : SAMPLE_ORDERS);
-      } catch {
-        setOrders(SAMPLE_ORDERS);
-        setError('Showing sample orders because Firestore orders could not be loaded.');
-      } finally {
+    const ordersQuery = query(collection(db, 'orders'), orderBy('createdAt', 'desc'));
+    const unsubscribe = onSnapshot(
+      ordersQuery,
+      (snapshot) => {
+        setOrders(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
         setLoading(false);
-      }
-    }
+      },
+      () => {
+        setOrders([]);
+        setError('Unable to load orders from Firebase.');
+        setLoading(false);
+      },
+    );
 
-    loadOrders();
+    return unsubscribe;
   }, []);
 
   const summary = useMemo(() => ({
@@ -147,15 +113,6 @@ function AdminOrders() {
   const handleStatusChange = async (order, nextStatus) => {
     setUpdatingId(order.id);
     setError('');
-
-    if (order.isSample) {
-      setOrders((current) => current.map((item) => (item.id === order.id ? { ...item, status: nextStatus, updatedAt: new Date() } : item)));
-      if (selectedOrder?.id === order.id) {
-        setSelectedOrder((current) => ({ ...current, status: nextStatus, updatedAt: new Date() }));
-      }
-      setUpdatingId('');
-      return;
-    }
 
     try {
       await updateDoc(doc(db, 'orders', order.id), {
@@ -194,11 +151,6 @@ function AdminOrders() {
   };
 
   const handlePrepareOrder = async (order) => {
-    if (order.isSample) {
-      setError('Sample orders cannot create warehouse commands.');
-      return;
-    }
-
     setPreparingId(order.id);
     setError('');
 
