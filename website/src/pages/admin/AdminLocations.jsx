@@ -65,7 +65,6 @@ function formatDate(value) {
 function AdminLocations() {
   const [locations, setLocations] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [seeding, setSeeding] = useState(false);
   const [error, setError] = useState('');
   const [selectedLocation, setSelectedLocation] = useState(null);
 
@@ -143,20 +142,6 @@ function AdminLocations() {
     };
   }, [locationsById]);
 
-  const handleSeedLocations = async () => {
-    setSeeding(true);
-    setError('');
-
-    try {
-      await initializeWarehouse();
-      await loadLocations();
-    } catch {
-      setError('Unable to seed warehouse locations.');
-    } finally {
-      setSeeding(false);
-    }
-  };
-
   return (
     <div className="admin-locations-page">
       <section className="admin-page-heading">
@@ -165,9 +150,6 @@ function AdminLocations() {
           <h1>Positions Management</h1>
           <p>Prepare the 9 physical warehouse locations for GO movement commands.</p>
         </div>
-        <button className="button button-primary" type="button" onClick={handleSeedLocations} disabled={seeding}>
-          {seeding ? 'Seeding...' : 'Seed Locations'}
-        </button>
       </section>
 
       <section className="inventory-summary-grid" aria-label="Warehouse summary">
