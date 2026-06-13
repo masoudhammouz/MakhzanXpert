@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { addDoc, collection, doc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
+import { addDoc, collection, doc, getDoc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
 import { db } from '../../firebase/firebase.js';
 
 const SYSTEM_SETTINGS_REF = doc(db, 'settings', 'system');
 const AUTOMATION_STATUS_REF = doc(db, 'automation', 'status');
 const ESP_DEVICE_REF = doc(db, 'devices', 'esp-main-01');
+const ESP_DEVICE_ID = 'esp-main-01';
 const TOTAL_MOVEMENT_POSITIONS = 18;
 const ONLINE_WINDOW_MS = 30000;
 
@@ -66,6 +67,26 @@ function logWebsiteActivity(activityType, message) {
     addDoc(collection(db, 'systemActivity'), data),
     addDoc(collection(db, 'activityLog'), data),
   ]);
+}
+
+async function createAutomationCommand(command) {
+  const commandRef = doc(collection(db, 'commands'));
+  const commandId = commandRef.id;
+
+  await setDoc(commandRef, {
+    command,
+    status: 'pending',
+    deviceId: ESP_DEVICE_ID,
+    createdAt: serverTimestamp(),
+    commandId,
+  });
+
+  const createdCommand = await getDoc(commandRef);
+  if (!createdCommand.exists()) {
+    throw new Error(`${command} command was not created in Firestore.`);
+  }
+
+  return commandId;
 }
 
 function getDateValue(value) {
@@ -163,6 +184,7 @@ function AdminControlPanel() {
   const [saving, setSaving] = useState('');
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
+  const commandRequestInFlight = useRef(false);
 
   useEffect(() => {
     const unsubscribe = onSnapshot(
@@ -345,66 +367,53 @@ function AdminControlPanel() {
     }
   };
 
-  const handleAutomationToggle = (enabled) => {
-    if (enabled && !sortingMode) {
-      setError('Choose a sorting strategy before starting automation.');
-      return;
-    }
+  const handleAutomationToggle = async (enabled) => {
+    if (commandRequestInFlight.current) return;
 
-    setSaving(enabled ? 'Start Automation' : 'Stop Automation');
+    const actionLabel = enabled ? 'Start Automation' : 'Stop Automation';
+    const command = enabled ? 'START_AUTOMATION' : 'STOP_AUTOMATION';
+    commandRequestInFlight.current = true;
+    setSaving(actionLabel);
     setError('');
     setNotice('');
 
-    const writes = [
-      setDoc(SYSTEM_SETTINGS_REF, {
-        automationEnabled: enabled,
-        sortingMode,
-        lastControlAction: enabled ? 'START_AUTOMATION' : 'STOP_AUTOMATION',
-        controlRequestedAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      }, { merge: true }),
-      setDoc(AUTOMATION_STATUS_REF, {
-        automationStarted: enabled,
-        sortingStrategy: sortingMode,
-        currentState: enabled ? 'WAIT_BOX_AT_CAMERA' : 'STOPPED',
-        cameraBusy: false,
-        beltRunning: false,
-        beltBlocked: !enabled,
-        lifterBusy: false,
-        currentOperation: '',
-        lastError: enabled ? null : 'Stopped by operator',
-        updatedAt: serverTimestamp(),
-      }, { merge: true }),
-    ];
+    try {
+      const commandId = await createAutomationCommand(command);
+      console.log(`${command} sent`);
 
-    if (!enabled) {
-      const stopCommandRef = doc(collection(db, 'commands'));
-      writes.push(setDoc(stopCommandRef, {
-        commandId: stopCommandRef.id,
-        type: 'COMMAND',
-        command: 'STOP',
-        payload: {},
-        response: null,
-        status: 'pending',
-        source: 'website',
-        deviceId: 'esp-main-01',
-        createdAt: serverTimestamp(),
-        executedAt: null,
-        updatedAt: serverTimestamp(),
-      }));
-    }
-
-    Promise.all(writes)
-      .then(() => {
-        console.info(enabled ? '[AUTOMATION_STARTED]' : '[AUTOMATION_STOPPED]', { sortingStrategy: sortingMode });
-        return logWebsiteActivity(
+      await Promise.all([
+        setDoc(SYSTEM_SETTINGS_REF, {
+          automationEnabled: enabled,
+          sortingMode,
+          lastControlAction: command,
+          controlRequestedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }, { merge: true }),
+        setDoc(AUTOMATION_STATUS_REF, {
+          automationStarted: enabled,
+          sortingStrategy: sortingMode,
+          currentState: enabled ? 'WAIT_BOX_AT_CAMERA' : 'STOPPED',
+          cameraBusy: false,
+          beltRunning: false,
+          beltBlocked: !enabled,
+          lifterBusy: false,
+          currentOperation: '',
+          lastError: enabled ? null : 'Stopped by operator',
+          updatedAt: serverTimestamp(),
+        }, { merge: true }),
+        logWebsiteActivity(
           enabled ? 'AUTOMATION_STARTED' : 'AUTOMATION_STOPPED',
-          enabled ? `Automation started with ${sortingMode}.` : 'Automation stopped by operator.',
-        );
-      })
-      .then(() => setNotice(enabled ? 'Automation started.' : 'Automation stopped.'))
-      .catch(() => setError(enabled ? 'Unable to start automation.' : 'Unable to stop automation.'))
-      .finally(() => setSaving(''));
+          enabled ? `Automation started with ${sortingMode || 'no sorting strategy selected'}.` : 'Automation stopped by operator.',
+        ),
+      ]);
+
+      setNotice(`${actionLabel} command sent. Command ID: ${commandId}`);
+    } catch (requestError) {
+      setError(requestError.message || `Unable to ${enabled ? 'start' : 'stop'} automation.`);
+    } finally {
+      commandRequestInFlight.current = false;
+      setSaving('');
+    }
   };
 
   const handleSortingSave = () => {
@@ -593,17 +602,17 @@ function AdminControlPanel() {
               className="button button-primary"
               type="button"
               onClick={() => handleAutomationToggle(true)}
-              disabled={Boolean(saving) || automationStatus.automationStarted}
+              disabled={Boolean(saving)}
             >
-              Start Automation
+              {saving === 'Start Automation' ? 'Starting...' : 'Start Automation'}
             </button>
             <button
               className="button button-secondary"
               type="button"
               onClick={() => handleAutomationToggle(false)}
-              disabled={Boolean(saving) || !automationStatus.automationStarted}
+              disabled={Boolean(saving)}
             >
-              Stop Automation
+              {saving === 'Stop Automation' ? 'Stopping...' : 'Stop Automation'}
             </button>
           </div>
         </div>

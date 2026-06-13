@@ -23,6 +23,7 @@ const char* DEVICE_ID = "esp-main-01";
 #define FIRESTORE_DEVICE_INTERVAL_MS 5000
 #define FIRESTORE_SENSOR_SNAPSHOT_INTERVAL_MS 30000
 #define FIRESTORE_ACTIVITY_MIN_INTERVAL_MS 1500
+#define FIRESTORE_COMMAND_POLL_INTERVAL_MS 2000
 
 // ===================== SERIAL TO ARDUINO MEGA =====================
 // ESP32 RXD2 receives from Arduino TX
@@ -46,6 +47,8 @@ unsigned long commandCounter = 0;
 unsigned long lastFirestoreDeviceAt = 0;
 unsigned long lastFirestoreSnapshotAt = 0;
 unsigned long lastFirestoreActivityAt = 0;
+unsigned long lastFirestoreCommandPollAt = 0;
+bool firestoreCommandBusy = false;
 
 StaticJsonDocument<1024> latestStatus;
 
@@ -462,6 +465,194 @@ String statusJsonResponse() {
   return out;
 }
 
+
+// =====================================================
+// FIRESTORE COMMAND POLLER - NO WAIT MODE
+// Same logic as the older working code: send command then mark it sent.
+// This prevents the ESP32 from blocking until Arduino returns DONE.
+// =====================================================
+
+bool firestoreRequest(String method, String url, String body, String& response, int* statusCode = nullptr) {
+  response = "";
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  if (!http.begin(client, url)) return false;
+
+  http.setTimeout(15000);
+  http.addHeader("Content-Type", "application/json");
+
+  int code = -1;
+  if (method == "PATCH") {
+    code = http.PATCH(body);
+  } else if (method == "POST") {
+    code = http.POST(body);
+  } else {
+    code = http.GET();
+  }
+
+  response = http.getString();
+  if (statusCode) *statusCode = code;
+  http.end();
+
+  return code >= 200 && code < 300;
+}
+
+String getFirestoreStringField(JsonObject fields, String key) {
+  if (!fields.containsKey(key)) return "";
+  JsonObject f = fields[key];
+  if (f.containsKey("stringValue")) return f["stringValue"].as<String>();
+  return "";
+}
+
+String normalizeFirestoreCommand(String raw) {
+  raw.trim();
+  raw.toUpperCase();
+
+  if (raw.startsWith("GO ")) return raw;
+  if (raw.startsWith("GO")) {
+    String n = raw.substring(2);
+    n.trim();
+    if (n.length() > 0) return "GO " + n;
+  }
+
+  // ===== AUTOMATION =====
+  // Website Start Automation must reach Arduino as START_AUTOMATION.
+  if (raw == "START_AUTOMATION") return "START_AUTOMATION";
+  if (raw == "AUTO") return "START_AUTOMATION";
+  if (raw == "AUTOMATION_START") return "START_AUTOMATION";
+
+  if (raw == "STOP_AUTOMATION") return "STOP_AUTOMATION";
+  if (raw == "AUTOMATION_STOP") return "STOP_AUTOMATION";
+
+  // ===== BELT =====
+  // STOP from the website means stop the belt only.
+  if (raw == "STOP") return "BELT_STOP";
+  if (raw == "BELT") return "BELT_START";
+  if (raw == "BELT_START") return "BELT_START";
+  if (raw == "BELT_STOP") return "BELT_STOP";
+
+  // ===== CAMERA / DISPENSER =====
+  if (raw == "CAMERA" || raw == "CAMERA_SCAN") return "SCAN";
+  if (raw == "D") return "DISPENSE";
+
+  return raw;
+}
+
+bool patchFirestoreCommand(String docName, String status, String sentCommand, String response) {
+  String ts = getTimestamp();
+
+  String url = "https://firestore.googleapis.com/v1/" + docName +
+    "?key=" + String(FIREBASE_API_KEY) +
+    "&updateMask.fieldPaths=status" +
+    "&updateMask.fieldPaths=sentCommand" +
+    "&updateMask.fieldPaths=response" +
+    "&updateMask.fieldPaths=updatedAt";
+
+  String fields = "";
+  bool first = true;
+  appendFirestoreField(fields, first, "status", firestoreStringValue(status));
+  appendFirestoreField(fields, first, "sentCommand", firestoreStringValue(sentCommand));
+  appendFirestoreField(fields, first, "response", firestoreStringValue(response));
+  appendFirestoreField(fields, first, "updatedAt", firestoreTimestampValue(ts));
+
+  String body = "{\"fields\":{" + fields + "}}";
+  String res;
+  int code = -1;
+  bool ok = firestoreRequest("PATCH", url, body, res, &code);
+
+  Serial.print("COMMAND PATCH CODE: ");
+  Serial.println(code);
+  Serial.println(ok ? "FIRESTORE UPDATE OK" : "FIRESTORE UPDATE FAILED");
+  if (!ok) Serial.println(res);
+  return ok;
+}
+
+void pollFirestoreCommands() {
+  if (firestoreCommandBusy) return;
+  if (millis() - lastFirestoreCommandPollAt < FIRESTORE_COMMAND_POLL_INTERVAL_MS) return;
+  lastFirestoreCommandPollAt = millis();
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) +
+    "/databases/(default)/documents:runQuery?key=" + String(FIREBASE_API_KEY);
+
+  String body =
+    "{"
+      "\"structuredQuery\":{"
+        "\"from\":[{\"collectionId\":\"commands\"}],"
+        "\"where\":{"
+          "\"compositeFilter\":{"
+            "\"op\":\"AND\","
+            "\"filters\":["
+              "{\"fieldFilter\":{\"field\":{\"fieldPath\":\"deviceId\"},\"op\":\"EQUAL\",\"value\":{\"stringValue\":\"" + String(DEVICE_ID) + "\"}}},"
+              "{\"fieldFilter\":{\"field\":{\"fieldPath\":\"status\"},\"op\":\"EQUAL\",\"value\":{\"stringValue\":\"pending\"}}}"
+            "]"
+          "}"
+        "},"
+        "\"orderBy\":[{\"field\":{\"fieldPath\":\"createdAt\"},\"direction\":\"ASCENDING\"}],"
+        "\"limit\":1"
+      "}"
+    "}";
+
+  String res;
+  int code = -1;
+  bool ok = firestoreRequest("POST", url, body, res, &code);
+
+  Serial.print("COMMAND CHECK CODE: ");
+  Serial.println(code);
+
+  if (!ok) {
+    Serial.println("COMMAND QUERY FAILED");
+    Serial.println(res);
+    return;
+  }
+
+  DynamicJsonDocument doc(8192);
+  DeserializationError err = deserializeJson(doc, res);
+  if (err) {
+    Serial.print("Firestore command query parse error: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  JsonArray arr = doc.as<JsonArray>();
+  for (JsonObject item : arr) {
+    if (!item.containsKey("document")) continue;
+
+    JsonObject document = item["document"];
+    String docName = document["name"].as<String>();
+    JsonObject fields = document["fields"];
+
+    String rawCommand = getFirestoreStringField(fields, "arduinoCommand");
+    if (rawCommand.length() == 0) rawCommand = getFirestoreStringField(fields, "command");
+
+    String arduinoCommand = normalizeFirestoreCommand(rawCommand);
+    if (arduinoCommand.length() == 0) continue;
+
+    firestoreCommandBusy = true;
+
+    Serial.print("COMMAND FOUND ");
+    Serial.println(rawCommand);
+
+    sendToArduino(arduinoCommand);
+
+    Serial.print("COMMAND SENT ");
+    Serial.println(arduinoCommand);
+
+    patchFirestoreCommand(docName, "sent_to_arduino", arduinoCommand, "Command sent to Arduino");
+    publishSystemActivity("COMMAND_FORWARDED", arduinoCommand, false);
+    publishHardwareStatus(true);
+
+    firestoreCommandBusy = false;
+    break;
+  }
+}
+
 // =====================================================
 // ROUTES
 // =====================================================
@@ -641,32 +832,46 @@ void handleCommand() {
   Serial.print("[COMMAND_RECEIVED] ");
   Serial.println(raw);
 
-  String arduinoCommand = raw;
+  String arduinoCommand = normalizeFirestoreCommand(raw);
+
+  // Automation commands are no-wait commands because the Arduino prints OK/AUTO logs,
+  // not DONE lines, and START_AUTOMATION stays running until IRFIRST detects a carton.
+  if (arduinoCommand == "START_AUTOMATION" || arduinoCommand == "STOP_AUTOMATION") {
+    sendToArduino(arduinoCommand);
+
+    StaticJsonDocument<512> doc;
+    doc["ok"] = true;
+    doc["command"] = arduinoCommand;
+    doc["requestedCommand"] = raw;
+    doc["message"] = "Automation command sent to Arduino";
+    doc["lastArduinoLine"] = lastArduinoLine;
+    doc["lastErrorLine"] = lastErrorLine;
+    doc["source"] = server.arg("source");
+    doc["queueId"] = server.arg("queueId");
+
+    String out;
+    serializeJson(doc, out);
+    sendJson(200, out);
+    return;
+  }
+
   String expectedDone = "";
 
-  if (raw == "STOP") {
-    arduinoCommand = "BELT_STOP";
-    expectedDone = "DONE:BELT_STOP";
-  } else if (raw == "BELT") {
-    arduinoCommand = "BELT_START";
+  if (arduinoCommand == "BELT_START") {
     expectedDone = "DONE:BELT_START";
-  } else if (raw == "BELT_START") {
-    expectedDone = "DONE:BELT_START";
-  } else if (raw == "BELT_STOP") {
+  } else if (arduinoCommand == "BELT_STOP") {
     expectedDone = "DONE:BELT_STOP";
-  } else if (raw == "HOME") {
+  } else if (arduinoCommand == "HOME") {
     expectedDone = "DONE:HOME";
-  } else if (raw == "START") {
+  } else if (arduinoCommand == "START") {
     expectedDone = "DONE:START";
-  } else if (raw == "ULTRA") {
+  } else if (arduinoCommand == "ULTRA") {
     expectedDone = "DONE:ULTRA";
-  } else if (raw == "TESTIR") {
+  } else if (arduinoCommand == "TESTIR") {
     expectedDone = "DONE:TESTIR";
-  } else if (raw == "CAMERA" || raw == "SCAN" || raw == "CAMERA_SCAN") {
-    arduinoCommand = "SCAN";
+  } else if (arduinoCommand == "SCAN") {
     expectedDone = "DONE:SCAN";
-  } else if (raw == "DISPENSE" || raw == "D") {
-    arduinoCommand = "DISPENSE";
+  } else if (arduinoCommand == "DISPENSE") {
     expectedDone = "DONE:DISPENSE";
   } else {
     expectedDone = "DONE:";
@@ -780,12 +985,47 @@ void handleVerifyLocation() {
   sendJson(ok ? 200 : 504, out);
 }
 
+void handleAutomationStart() {
+  Serial.println("[COMMAND_RECEIVED] START_AUTOMATION");
+  sendToArduino("START_AUTOMATION");
+
+  StaticJsonDocument<384> doc;
+  doc["ok"] = true;
+  doc["command"] = "START_AUTOMATION";
+  doc["message"] = "Automation start sent to Arduino";
+  doc["lastArduinoLine"] = lastArduinoLine;
+  doc["lastErrorLine"] = lastErrorLine;
+
+  String out;
+  serializeJson(doc, out);
+  sendJson(200, out);
+}
+
+void handleAutomationStop() {
+  Serial.println("[COMMAND_RECEIVED] STOP_AUTOMATION");
+  sendToArduino("STOP_AUTOMATION");
+
+  StaticJsonDocument<384> doc;
+  doc["ok"] = true;
+  doc["command"] = "STOP_AUTOMATION";
+  doc["message"] = "Automation stop sent to Arduino";
+  doc["lastArduinoLine"] = lastArduinoLine;
+  doc["lastErrorLine"] = lastErrorLine;
+
+  String out;
+  serializeJson(doc, out);
+  sendJson(200, out);
+}
+
 void setupRoutes() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
 
   server.on("/go", HTTP_GET, handleGo);
   server.on("/start", HTTP_GET, handleStart);
+
+  server.on("/automation/start", HTTP_GET, handleAutomationStart);
+  server.on("/automation/stop", HTTP_GET, handleAutomationStop);
 
   server.on("/belt/start", HTTP_GET, handleBeltStart);
   server.on("/belt/stop", HTTP_GET, handleBeltStop);
@@ -837,6 +1077,8 @@ void setup() {
   Serial.println("GET /status");
   Serial.println("GET /go?position=1..18");
   Serial.println("GET /start");
+  Serial.println("GET /automation/start");
+  Serial.println("GET /automation/stop");
   Serial.println("GET /belt/start");
   Serial.println("GET /belt/stop");
   Serial.println("GET /belt/run?ms=3000");
@@ -849,6 +1091,7 @@ void setup() {
 void loop() {
   server.handleClient();
   readArduinoSerial();
+  pollFirestoreCommands();
   publishHardwareStatus(false);
 
   // Reconnect WiFi if disconnected

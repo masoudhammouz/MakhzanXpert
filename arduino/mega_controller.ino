@@ -23,9 +23,9 @@ unsigned long lastSensorSend = 0;
 // ================= BELT RELAY =================
 #define RELAY_PIN 13
 
-#define IR_START_PIN 40
-#define IR_END_PIN 25
-#define IR_DETECTED_STATE LOW
+// ================= BELT IR =================
+#define IRFIRST 40
+#define IRLAST 25
 
 bool beltRunning = false;
 bool autoMode = false;
@@ -112,9 +112,10 @@ void setup() {
 
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
+  beltRunning = false;
 
-  pinMode(IR_START_PIN, INPUT_PULLUP);
-  pinMode(IR_END_PIN, INPUT_PULLUP);
+  pinMode(IRFIRST, INPUT_PULLUP);
+  pinMode(IRLAST, INPUT_PULLUP);
 
   pinMode(LOC_MUX_OUT, INPUT_PULLUP);
   pinMode(LOC_SEL0, OUTPUT);
@@ -193,14 +194,24 @@ void handleCommand(String cmd) {
     printHelp();
   }
 
-  else if (cmd == "AUTO") {
+  else if (cmd == "AUTO" || cmd == "START_AUTOMATION") {
     autoMode = true;
-    Serial.println("OK AUTO STARTED");
+
+    if (!beltRunning) {
+      beltToggle();
+    }
+
+    Serial.println("OK AUTO STARTED - BELT ON UNTIL IRFIRST");
   }
 
-  else if (cmd == "STOP") {
+  else if (cmd == "STOP" || cmd == "STOP_AUTOMATION") {
     autoMode = false;
-    Serial.println("OK AUTO STOPPED");
+
+    if (beltRunning) {
+      beltToggle();
+    }
+
+    Serial.println("OK AUTO STOPPED - BELT OFF");
   }
 
   else if (cmd == "HOME" || cmd == "H") {
@@ -215,13 +226,17 @@ void handleCommand(String cmd) {
   }
 
   else if (cmd == "BELT_START" || cmd == "BON") {
-    beltToggle();
-    Serial.println("OK BELT_START TOGGLE");
+    if (!beltRunning) {
+      beltToggle();
+    }
+    Serial.println("OK BELT START");
   }
 
   else if (cmd == "BELT_STOP" || cmd == "BOFF") {
-    beltToggle();
-    Serial.println("OK BELT_STOP TOGGLE");
+    if (beltRunning) {
+      beltToggle();
+    }
+    Serial.println("OK BELT STOP");
   }
 
   else if (cmd == "BELT" || cmd == "B") {
@@ -352,6 +367,8 @@ void updateSensors() {
   data += "\"humidity\":" + String(humidity, 2) + ",";
   data += "\"dhtOk\":" + String(dhtOk ? "true" : "false") + ",";
   data += "\"belt\":" + String(beltRunning ? 1 : 0) + ",";
+  data += "\"irFirst\":" + String(readIRFIRST()) + ",";
+  data += "\"irLast\":" + String(readIRLAST()) + ",";
   data += "\"x\":" + String(currentX) + ",";
   data += "\"y\":" + String(currentY) + ",";
   data += "\"z\":" + String(currentZ);
@@ -361,42 +378,59 @@ void updateSensors() {
   Serial1.println(data);
 }
 
+// ================= IR READINGS =================
+// بدون جسم = HIGH
+// مع جسم = LOW
+// بالكود: بدون جسم = 0 / مع جسم = 1
+
+int readIRFIRST() {
+  if (digitalRead(IRFIRST) == LOW) return 1;
+  return 0;
+}
+
+int readIRLAST() {
+  if (digitalRead(IRLAST) == LOW) return 1;
+  return 0;
+}
+
+bool irFirstDetected() {
+  return readIRFIRST() == 1;
+}
+
+bool irLastDetected() {
+  return readIRLAST() == 1;
+}
+
 // ================= AUTO SEQUENCE =================
 
 void runAutoCycle() {
-  Serial.println("AUTO: DISPENSE");
-  dispenseOne();
+  if (!beltRunning) {
+    beltToggle();
+  }
 
-  Serial.println("AUTO: BELT TOGGLE ON");
-  beltToggle();
+  Serial.println("AUTO: BELT RUNNING UNTIL IRFIRST");
 
-  while (!irStartDetected()) {
+  while (!irFirstDetected()) {
     updateSensors();
     readCommandFrom(Serial);
     readCommandFrom(Serial1);
-    if (!autoMode) return;
+
+    if (!autoMode) {
+      if (beltRunning) {
+        beltToggle();
+      }
+      return;
+    }
   }
 
-  Serial.println("AUTO: START IR DETECTED");
+  Serial.println("AUTO: IRFIRST DETECTED - STOP BELT");
 
-  while (!irEndDetected()) {
-    updateSensors();
-    readCommandFrom(Serial);
-    readCommandFrom(Serial1);
-    if (!autoMode) return;
+  if (beltRunning) {
+    beltToggle();
   }
-
-  Serial.println("AUTO: END IR DETECTED");
-
-  Serial.println("AUTO: BELT TOGGLE OFF");
-  beltToggle();
-
-  sendCameraScan();
-
-  Serial.println("AUTO: WAITING RPI RESULT");
-  Serial.println("RPI SEND: SITE 1 TO SITE 9");
 
   autoMode = false;
+  Serial.println("OK AUTO STEP 1 DONE");
 }
 
 // ================= BELT =================
@@ -411,14 +445,6 @@ void beltToggle() {
   relayPulse();
   beltRunning = !beltRunning;
   Serial.println(beltRunning ? "BELT STATE = ON" : "BELT STATE = OFF");
-}
-
-bool irStartDetected() {
-  return digitalRead(IR_START_PIN) == IR_DETECTED_STATE;
-}
-
-bool irEndDetected() {
-  return digitalRead(IR_END_PIN) == IR_DETECTED_STATE;
 }
 
 // ================= DISPENSER =================
@@ -441,28 +467,34 @@ void sendCameraScan() {
 // ================= LOCATION IR MUX =================
 
 bool readLocationIR(byte channel) {
-  if (channel > 3) return false;
+  if (channel > 2) return false;
 
   digitalWrite(LOC_SEL0, channel & 1);
   digitalWrite(LOC_SEL1, (channel >> 1) & 1);
 
-  delayMicroseconds(50);
+  delay(5);
 
-  return digitalRead(LOC_MUX_OUT) == IR_DETECTED_STATE;
+  int detectedCount = 0;
+
+  for (int i = 0; i < 7; i++) {
+    if (digitalRead(LOC_MUX_OUT) == LOW) {
+      detectedCount++;
+    }
+    delay(2);
+  }
+
+  return detectedCount >= 5;
 }
 
 void printLocationIRs() {
-  Serial.print("LOC IR 1 CH0 = ");
+  Serial.print("LOCATION 9 IR = ");
   Serial.println(readLocationIR(0) ? "DETECTED" : "CLEAR");
 
-  Serial.print("LOC IR 2 CH1 = ");
+  Serial.print("LOCATION 8 IR = ");
   Serial.println(readLocationIR(1) ? "DETECTED" : "CLEAR");
 
-  Serial.print("LOC IR 3 CH2 = ");
+  Serial.print("LOCATION 7 IR = ");
   Serial.println(readLocationIR(2) ? "DETECTED" : "CLEAR");
-
-  Serial.print("LOC IR CH3 EMPTY = ");
-  Serial.println(readLocationIR(3) ? "DETECTED" : "CLEAR");
 }
 
 // ================= POSITIONS =================
@@ -751,22 +783,22 @@ void printStatus() {
   Serial.print("BELT TRACKED STATE = ");
   Serial.println(beltRunning ? "ON" : "OFF");
 
-  Serial.print("IR START D40 = ");
-  Serial.println(irStartDetected() ? "DETECTED" : "CLEAR");
+  Serial.print("IRFIRST = ");
+  Serial.println(readIRFIRST() == 1 ? "DETECTED" : "CLEAR");
 
-  Serial.print("IR END D25 = ");
-  Serial.println(irEndDetected() ? "DETECTED" : "CLEAR");
+  Serial.print("IRLAST = ");
+  Serial.println(readIRLAST() == 1 ? "DETECTED" : "CLEAR");
 
   printLocationIRs();
   printCurrent();
 }
 
 void testIRs() {
-  Serial.print("IR START D40 = ");
-  Serial.println(digitalRead(IR_START_PIN));
+  Serial.print("IRFIRST = ");
+  Serial.println(readIRFIRST() == 1 ? "DETECTED" : "CLEAR");
 
-  Serial.print("IR END D25 = ");
-  Serial.println(digitalRead(IR_END_PIN));
+  Serial.print("IRLAST = ");
+  Serial.println(readIRLAST() == 1 ? "DETECTED" : "CLEAR");
 
   printLocationIRs();
 }
@@ -790,12 +822,12 @@ void testLimits() {
 
 void printHelp() {
   Serial.println("Commands:");
-  Serial.println("AUTO");
-  Serial.println("STOP");
+  Serial.println("AUTO / START_AUTOMATION");
+  Serial.println("STOP / STOP_AUTOMATION");
   Serial.println("HOME / H");
   Serial.println("START / S");
-  Serial.println("BELT_START / BON = TOGGLE");
-  Serial.println("BELT_STOP / BOFF = TOGGLE");
+  Serial.println("BELT_START / BON");
+  Serial.println("BELT_STOP / BOFF");
   Serial.println("BELT / B = TOGGLE");
   Serial.println("DISPENSE / D");
   Serial.println("CAMERA / SCAN");
