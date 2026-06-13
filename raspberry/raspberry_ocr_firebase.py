@@ -1,6 +1,8 @@
 import argparse
+import difflib
 import json
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -30,14 +32,31 @@ FIRESTORE_BASE_URL = (
 )
 
 TESSERACT_CMD = ""  # On Raspberry Pi keep empty if tesseract is in PATH.
+OCR_TEST_MODE = os.getenv("MAKHZAN_OCR_TEST_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
 OCR_EVERY_N_FRAMES = 8
-MIN_SHARPNESS = 50.0
-UPSCALE_FACTOR = 1.5
+MIN_SHARPNESS = 35.0
+UPSCALE_FACTOR = 1.2
+ROI_X = 0.15
+ROI_Y = 0.10
+ROI_W = 0.70
+ROI_H = 0.75
+BRAND_REGION = (0.05, 0.05, 0.90, 0.25)
+MODEL_REGION = (0.05, 0.35, 0.90, 0.18)
+COLOR_REGION = (0.05, 0.55, 0.90, 0.16)
+SIZE_REGION = (0.05, 0.72, 0.90, 0.16)
 LOGO_FOLDER = "logos"
-STABLE_N = 3
+STABLE_N = 2
 SAME_LABEL_SUPPRESS_SECONDS = 15
-CAMERA_ALIGN_DELAY_MS = 1200
+CAMERA_ALIGN_DELAY_MS = 350
 DROP_TO_LIFTER_DELAY_MS = 3000
+ESP_STATUS_CACHE_SECONDS = 0.25
+AUTOMATION_READY_CACHE_SECONDS = 2.0
+STATUS_UPDATE_MIN_INTERVAL_SECONDS = 2.0
+STATUS_STATS_INTERVAL_SECONDS = 3.0
+HARDWARE_FIRESTORE_INTERVAL_SECONDS = 2.0
+DEBUG_OCR_DIR = "debug_ocr"
+SAVE_DEBUG_IMAGES = True
+SAVE_DEBUG_EVERY_N_OCR = 10
 AUTOMATION_STATUS_PATH = "automation/status"
 VALID_SORTING_STRATEGIES = {
     "brand",
@@ -114,6 +133,24 @@ INTERNAL_PRODUCT_CATALOG = [
     {"brand": "SKECHERS", "model": "ARCH FIT", "color": "NAVY", "size": "42", "price": 90.0},
     {"brand": "SKECHERS", "model": "UNO", "color": "RED", "size": "43", "price": 85.0},
 ]
+
+ALLOWED_BRANDS = ["NIKE", "ADIDAS", "PUMA", "SKECHERS"]
+ALLOWED_COLORS = ["WHITE", "BLACK", "GREEN", "RED", "NAVY"]
+ALLOWED_MODELS = [
+    "AIR FORCE",
+    "AIR MAX",
+    "DUNK LOW",
+    "SAMBA",
+    "GAZELLE",
+    "CAMPUS",
+    "SUEDE CLASSIC",
+    "RS",
+    "CALI",
+    "GO WALK",
+    "ARCH FIT",
+    "UNO",
+]
+ALLOWED_SIZES = ["38", "39", "40", "41", "42", "43"]
 
 
 @dataclass
@@ -357,6 +394,103 @@ def get_esp_status(esp_base_url: str) -> dict:
     return data.get("status") or data
 
 
+class EspStatusCache:
+    def __init__(self, esp_base_url: str, ttl_seconds: float = ESP_STATUS_CACHE_SECONDS):
+        self.esp_base_url = esp_base_url
+        self.ttl_seconds = ttl_seconds
+        self.last_status: dict = {}
+        self.last_read_at = 0.0
+
+    def get(self) -> dict:
+        now = time.monotonic()
+        if self.last_status and now - self.last_read_at < self.ttl_seconds:
+            return self.last_status
+
+        started_at = time.perf_counter()
+        self.last_status = get_esp_status(self.esp_base_url)
+        self.last_read_at = now
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        print(f"ESP_STATUS_TIME_MS {elapsed_ms:.1f}")
+        return self.last_status
+
+
+class EspStatusPoller(threading.Thread):
+    def __init__(self, esp_base_url: str, firebase: Optional[FirebaseClient] = None, interval_seconds: float = ESP_STATUS_CACHE_SECONDS):
+        super().__init__(daemon=True)
+        self.esp_base_url = esp_base_url
+        self.firebase = firebase
+        self.interval_seconds = interval_seconds
+        self.status: dict = {}
+        self.error = ""
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.last_firestore_publish_at = 0.0
+
+    def snapshot(self) -> tuple[dict, str]:
+        with self.lock:
+            return dict(self.status), self.error
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            started_at = time.perf_counter()
+            try:
+                status = get_esp_status(self.esp_base_url)
+                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                with self.lock:
+                    self.status = status
+                    self.error = ""
+                print(f"ESP_STATUS_TIME_MS {elapsed_ms:.1f}")
+                self.publish_firestore_status(status, "")
+            except requests.RequestException as exc:
+                with self.lock:
+                    self.error = str(exc)
+                self.publish_firestore_status({}, str(exc))
+            self.stop_event.wait(self.interval_seconds)
+
+    def publish_firestore_status(self, status: dict, error: str) -> None:
+        if not self.firebase or not self.firebase.enabled:
+            return
+        now_monotonic = time.monotonic()
+        if now_monotonic - self.last_firestore_publish_at < HARDWARE_FIRESTORE_INTERVAL_SECONDS:
+            return
+        self.last_firestore_publish_at = now_monotonic
+        try:
+            publish_esp_hardware_status(self.firebase, status, error)
+        except requests.RequestException as exc:
+            print("ESP Firestore publish failed:", exc)
+
+
+class AutomationReadyPoller(threading.Thread):
+    def __init__(self, firebase: FirebaseClient, interval_seconds: float = AUTOMATION_READY_CACHE_SECONDS):
+        super().__init__(daemon=True)
+        self.firebase = firebase
+        self.interval_seconds = interval_seconds
+        self.ready = False
+        self.status = automation_status_defaults()
+        self.reason = "Waiting for automation"
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+
+    def snapshot(self) -> tuple[bool, dict, str]:
+        with self.lock:
+            return self.ready, dict(self.status), self.reason
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                ready, status, reason = automation_ready(self.firebase)
+            except requests.RequestException as exc:
+                ready = False
+                status = automation_status_defaults()
+                reason = f"Automation status failed: {exc}"
+                print("Automation status failed:", exc)
+            with self.lock:
+                self.ready = ready
+                self.status = status
+                self.reason = reason
+            self.stop_event.wait(self.interval_seconds)
+
+
 def bool_status(status: dict, key: str) -> bool:
     return bool(status.get(key))
 
@@ -385,11 +519,110 @@ def get_automation_status(firebase: FirebaseClient) -> dict:
     return {**automation_status_defaults(), **status}
 
 
+_automation_status_cache: dict = {}
+_automation_status_lock = threading.Lock()
+_status_update_worker = None
+
+
 def set_automation_status(firebase: FirebaseClient, updates: dict) -> None:
     if not firebase.enabled:
         return
     data = {"updatedAt": timestamp(), **updates}
     firebase.set_doc(AUTOMATION_STATUS_PATH, data, merge=True)
+
+
+class StatusUpdateWorker(threading.Thread):
+    def __init__(self, firebase: FirebaseClient):
+        super().__init__(daemon=True)
+        self.firebase = firebase
+        self.queue: queue.Queue = queue.Queue(maxsize=1)
+        self.stop_event = threading.Event()
+        self.last_sent_at = 0.0
+        self.sent_count = 0
+        self.skipped_count = 0
+        self.last_stats_at = 0.0
+
+    def enqueue(self, updates: dict) -> bool:
+        if not self.firebase.enabled:
+            self.skipped_count += 1
+            return False
+        try:
+            self.queue.put_nowait(dict(updates))
+            return True
+        except queue.Full:
+            self.skipped_count += 1
+            try:
+                self.queue.get_nowait()
+                self.queue.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self.queue.put_nowait(dict(updates))
+                return True
+            except queue.Full:
+                return False
+
+    def print_stats(self) -> None:
+        now = time.monotonic()
+        if now - self.last_stats_at < STATUS_STATS_INTERVAL_SECONDS:
+            return
+        self.last_stats_at = now
+        print(f"STATUS_QUEUE_SIZE {self.queue.qsize()}")
+        print(f"STATUS_SENT {self.sent_count}")
+        print(f"STATUS_SKIPPED {self.skipped_count}")
+
+    def run(self) -> None:
+        pending = None
+        while not self.stop_event.is_set():
+            self.print_stats()
+            try:
+                pending = self.queue.get(timeout=0.1)
+                self.queue.task_done()
+            except queue.Empty:
+                continue
+
+            elapsed = time.monotonic() - self.last_sent_at
+            if elapsed < STATUS_UPDATE_MIN_INTERVAL_SECONDS:
+                self.stop_event.wait(STATUS_UPDATE_MIN_INTERVAL_SECONDS - elapsed)
+                if self.stop_event.is_set():
+                    break
+
+            started_at = time.perf_counter()
+            try:
+                set_automation_status(self.firebase, pending)
+            except requests.RequestException as exc:
+                self.skipped_count += 1
+                print("Firebase status update failed:", exc)
+                continue
+            self.last_sent_at = time.monotonic()
+            self.sent_count += 1
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            print(f"FIREBASE_UPDATE_TIME_MS {elapsed_ms:.1f}")
+
+
+def set_status_update_worker(worker) -> None:
+    global _status_update_worker
+    _status_update_worker = worker
+
+
+def set_status_if_changed(firebase: FirebaseClient, updates: dict) -> bool:
+    if not firebase.enabled:
+        return False
+
+    comparable = {key: value for key, value in updates.items() if key != "updatedAt"}
+    with _automation_status_lock:
+        unchanged = all(_automation_status_cache.get(key) == value for key, value in comparable.items())
+        if unchanged:
+            worker = _status_update_worker
+            if worker:
+                worker.skipped_count += 1
+            return False
+        _automation_status_cache.update(comparable)
+
+    worker = _status_update_worker
+    if worker:
+        return worker.enqueue(updates)
+    return False
 
 
 def ensure_automation_status(firebase: FirebaseClient) -> None:
@@ -408,6 +641,47 @@ def automation_ready(firebase: FirebaseClient) -> tuple[bool, dict, str]:
     if not bool(status.get("automationStarted")):
         return False, status, "Waiting for Start Automation"
     return True, status, ""
+
+
+def fire_status_from_sensors(status: dict) -> tuple[str, str]:
+    mq3 = int(float(status.get("mq3") or 0))
+    mq135 = int(float(status.get("mq135") or 0))
+    temperature = float(status.get("temperature") or -1)
+    gas_warning = mq3 >= 1500 or mq135 >= 1500
+    gas_alert = mq3 >= 2500 or mq135 >= 2500
+    high_temperature = temperature >= 45
+    if gas_alert or (gas_warning and high_temperature):
+        return "Fire Alert", "High"
+    if gas_warning or high_temperature:
+        return "Warning", "Medium"
+    return "Normal", "Low"
+
+
+def publish_esp_hardware_status(firebase: FirebaseClient, status: dict, error: str = "") -> None:
+    now = utc_now()
+    device_id = "esp-main-01"
+    fire_status, fire_risk = fire_status_from_sensors(status)
+    sensor_payload = {
+        **status,
+        "deviceId": device_id,
+        "fireStatus": fire_status,
+        "fireRisk": fire_risk,
+        "gasStatus": fire_status,
+        "environmentStatus": "Error" if error else "Online",
+        "createdAt": timestamp(now),
+        "updatedAt": timestamp(now),
+    }
+    device_payload = {
+        **status,
+        "deviceId": device_id,
+        "status": "error" if error else "online",
+        "lastError": error or None,
+        "lastSeen": timestamp(now),
+        "updatedAt": timestamp(now),
+    }
+    firebase.add_doc("sensorReadings", sensor_payload)
+    firebase.set_doc(f"devices/{device_id}", device_payload, merge=True)
+    log_activity(firebase, "FIRESTORE_UPDATE", f"ESP32 status mirrored to sensorReadings/devices.", "esp32")
 
 
 def normalize_sku_part(value: str) -> str:
@@ -1047,6 +1321,7 @@ def create_store_task(db_path: str, firebase: FirebaseClient, label: dict) -> Op
         out_position = get_out_position(location_id)
 
         print("CALLING_SYNC_PRODUCT_FROM_LABEL")
+        print("[LOCATION_SELECTED]", f"{key} -> location {location_id} / GO {in_position}, GO {out_position}")
         product_sku, sync_status = sync_product_from_label(
             firebase,
             label,
@@ -1157,6 +1432,7 @@ def create_store_task(db_path: str, firebase: FirebaseClient, label: dict) -> Op
         "updatedAt": timestamp(now),
     }, merge=False)
     print("STORE_QUEUE_CREATED")
+    print("[LOCATION_SELECTED]", f"{product_sku} -> location {location_id}")
     log_activity(firebase, "LOCATION_RESERVED", f"{product_sku} reserved location {location_id}.", "raspberry")
     log_activity(firebase, "store_queued", f"{box_id} queued for location {location_id}: GO {in_position} then GO {out_position}.", "raspberry")
     log_activity(firebase, "scan_queued", f"{box_id} queued for location {location_id}: IN {in_position}, OUT {out_position}.", "raspberry")
@@ -1263,7 +1539,8 @@ class QueueWorker(threading.Thread):
             "currentOperation": f"GO {position}",
             "lastError": None,
         })
-        log_activity(self.firebase, "go_sent", f"GO {position} sent for {queue_id}.", source)
+        print("[COMMAND_SENT]", f"GO {position}", queue_id)
+        log_activity(self.firebase, "COMMAND_SENT", f"GO {position} sent for {queue_id}.", source)
         response = requests.get(
             f"{self.esp_base_url}/go",
             params={"position": position, "source": source, "queueId": queue_id},
@@ -1273,7 +1550,7 @@ class QueueWorker(threading.Thread):
         result = response.json()
         if not result.get("ok"):
             raise RuntimeError(result.get("error") or f"GO {position} failed")
-        log_activity(self.firebase, "go_done", f"GO {position} done for {queue_id}.", source)
+        log_activity(self.firebase, "COMMAND_COMPLETED", f"GO {position} done for {queue_id}.", source)
         self.at_starting_point = False
         return result
 
@@ -1318,6 +1595,9 @@ class QueueWorker(threading.Thread):
     def verify_location(self, location_id: int) -> bool:
         data = esp_get_json(self.esp_base_url, "/verify-location", params={"id": location_id}, timeout=20)
         verification = data.get("verification") or data
+        if verification.get("prototypeBypass"):
+            print("[VERIFY]", f"Location {location_id} skipped - no prototype sensor")
+            log_activity(self.firebase, "VERIFY_SKIPPED", f"Location {location_id} has no verification sensor; skipped.", "raspberry")
         return bool(verification.get("detected"))
 
     def wait_for_lifter_ir(self, timeout_seconds: int = 30) -> None:
@@ -1497,7 +1777,8 @@ class QueueWorker(threading.Thread):
             conn.execute("UPDATE store_queue SET status = 'done', updated_at = ? WHERE id = ?", (now, task["id"]))
             conn.execute("UPDATE boxes SET status = 'stored', updated_at = ? WHERE box_id = ?", (now, task["box_id"]))
             conn.execute("UPDATE locations SET status = 'full', updated_at = ? WHERE id = ?", (now, task["location_id"]))
-            log_activity(self.firebase, "put_done", f"{task['box_id']} stored at location {task['location_id']}.", "raspberry")
+            print("[STORE_SUCCESS]", f"{task['box_id']} stored at location {task['location_id']}")
+            log_activity(self.firebase, "STORE_SUCCESS", f"{task['box_id']} stored at location {task['location_id']}.", "raspberry")
             try:
                 post_available_stock_after_store(
                     self.firebase,
@@ -1522,7 +1803,8 @@ class QueueWorker(threading.Thread):
                 "errorMessage": "Store task failed.",
                 "updatedAt": timestamp(now),
             }, merge=True)
-            log_activity(self.firebase, "store_error", "Store task failed.", "raspberry")
+            print("[STORE_FAILED]", f"{task['box_id']} store failed")
+            log_activity(self.firebase, "STORE_FAILED", "Store task failed.", "raspberry")
         conn.commit()
         conn.close()
 
@@ -1735,10 +2017,13 @@ class QueueWorker(threading.Thread):
             return False
 
         command = commands[0]
+        if command.get("executedAt") or command.get("status") != "pending":
+            return False
+        command_id = str(command.get("commandId") or command["_id"])
         command_type = str(command.get("type") or "GO").strip().upper()
         if command_type == "COMMAND":
             raw_command = str(command.get("command") or command.get("arduinoCommand") or "").strip().upper()
-            if raw_command not in ("STOP", "STATUS", "TESTIR", "ULTRA", "CAMERA", "SCAN", "DISPENSE", "D", "HOME", "START", "BELT"):
+            if raw_command not in ("STOP", "STATUS", "TESTIR", "ULTRA", "CAMERA", "SCAN", "DISPENSE", "D", "HOME", "START", "BELT", "BELT_START", "BELT_STOP"):
                 self.firebase.set_doc(f"commands/{command['_id']}", {
                     "status": "error",
                     "errorMessage": f"Invalid command {raw_command}",
@@ -1748,7 +2033,9 @@ class QueueWorker(threading.Thread):
 
             self.firebase.set_doc(f"commands/{command['_id']}", {
                 "status": "sent_to_arduino",
+                "commandId": command_id,
                 "sentAt": timestamp(),
+                "updatedAt": timestamp(),
             })
             try:
                 result = self.call_esp_command(raw_command, "website", command["_id"])
@@ -1758,9 +2045,12 @@ class QueueWorker(threading.Thread):
                 ok = False
 
             self.firebase.set_doc(f"commands/{command['_id']}", {
+                "commandId": command_id,
                 "status": "done" if ok else "error",
+                "response": result,
                 "errorMessage": "" if ok else result.get("error", "Manual command failed."),
-                "doneAt": timestamp() if ok else timestamp(),
+                "doneAt": timestamp(),
+                "executedAt": timestamp() if ok else None,
                 "updatedAt": timestamp(),
             })
             return True
@@ -1785,7 +2075,9 @@ class QueueWorker(threading.Thread):
 
         self.firebase.set_doc(f"commands/{command['_id']}", {
             "status": "sent_to_arduino",
+            "commandId": command_id,
             "sentAt": timestamp(),
+            "updatedAt": timestamp(),
         })
         try:
             result = self.call_esp_go(position, "website", command["_id"])
@@ -1795,9 +2087,12 @@ class QueueWorker(threading.Thread):
             ok = False
 
         self.firebase.set_doc(f"commands/{command['_id']}", {
+            "commandId": command_id,
             "status": "done" if ok else "error",
+            "response": result,
             "errorMessage": "" if ok else result.get("error", "Manual command failed."),
-            "doneAt": timestamp() if ok else timestamp(),
+            "doneAt": timestamp(),
+            "executedAt": timestamp() if ok else None,
             "updatedAt": timestamp(),
         })
         return True
@@ -2062,8 +2357,8 @@ def brand_from_model_text(text):
     return "--"
 
 
-def set_camera_properties(_cap):
-    pass
+def set_camera_properties(cap):
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
 def open_camera(camera_index):
@@ -2081,10 +2376,10 @@ def preprocess_fast(frame):
 
 def extract_roi(frame):
     h, w = frame.shape[:2]
-    roi_w = int(w * 0.75)
-    roi_h = int(h * 0.85)
-    x = int(w * 0.125)
-    y = int(h * 0.075)
+    roi_w = int(w * ROI_W)
+    roi_h = int(h * ROI_H)
+    x = int(w * ROI_X)
+    y = int(h * ROI_Y)
     return frame[y:y + roi_h, x:x + roi_w], (x, y, roi_w, roi_h)
 
 
@@ -2114,6 +2409,16 @@ def normalize_ocr_text(text):
     return text.strip()
 
 
+def crop_relative(image, region):
+    h, w = image.shape[:2]
+    rel_x, rel_y, rel_w, rel_h = region
+    x1 = max(0, min(w - 1, int(w * rel_x)))
+    y1 = max(0, min(h - 1, int(h * rel_y)))
+    x2 = max(x1 + 1, min(w, int(w * (rel_x + rel_w))))
+    y2 = max(y1 + 1, min(h, int(h * (rel_y + rel_h))))
+    return image[y1:y2, x1:x2]
+
+
 def clean_value(value):
     value = value.strip(" -:_")
     value = value.replace("|", "/")
@@ -2137,37 +2442,252 @@ def parse_fields(text):
     return fields
 
 
-def run_ocr(image, debug_name, psm):
-    config = f"--oem 3 --psm {psm}"
+def clean_field_ocr_text(value: str) -> str:
+    value = normalize_ocr_text(value).upper()
+    value = value.replace("0", "O")
+    value = value.replace("|", "I")
+    value = re.sub(r"\b(BRAND|MODEL|COLOR|SIZE)\b\s*[:\-]?", " ", value)
+    value = re.sub(r"[^A-Z0-9]+", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def compact_match_value(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def closest_allowed(raw_value: str, allowed_values: list[str], threshold: float = 0.64) -> str:
+    candidate = clean_field_ocr_text(raw_value)
+    if not candidate:
+        return ""
+
+    aliases = {
+        "AIRFORCE": "AIR FORCE",
+        "AIRFORCE1": "AIR FORCE",
+        "AIRF0RCE": "AIR FORCE",
+        "AIRMAX": "AIR MAX",
+        "DUNK": "DUNK LOW",
+        "DUNKLOW": "DUNK LOW",
+        "SUEDE": "SUEDE CLASSIC",
+        "SUEDECLASSIC": "SUEDE CLASSIC",
+        "RSX": "RS",
+        "RS X": "RS",
+        "GOWALK": "GO WALK",
+        "ARCHFIT": "ARCH FIT",
+        "SKECHER": "SKECHERS",
+        "SKETCHERS": "SKECHERS",
+        "SHECHERS": "SKECHERS",
+        "WHLTE": "WHITE",
+        "WHTE": "WHITE",
+        "WH1TE": "WHITE",
+        "BLAK": "BLACK",
+        "BLK": "BLACK",
+    }
+    candidate = aliases.get(candidate, aliases.get(compact_match_value(candidate), candidate))
+    if candidate in allowed_values:
+        return candidate
+
+    compact_candidate = compact_match_value(candidate)
+    for allowed in allowed_values:
+        compact_allowed = compact_match_value(allowed)
+        if compact_candidate == compact_allowed:
+            return allowed
+        if compact_allowed in compact_candidate or compact_candidate in compact_allowed:
+            if min(len(compact_allowed), len(compact_candidate)) >= 2:
+                return allowed
+
+    best_value = ""
+    best_score = 0.0
+    for allowed in allowed_values:
+        score = difflib.SequenceMatcher(None, compact_candidate, compact_match_value(allowed)).ratio()
+        if score > best_score:
+            best_score = score
+            best_value = allowed
+    return best_value if best_score >= threshold else ""
+
+
+def closest_allowed_size(raw_value: str) -> str:
+    value = normalize_ocr_text(raw_value).upper()
+    value = value.replace("O", "0").replace("Q", "0")
+    value = value.replace("I", "1").replace("L", "1")
+    value = value.replace("S", "5").replace("B", "8")
+    match = re.search(r"\d{2}", value)
+    if match and match.group(0) in ALLOWED_SIZES:
+        return match.group(0)
+    return closest_allowed(value, ALLOWED_SIZES, threshold=0.75)
+
+
+def preprocess_ocr_crop(image):
+    gray = preprocess_fast(image)
+    _, thresholded = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    enlarged = cv2.resize(thresholded, None, fx=UPSCALE_FACTOR, fy=UPSCALE_FACTOR, interpolation=cv2.INTER_CUBIC)
+    return thresholded, enlarged
+
+
+def run_ocr(image, config):
     data = pytesseract.image_to_data(image, config=config, output_type=pytesseract.Output.DICT)
-    text = pytesseract.image_to_string(image, config=config)
-    clean_text = normalize_ocr_text(text)
-    return OCRResult(text=clean_text, confidence=mean_confidence(data), fields=parse_fields(clean_text), debug_name=f"{debug_name}_psm{psm}")
+    words = []
+    for text, conf in zip(data.get("text", []), data.get("conf", [])):
+        try:
+            if float(conf) < 0:
+                continue
+        except ValueError:
+            continue
+        text = str(text or "").strip()
+        if text:
+            words.append(text)
+    text = " ".join(words)
+    return normalize_ocr_text(text), mean_confidence(data)
+
+
+_ocr_debug_attempt_count = 0
+
+
+def should_save_ocr_debug_images() -> bool:
+    global _ocr_debug_attempt_count
+    _ocr_debug_attempt_count += 1
+    return SAVE_DEBUG_IMAGES and _ocr_debug_attempt_count % SAVE_DEBUG_EVERY_N_OCR == 0
+
+
+def save_ocr_debug_images(roi, crops: dict, thresholded_crops: dict) -> None:
+    os.makedirs(DEBUG_OCR_DIR, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    suffix = f"{stamp}-{int(time.time() * 1000) % 1000:03d}"
+    cv2.imwrite(os.path.join(DEBUG_OCR_DIR, f"{suffix}-full_roi.png"), roi)
+    for name, crop in crops.items():
+        cv2.imwrite(os.path.join(DEBUG_OCR_DIR, f"{suffix}-{name}_crop.png"), crop)
+    for name, crop in thresholded_crops.items():
+        cv2.imwrite(os.path.join(DEBUG_OCR_DIR, f"{suffix}-{name}_threshold.png"), crop)
 
 
 def best_ocr_result(roi, templates):
-    gray = preprocess_fast(roi)
-    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    enlarged = cv2.resize(otsu, None, fx=UPSCALE_FACTOR, fy=UPSCALE_FACTOR, interpolation=cv2.INTER_CUBIC)
-    best_result = run_ocr(enlarged, "otsu", 6)
+    text_config = "--oem 1 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+    size_config = "--oem 1 --psm 7 -c tessedit_char_whitelist=0123456789"
+    crops = {
+        "brand": crop_relative(roi, BRAND_REGION),
+        "model": crop_relative(roi, MODEL_REGION),
+        "color": crop_relative(roi, COLOR_REGION),
+        "size": crop_relative(roi, SIZE_REGION),
+    }
+    thresholded_crops = {}
+    enlarged_crops = {}
+    for name, crop in crops.items():
+        thresholded, enlarged = preprocess_ocr_crop(crop)
+        thresholded_crops[name] = thresholded
+        enlarged_crops[name] = enlarged
+
+    if should_save_ocr_debug_images():
+        save_ocr_debug_images(roi, crops, thresholded_crops)
+
+    brand_raw, brand_conf = run_ocr(enlarged_crops["brand"], text_config)
+    model_raw, model_conf = run_ocr(enlarged_crops["model"], text_config)
+    color_raw, color_conf = run_ocr(enlarged_crops["color"], text_config)
+    size_raw, size_conf = run_ocr(enlarged_crops["size"], size_config)
+
+    print("BRAND_RAW =", brand_raw)
+    print("MODEL_RAW =", model_raw)
+    print("COLOR_RAW =", color_raw)
+    print("SIZE_RAW =", size_raw)
+
     logo_score = 0.0
-    brand_text = brand_from_ocr_text(best_result.text)
+    fields = {
+        "model": closest_allowed(model_raw, ALLOWED_MODELS, threshold=0.58),
+        "color": closest_allowed(color_raw, ALLOWED_COLORS, threshold=0.68),
+        "size": closest_allowed_size(size_raw),
+    }
+
+    brand_text = brand_from_ocr_text(brand_raw)
+    if brand_text == "--":
+        brand_text = closest_allowed(brand_raw, ALLOWED_BRANDS, threshold=0.62) or "--"
     if brand_text != "--":
-        best_result.fields["brand"] = brand_text
+        fields["brand"] = brand_text
     else:
-        brand_logo, logo_score = detect_brand_by_logo(roi, templates)
-        best_result.fields["brand"] = brand_logo if brand_logo != "--" else brand_from_model_text(best_result.text)
-    return best_result, enlarged, logo_score
+        brand_logo, logo_score = detect_brand_by_logo(crops["brand"], templates)
+        fields["brand"] = brand_logo if brand_logo != "--" else ""
+
+    fields = {key: value for key, value in fields.items() if value}
+    combined_text = " ".join([brand_raw, model_raw, color_raw, size_raw]).strip()
+    confidence_values = [brand_conf, model_conf, color_conf, size_conf]
+    confidence = float(np.mean([value for value in confidence_values if value >= 0])) if confidence_values else 0.0
+    result = OCRResult(text=combined_text, confidence=confidence, fields=fields, debug_name="field_crops")
+    return result, enlarged_crops, logo_score
 
 
-def draw_overlay(frame, roi_rect, result, fps, sharpness, status, logo_score):
+class OCRWorker(threading.Thread):
+    def __init__(self, templates):
+        super().__init__(daemon=True)
+        self.templates = templates
+        self.jobs: queue.Queue = queue.Queue(maxsize=1)
+        self.results: queue.Queue = queue.Queue(maxsize=1)
+        self.stop_event = threading.Event()
+        self.busy = threading.Event()
+
+    def submit(self, roi, sharpness: float) -> bool:
+        if self.busy.is_set() or not self.jobs.empty():
+            return False
+        job = (roi.copy(), sharpness, time.time())
+        try:
+            self.jobs.put_nowait(job)
+            return True
+        except queue.Full:
+            return False
+
+    def get_result(self) -> Optional[dict]:
+        try:
+            return self.results.get_nowait()
+        except queue.Empty:
+            return None
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                roi, sharpness, submitted_at = self.jobs.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            self.busy.set()
+            started_at = time.perf_counter()
+            try:
+                print("OCR WORKER STARTED")
+                result, _, logo_score = best_ocr_result(roi, self.templates)
+                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                print(f"OCR_TIME_MS {elapsed_ms:.1f}")
+                payload = {
+                    "result": result,
+                    "logo_score": logo_score,
+                    "sharpness": sharpness,
+                    "submitted_at": submitted_at,
+                    "ocr_time_ms": elapsed_ms,
+                }
+                while not self.results.empty():
+                    try:
+                        self.results.get_nowait()
+                    except queue.Empty:
+                        break
+                self.results.put_nowait(payload)
+            except Exception as exc:
+                print("OCR worker failed:", exc)
+            finally:
+                self.busy.clear()
+                self.jobs.task_done()
+
+
+def draw_overlay(frame, roi_rect, result, fps, sharpness, status, logo_score, diagnostics: Optional[dict] = None):
     output = frame.copy()
     x, y, w, h = roi_rect
     cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 255), 2)
+    diagnostics = diagnostics or {}
+    last_text = str(diagnostics.get("last_ocr_text", "") or "")
+    if len(last_text) > 34:
+        last_text = last_text[:34] + "..."
     overlay_lines = [
         f"FPS: {fps:.1f}",
+        f"IR_CAMERA: {diagnostics.get('ir_camera', False)}",
         f"Sharpness: {sharpness:.1f}",
         f"Status: {status}",
+        f"OCR Busy: {diagnostics.get('ocr_busy', False)}",
+        f"Last OCR ms: {diagnostics.get('last_ocr_time_ms', 0.0):.1f}",
+        f"Last OCR text: {last_text}",
         f"Confidence: {result.confidence:.1f}",
         f"Logo Score: {logo_score:.2f}",
         f"BRAND: {stable_fields['brand']} ({field_count['brand']})",
@@ -2189,6 +2709,7 @@ def parse_args():
     parser.add_argument("--no-command-poll", action="store_true")
     parser.add_argument("--init-catalog-only", action="store_true")
     parser.add_argument("--cleanup-firebase-runtime", action="store_true")
+    parser.add_argument("--ocr-test-mode", action="store_true")
     return parser.parse_args()
 
 
@@ -2196,7 +2717,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    firebase = FirebaseClient(FIREBASE_API_KEY, enabled=not args.no_firebase)
+    ocr_test_mode = OCR_TEST_MODE or args.ocr_test_mode
+    firebase = FirebaseClient(FIREBASE_API_KEY, enabled=not args.no_firebase and not ocr_test_mode)
+    if ocr_test_mode:
+        print("OCR_TEST_MODE = True")
+        print("Firebase, ESP, automation state, IR gate, and queue workers are disabled for OCR diagnostics.")
 
     if args.cleanup_firebase_runtime:
         try:
@@ -2205,20 +2730,21 @@ def main():
             print_firestore_error("CLEANUP_FAILED", exc)
         return
 
-    ensure_automation_status(firebase)
     init_sqlite(args.db)
-    try:
-        sync_settings_from_firebase(args.db, firebase)
-    except requests.RequestException as exc:
-        print("Firebase settings sync failed, using local defaults:", exc)
+    if not ocr_test_mode:
+        ensure_automation_status(firebase)
+        try:
+            sync_settings_from_firebase(args.db, firebase)
+        except requests.RequestException as exc:
+            print("Firebase settings sync failed, using local defaults:", exc)
 
-    try:
-        ensure_internal_product_catalog(firebase)
-    except requests.RequestException as exc:
-        print_firestore_error("PRODUCT_SYNC_FAILED", exc)
-        log_activity(firebase, "INVENTORY_SYNC_ERROR", str(exc), "raspberry")
-        if args.init_catalog_only:
-            return
+        try:
+            ensure_internal_product_catalog(firebase)
+        except requests.RequestException as exc:
+            print_firestore_error("PRODUCT_SYNC_FAILED", exc)
+            log_activity(firebase, "INVENTORY_SYNC_ERROR", str(exc), "raspberry")
+            if args.init_catalog_only:
+                return
 
     if args.init_catalog_only:
         return
@@ -2226,10 +2752,17 @@ def main():
     configure_tesseract()
     templates = load_logo_templates()
 
-    worker = QueueWorker(args.db, args.esp_url, firebase, poll_commands=not args.no_command_poll)
-    worker.start()
-    pick_poller = PickRequestPoller(args.db, firebase)
-    pick_poller.start()
+    worker = None
+    pick_poller = None
+    status_worker = None
+    if not ocr_test_mode:
+        status_worker = StatusUpdateWorker(firebase)
+        set_status_update_worker(status_worker)
+        status_worker.start()
+        worker = QueueWorker(args.db, args.esp_url, firebase, poll_commands=not args.no_command_poll)
+        worker.start()
+        pick_poller = PickRequestPoller(args.db, firebase)
+        pick_poller.start()
 
     cap = open_camera(args.camera)
     if not cap.isOpened():
@@ -2237,14 +2770,28 @@ def main():
         return
 
     set_camera_properties(cap)
+    esp_status_poller = None
+    automation_poller = None
+    if not ocr_test_mode:
+        esp_status_poller = EspStatusPoller(args.esp_url, firebase)
+        esp_status_poller.start()
+        automation_poller = AutomationReadyPoller(firebase)
+        automation_poller.start()
+    ocr_worker = OCRWorker(templates)
+    ocr_worker.start()
     tick_freq = cv2.getTickFrequency()
     last_tick = cv2.getTickCount()
     frame_counter = 0
-    last_automation_status_sync = 0.0
     camera_aligned_for_current_box = False
     last_result = OCRResult(text="", confidence=0.0, fields={}, debug_name="waiting")
     last_status = "waiting"
     last_logo_score = 0.0
+    last_ocr_time_ms = 0.0
+    last_ocr_text = ""
+    ir_camera = False
+    fps = 0.0
+    last_fps_log = 0.0
+    last_ir_log = 0.0
 
     print("ESP32 GO URL:", f"{args.esp_url.rstrip()}/go")
     print("SQLite DB:", args.db)
@@ -2261,151 +2808,166 @@ def main():
 
             roi, roi_rect = extract_roi(frame)
             sharpness = frame_sharpness(roi)
-            ready, automation_status, wait_reason = automation_ready(firebase)
             now_seconds = time.time()
-            if not ready:
-                camera_aligned_for_current_box = False
-                if now_seconds - last_automation_status_sync > 2.0:
-                    set_automation_status(firebase, {
-                        "currentState": STATE_WAIT_FOR_AUTOMATION if not automation_status.get("automationStarted") else STATE_STOPPED,
-                        "cameraBusy": False,
-                        "beltRunning": False,
-                        "beltBlocked": True,
-                        "lifterBusy": False,
-                        "currentOperation": "",
-                        "lastError": wait_reason,
-                    })
-                    last_automation_status_sync = now_seconds
-                last_status = wait_reason
-                frame_counter += 1
-                output = draw_overlay(frame, roi_rect, last_result, fps if "fps" in locals() else 0.0, sharpness, last_status, last_logo_score)
-                cv2.imshow("MakhzanXpert OCR Queue Controller", output)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    break
-                if key == ord("r"):
-                    print("RESET FOR NEW LABEL")
-                    reset_stability()
-                    last_status = "reset"
-                continue
+            if ocr_test_mode:
+                automation_ready_cached = True
+                automation_status_cached = automation_status_defaults()
+                automation_wait_reason = ""
+            else:
+                automation_ready_cached, automation_status_cached, automation_wait_reason = automation_poller.snapshot()
 
-            try:
-                esp_status = get_esp_status(args.esp_url)
-            except requests.RequestException as exc:
-                print("ESP status failed:", exc)
-                set_automation_status(firebase, {
-                    "currentState": STATE_ERROR,
-                    "beltBlocked": True,
-                    "beltRunning": False,
-                    "lastError": f"ESP status failed: {exc}",
-                })
-                last_status = "esp status error"
-                frame_counter += 1
-                output = draw_overlay(frame, roi_rect, last_result, fps if "fps" in locals() else 0.0, sharpness, last_status, last_logo_score)
-                cv2.imshow("MakhzanXpert OCR Queue Controller", output)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    break
-                continue
-
-            if not bool_status(esp_status, "irCamera"):
-                camera_aligned_for_current_box = False
-                set_automation_status(firebase, {
+            ocr_payload = ocr_worker.get_result()
+            if ocr_payload:
+                last_result = ocr_payload["result"]
+                last_logo_score = float(ocr_payload["logo_score"])
+                last_ocr_time_ms = float(ocr_payload.get("ocr_time_ms") or 0.0)
+                last_ocr_text = last_result.text
+                confirmed_label = update_field_stability(last_result.fields)
+                set_status_if_changed(firebase, {
                     "currentState": STATE_WAIT_BOX_AT_CAMERA,
                     "cameraBusy": False,
-                    "beltRunning": False,
                     "beltBlocked": False,
+                    "beltRunning": False,
                     "lastError": None,
                 })
-                last_status = "waiting for IR_CAMERA"
-                frame_counter += 1
-                current_tick = cv2.getTickCount()
-                fps = tick_freq / max(current_tick - last_tick, 1)
-                last_tick = current_tick
-                output = draw_overlay(frame, roi_rect, last_result, fps, sharpness, last_status, last_logo_score)
-                cv2.imshow("MakhzanXpert OCR Queue Controller", output)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    break
-                if key == ord("r"):
-                    print("RESET FOR NEW LABEL")
-                    reset_stability()
-                    last_status = "reset"
-                continue
+                print("FIELDS =", last_result.fields)
+                print("[OCR_FIELDS]", last_result.fields)
+                print("COUNTS =", field_count)
+                print("STABLE =", stable_fields)
 
-            if not camera_aligned_for_current_box:
-                try:
-                    set_automation_status(firebase, {
-                        "currentState": STATE_CAMERA_ALIGNING,
-                        "cameraBusy": False,
-                        "beltRunning": True,
-                        "beltBlocked": True,
-                        "currentOperation": "Align box at camera",
-                        "lastError": None,
-                    })
-                    esp_get_json(args.esp_url, "/belt/run", params={"ms": CAMERA_ALIGN_DELAY_MS}, timeout=20)
-                    esp_get_json(args.esp_url, "/belt/stop", timeout=20)
-                    camera_aligned_for_current_box = True
-                except Exception as exc:
-                    print("Camera alignment failed:", exc)
-                    set_automation_status(firebase, {
-                        "currentState": STATE_ERROR,
-                        "beltRunning": False,
-                        "beltBlocked": True,
-                        "lastError": f"Camera alignment failed: {exc}",
-                    })
-                    last_status = "camera align error"
-                    continue
-
-            if frame_counter % OCR_EVERY_N_FRAMES == 0:
-                if sharpness >= MIN_SHARPNESS:
-                    set_automation_status(firebase, {
-                        "currentState": STATE_CAMERA_READING,
-                        "cameraBusy": True,
-                        "beltBlocked": True,
-                        "beltRunning": False,
-                        "lastError": None,
-                    })
-                    try:
-                        last_result, _, last_logo_score = best_ocr_result(roi, templates)
-                        confirmed_label = update_field_stability(last_result.fields)
-                    finally:
-                        set_automation_status(firebase, {
-                            "currentState": STATE_WAIT_BOX_AT_CAMERA,
-                            "cameraBusy": False,
-                            "beltBlocked": False,
-                            "beltRunning": False,
-                        })
-                    print("\n========== FIELDS ==========")
-                    print(last_result.fields)
-                    print("Counts:", field_count)
-                    print("Stable:", stable_fields)
-
-                    if confirmed_label and should_accept_label(confirmed_label):
-                        print("FINAL CONFIRMED LABEL:", confirmed_label)
+                if confirmed_label and should_accept_label(confirmed_label):
+                    print("FINAL CONFIRMED LABEL:", confirmed_label)
+                    print("[OCR_CONFIRMED]", label_signature(confirmed_label))
+                    if ocr_test_mode:
+                        last_status = "test label confirmed"
+                    else:
                         try:
                             box_id = create_store_task(args.db, firebase, confirmed_label)
                             last_status = f"queued {box_id}" if box_id else "no empty location"
                         except Exception as exc:
                             print("Queue creation failed:", exc)
                             last_status = "queue error"
-                        reset_stability()
-                        camera_aligned_for_current_box = False
-                    elif confirmed_label:
-                        print("DUPLICATE_LABEL_SUPPRESSED")
-                        log_activity(firebase, "DUPLICATE_LABEL_SUPPRESSED", label_signature(confirmed_label), "raspberry")
-                        last_status = "duplicate label suppressed"
-                    else:
-                        last_status = "confirming fields"
+                    reset_stability()
+                    camera_aligned_for_current_box = False
+                elif confirmed_label:
+                    print("DUPLICATE_LABEL_SUPPRESSED")
+                    log_activity(firebase, "DUPLICATE_LABEL_SUPPRESSED", label_signature(confirmed_label), "raspberry")
+                    last_status = "duplicate label suppressed"
+                    reset_stability()
+                    camera_aligned_for_current_box = False
                 else:
-                    last_status = "frame too blurry"
+                    last_status = "confirming fields"
+
+            if not automation_ready_cached:
+                print("OCR SKIPPED = automation not ready")
+                camera_aligned_for_current_box = False
+                set_status_if_changed(firebase, {
+                    "currentState": STATE_WAIT_FOR_AUTOMATION if not automation_status_cached.get("automationStarted") else STATE_STOPPED,
+                    "cameraBusy": False,
+                    "beltRunning": False,
+                    "beltBlocked": True,
+                    "lifterBusy": False,
+                    "currentOperation": "",
+                    "lastError": automation_wait_reason,
+                })
+                last_status = automation_wait_reason
+            else:
+                if ocr_test_mode:
+                    esp_status = {}
+                    esp_error = ""
+                    ir_camera = True
+                else:
+                    esp_status, esp_error = esp_status_poller.snapshot()
+                    if esp_error:
+                        set_status_if_changed(firebase, {
+                            "currentState": STATE_ERROR,
+                            "beltBlocked": True,
+                            "beltRunning": False,
+                            "lastError": f"ESP status failed: {esp_error}",
+                        })
+                        last_status = "esp status error"
+                    ir_camera = bool_status(esp_status, "irCamera")
+
+                if now_seconds - last_ir_log >= 1.0:
+                    print(f"IR_CAMERA = {ir_camera}")
+                    print(f"SHARPNESS = {sharpness:.1f}")
+                    print(f"MIN_SHARPNESS = {MIN_SHARPNESS:.1f}")
+                    print(f"SHARPNESS_REJECTED = {sharpness < MIN_SHARPNESS}")
+                    last_ir_log = now_seconds
+
+                if not ir_camera and not ocr_test_mode:
+                    print("OCR SKIPPED = no IR_CAMERA")
+                    camera_aligned_for_current_box = False
+                    set_status_if_changed(firebase, {
+                        "currentState": STATE_WAIT_BOX_AT_CAMERA,
+                        "cameraBusy": False,
+                        "beltRunning": False,
+                        "beltBlocked": False,
+                        "lastError": None,
+                    })
+                    last_status = "waiting for IR_CAMERA"
+                elif not camera_aligned_for_current_box and not ocr_test_mode:
+                    try:
+                        set_status_if_changed(firebase, {
+                            "currentState": STATE_CAMERA_ALIGNING,
+                            "cameraBusy": False,
+                            "beltRunning": True,
+                            "beltBlocked": True,
+                            "currentOperation": "Align box at camera",
+                            "lastError": None,
+                        })
+                        esp_get_json(args.esp_url, "/belt/run", params={"ms": CAMERA_ALIGN_DELAY_MS}, timeout=20)
+                        esp_get_json(args.esp_url, "/belt/stop", timeout=20)
+                        camera_aligned_for_current_box = True
+                        last_status = "camera aligned"
+                    except Exception as exc:
+                        print("Camera alignment failed:", exc)
+                        set_status_if_changed(firebase, {
+                            "currentState": STATE_ERROR,
+                            "beltRunning": False,
+                            "beltBlocked": True,
+                            "lastError": f"Camera alignment failed: {exc}",
+                        })
+                        last_status = "camera align error"
+                elif ocr_test_mode or frame_counter % OCR_EVERY_N_FRAMES == 0:
+                    print("TRYING OCR")
+                    print("IR_CAMERA =", ir_camera)
+                    print("SHARPNESS =", sharpness)
+                    print("FRAME_COUNTER =", frame_counter)
+                    if sharpness >= MIN_SHARPNESS:
+                        submitted = ocr_worker.submit(roi, sharpness)
+                        print("OCR SUBMITTED =", submitted)
+                        if submitted:
+                            set_status_if_changed(firebase, {
+                                "currentState": STATE_CAMERA_READING,
+                                "cameraBusy": True,
+                                "beltBlocked": True,
+                                "beltRunning": False,
+                                "lastError": None,
+                            })
+                            last_status = "ocr reading"
+                        elif ocr_worker.busy.is_set():
+                            last_status = "ocr busy"
+                    else:
+                        print("OCR SUBMITTED = False")
+                        print("OCR SKIPPED = frame too blurry")
+                        last_status = "frame too blurry"
 
             frame_counter += 1
             current_tick = cv2.getTickCount()
             fps = tick_freq / max(current_tick - last_tick, 1)
             last_tick = current_tick
+            if now_seconds - last_fps_log >= 1.0:
+                print(f"FPS {fps:.1f}")
+                last_fps_log = now_seconds
 
-            output = draw_overlay(frame, roi_rect, last_result, fps, sharpness, last_status, last_logo_score)
+            diagnostics = {
+                "ir_camera": ir_camera,
+                "ocr_busy": ocr_worker.busy.is_set(),
+                "last_ocr_time_ms": last_ocr_time_ms,
+                "last_ocr_text": last_ocr_text,
+            }
+            output = draw_overlay(frame, roi_rect, last_result, fps, sharpness, last_status, last_logo_score, diagnostics)
             cv2.imshow("MakhzanXpert OCR Queue Controller", output)
 
             key = cv2.waitKey(1) & 0xFF
@@ -2414,10 +2976,20 @@ def main():
             if key == ord("r"):
                 print("RESET FOR NEW LABEL")
                 reset_stability()
+                camera_aligned_for_current_box = False
                 last_status = "reset"
     finally:
-        worker.stop_event.set()
-        pick_poller.stop_event.set()
+        ocr_worker.stop_event.set()
+        if esp_status_poller:
+            esp_status_poller.stop_event.set()
+        if automation_poller:
+            automation_poller.stop_event.set()
+        if status_worker:
+            status_worker.stop_event.set()
+        if worker:
+            worker.stop_event.set()
+        if pick_poller:
+            pick_poller.stop_event.set()
         cap.release()
         cv2.destroyAllWindows()
 

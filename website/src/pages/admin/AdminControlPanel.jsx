@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { addDoc, collection, doc, getDocs, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
+import { addDoc, collection, doc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
 import { db } from '../../firebase/firebase.js';
 
 const SYSTEM_SETTINGS_REF = doc(db, 'settings', 'system');
@@ -51,6 +51,22 @@ const AUTOMATION_OPTIONS = [
   { key: 'requireIRVerification', label: 'IR Placement Verification' },
   { key: 'firebaseLogging', label: 'Firebase Logging' },
 ];
+
+function logWebsiteActivity(activityType, message) {
+  const data = {
+    type: activityType,
+    activityType,
+    message,
+    source: 'website',
+    sourceDevice: 'website',
+    status: 'info',
+    createdAt: serverTimestamp(),
+  };
+  return Promise.all([
+    addDoc(collection(db, 'systemActivity'), data),
+    addDoc(collection(db, 'activityLog'), data),
+  ]);
+}
 
 function getDateValue(value) {
   if (!value) return null;
@@ -362,17 +378,30 @@ function AdminControlPanel() {
     ];
 
     if (!enabled) {
-      writes.push(addDoc(collection(db, 'commands'), {
+      const stopCommandRef = doc(collection(db, 'commands'));
+      writes.push(setDoc(stopCommandRef, {
+        commandId: stopCommandRef.id,
         type: 'COMMAND',
         command: 'STOP',
+        payload: {},
+        response: null,
         status: 'pending',
         source: 'website',
+        deviceId: 'esp-main-01',
         createdAt: serverTimestamp(),
+        executedAt: null,
         updatedAt: serverTimestamp(),
       }));
     }
 
     Promise.all(writes)
+      .then(() => {
+        console.info(enabled ? '[AUTOMATION_STARTED]' : '[AUTOMATION_STOPPED]', { sortingStrategy: sortingMode });
+        return logWebsiteActivity(
+          enabled ? 'AUTOMATION_STARTED' : 'AUTOMATION_STOPPED',
+          enabled ? `Automation started with ${sortingMode}.` : 'Automation stopped by operator.',
+        );
+      })
       .then(() => setNotice(enabled ? 'Automation started.' : 'Automation stopped.'))
       .catch(() => setError(enabled ? 'Unable to start automation.' : 'Unable to stop automation.'))
       .finally(() => setSaving(''));

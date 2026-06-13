@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { collection, deleteDoc, doc, getDocs, orderBy, query } from 'firebase/firestore';
+import { collection, deleteDoc, doc, onSnapshot, orderBy, query } from 'firebase/firestore';
 import { Link, useNavigate } from 'react-router-dom';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
@@ -48,23 +48,28 @@ function AdminInventory() {
   const [brandFilter, setBrandFilter] = useState('all');
   const [availabilityFilter, setAvailabilityFilter] = useState('all');
 
-  const loadProducts = async () => {
+  const subscribeToProducts = () => {
     setLoading(true);
     setError('');
 
-    try {
-      const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
-      const snapshot = await getDocs(productsQuery);
-      setProducts(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-    } catch {
-      setError('Unable to load inventory products.');
-    } finally {
-      setLoading(false);
-    }
+    const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
+    return onSnapshot(
+      productsQuery,
+      (snapshot) => {
+        setProducts(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+        setLoading(false);
+      },
+      () => {
+        setProducts([]);
+        setError('Unable to load inventory products.');
+        setLoading(false);
+      },
+    );
   };
 
   useEffect(() => {
-    loadProducts();
+    const unsubscribe = subscribeToProducts();
+    return unsubscribe;
   }, []);
 
   const categories = useMemo(

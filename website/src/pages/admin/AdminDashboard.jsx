@@ -208,9 +208,9 @@ function AdminDashboard() {
           <p className="metric-note">Items below restock threshold.</p>
         </article>
         <article className="metric-card admin-metric-card">
-          <p className="metric-label">Machine Status</p>
-          <p className="metric-value">{latestReading?.environmentStatus || 'No Data'}</p>
-          <p className="metric-note">Latest environment state from Firebase.</p>
+          <p className="metric-label">Fire Status</p>
+          <p className="metric-value">{latestReading?.fireStatus || latestReading?.gasStatus || 'No Data'}</p>
+          <p className="metric-note">MQ3, MQ135, and temperature risk.</p>
         </article>
         <article className="metric-card admin-metric-card">
           <p className="metric-label">Latest Temperature</p>
@@ -221,11 +221,6 @@ function AdminDashboard() {
           <p className="metric-label">Latest Humidity</p>
           <p className="metric-value">{formatHumidity(latestHumidity)}</p>
           <p className="metric-note">From latest sensorReadings document.</p>
-        </article>
-        <article className="metric-card admin-metric-card">
-          <p className="metric-label">Latest Gas Status</p>
-          <p className="metric-value">{latestReading?.gasStatus || 'No Data'}</p>
-          <p className="metric-note">MQ3/MQ135 readiness summary.</p>
         </article>
         <article className="metric-card admin-metric-card">
           <p className="metric-label">Last Activity</p>

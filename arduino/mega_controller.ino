@@ -18,9 +18,16 @@ bool motionAlarm = false;
 int lastMotionState = LOW;
 
 unsigned long lastSensorSend = 0;
-#define SENSOR_INTERVAL 3000
+#define SENSOR_INTERVAL 250
+#define DHT_INTERVAL 2000
 #define DROP_TO_LIFTER_DELAY_MS 3000
 #define ULTRASONIC_READY_MAX_CM 12.0
+float lastUltrasonicCm = -1;
+bool lastUltrasonicReady = false;
+unsigned long lastDhtRead = 0;
+float cachedTemp = -1;
+float cachedHumidity = -1;
+bool cachedDhtOk = false;
 
 // ================= BELT RELAY =================
 #define RELAY_PIN 13
@@ -230,14 +237,19 @@ void updateSensors() {
   int mq3Value = analogRead(MQ3_PIN);
   int mq135Value = analogRead(MQ135_PIN);
 
-  float temp = dht.readTemperature();
-  float humidity = dht.readHumidity();
+  if (millis() - lastDhtRead >= DHT_INTERVAL) {
+    lastDhtRead = millis();
+    float temp = dht.readTemperature();
+    float humidity = dht.readHumidity();
 
-  bool dhtOk = !(isnan(temp) || isnan(humidity));
-
-  if (!dhtOk) {
-    temp = -1;
-    humidity = -1;
+    cachedDhtOk = !(isnan(temp) || isnan(humidity));
+    if (cachedDhtOk) {
+      cachedTemp = temp;
+      cachedHumidity = humidity;
+    } else {
+      cachedTemp = -1;
+      cachedHumidity = -1;
+    }
   }
 
   String data = "{";
@@ -246,10 +258,11 @@ void updateSensors() {
   data += "\"waterDetected\":" + String(waterValue > waterThreshold ? "true" : "false") + ",";
   data += "\"mq3\":" + String(mq3Value) + ",";
   data += "\"mq135\":" + String(mq135Value) + ",";
-  data += "\"temperature\":" + String(temp, 2) + ",";
-  data += "\"humidity\":" + String(humidity, 2) + ",";
-  data += "\"dhtOk\":" + String(dhtOk ? "true" : "false") + ",";
+  data += "\"temperature\":" + String(cachedTemp, 2) + ",";
+  data += "\"humidity\":" + String(cachedHumidity, 2) + ",";
+  data += "\"dhtOk\":" + String(cachedDhtOk ? "true" : "false") + ",";
   data += "\"belt\":" + String(beltRunning ? 1 : 0) + ",";
+  data += "\"beltRunning\":" + String(beltRunning ? "true" : "false") + ",";
   data += "\"x\":" + String(currentX) + ",";
   data += "\"y\":" + String(currentY) + ",";
   data += "\"z\":" + String(currentZ) + ",";
@@ -258,7 +271,8 @@ void updateSensors() {
   data += "\"loc8Detected\":" + String(locationDetected(8) ? "true" : "false") + ",";
   data += "\"loc9Detected\":" + String(locationDetected(9) ? "true" : "false") + ",";
   data += "\"atStartingPoint\":" + String(atStartingPoint() ? "true" : "false") + ",";
-  data += "\"busy\":" + String(motionBusy ? "true" : "false");
+  data += "\"busy\":" + String(motionBusy ? "true" : "false") + ",";
+  data += "\"lifterBusy\":" + String(motionBusy ? "true" : "false");
   data += "}";
 
   Serial.println(data);
@@ -307,11 +321,13 @@ void handleCommand(String cmd, Stream &replyPort) {
   }
 
   else if (cmd == "BELT_START") {
+    logBoth("[BELT_START]");
     beltStart();
     reply(replyPort, "DONE:BELT_START");
   }
 
   else if (cmd == "BELT_STOP") {
+    logBoth("[BELT_STOP]");
     beltStop();
     reply(replyPort, "DONE:BELT_STOP");
   }
@@ -336,7 +352,7 @@ void handleCommand(String cmd, Stream &replyPort) {
     reply(replyPort, "DONE:DISPENSE");
   }
 
-  else if (cmd == "SCAN" || cmd == "CAMERA") {
+  else if (cmd == "SCAN" || cmd == "CAMERA" || cmd == "CAMERA_SCAN") {
     sendCameraScan();
     reply(replyPort, "DONE:SCAN");
   }
@@ -364,9 +380,11 @@ void handleCommand(String cmd, Stream &replyPort) {
   else if (cmd.startsWith("VERIFY_LOCATION ")) {
     int locationId = cmd.substring(16).toInt();
     if (locationId == 8 || locationId == 9) {
+      logBoth("[VERIFY] LOCATION " + String(locationId));
       sendVerifyLocationJson(replyPort, locationId);
       reply(replyPort, "DONE:VERIFY_LOCATION");
     } else {
+      logBoth("[ERROR] BAD VERIFY_LOCATION");
       reply(replyPort, "ERROR BAD VERIFY_LOCATION");
     }
   }
@@ -375,12 +393,16 @@ void handleCommand(String cmd, Stream &replyPort) {
     int n = cmd.substring(3).toInt();
 
     if (n >= 1 && n <= 18) {
+      logBoth("[GO] " + String(n));
       if (goPosition(n)) {
+        logBoth("[DONE] " + String(n));
         reply(replyPort, "DONE:" + String(n));
       } else {
+        logBoth("[ERROR] " + lastMotionError);
         reply(replyPort, lastMotionError);
       }
     } else {
+      logBoth("[ERROR] BAD POSITION");
       reply(replyPort, "ERROR BAD POSITION");
     }
   }
@@ -884,20 +906,21 @@ bool ultrasonicReady(float cm) {
 }
 
 String statusJson() {
-  float ultrasonicCm = readAverageDistanceCM();
   String data = "{";
   data += "\"belt\":" + String(beltRunning ? 1 : 0) + ",";
+  data += "\"beltRunning\":" + String(beltRunning ? "true" : "false") + ",";
   data += "\"irCamera\":" + String(irStartDetected() ? "true" : "false") + ",";
   data += "\"irLifter\":" + String(irEndDetected() ? "true" : "false") + ",";
-  data += "\"ultrasonicCm\":" + String(ultrasonicCm, 2) + ",";
-  data += "\"ultrasonicReady\":" + String(ultrasonicReady(ultrasonicCm) ? "true" : "false") + ",";
+  data += "\"ultrasonicCm\":" + String(lastUltrasonicCm, 2) + ",";
+  data += "\"ultrasonicReady\":" + String(lastUltrasonicReady ? "true" : "false") + ",";
   data += "\"loc8Detected\":" + String(locationDetected(8) ? "true" : "false") + ",";
   data += "\"loc9Detected\":" + String(locationDetected(9) ? "true" : "false") + ",";
   data += "\"x\":" + String(currentX) + ",";
   data += "\"y\":" + String(currentY) + ",";
   data += "\"z\":" + String(currentZ) + ",";
   data += "\"atStartingPoint\":" + String(atStartingPoint() ? "true" : "false") + ",";
-  data += "\"busy\":" + String(motionBusy ? "true" : "false");
+  data += "\"busy\":" + String(motionBusy ? "true" : "false") + ",";
+  data += "\"lifterBusy\":" + String(motionBusy ? "true" : "false");
   data += "}";
   return data;
 }
@@ -908,9 +931,11 @@ void sendStatusJson(Stream &replyPort) {
 
 void sendUltraJson(Stream &replyPort) {
   float cm = readAverageDistanceCM();
+  lastUltrasonicCm = cm;
+  lastUltrasonicReady = ultrasonicReady(cm);
   String data = "{";
   data += "\"ultrasonicCm\":" + String(cm, 2) + ",";
-  data += "\"ultrasonicReady\":" + String(ultrasonicReady(cm) ? "true" : "false");
+  data += "\"ultrasonicReady\":" + String(lastUltrasonicReady ? "true" : "false");
   data += "}";
   reply(replyPort, data);
 }

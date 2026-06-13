@@ -91,16 +91,27 @@ function AdminCommands() {
 
     try {
       const commandRef = doc(collection(db, 'commands'));
+      const commandId = commandRef.id;
 
       await setDoc(commandRef, {
+        commandId,
         type: 'GO',
+        command: commandConfig.arduinoCommand,
         position: commandConfig.position,
         arduinoCommand: commandConfig.arduinoCommand,
+        payload: {
+          position: commandConfig.position,
+          arduinoCommand: commandConfig.arduinoCommand,
+        },
+        response: null,
         status: 'pending',
         source: 'website',
         deviceId: ESP_DEVICE_ID,
         createdAt: serverTimestamp(),
+        executedAt: null,
+        updatedAt: serverTimestamp(),
       });
+      console.info('[COMMAND_CREATED]', commandConfig.arduinoCommand, commandId);
     } catch {
       setError(`Unable to create ${commandConfig.arduinoCommand} command.`);
     } finally {
