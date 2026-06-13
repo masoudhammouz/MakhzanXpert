@@ -37,10 +37,7 @@ export function isPublishedProduct(product) {
 }
 
 export function getSellableStock(product) {
-  if (product?.availableStock !== undefined && product?.availableStock !== null) {
-    return Number(product.availableStock || 0);
-  }
-  return Number(product?.quantity || 0);
+  return Number(product?.availableStock ?? 0);
 }
 
 export function isCustomerVisibleProduct(product) {

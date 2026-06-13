@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { collection, getDocs, orderBy, query } from 'firebase/firestore';
+import { collection, onSnapshot, orderBy, query } from 'firebase/firestore';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import ProductCard from '../../components/ProductCard.jsx';
@@ -42,25 +42,26 @@ function Products() {
   }, [location.search]);
 
   useEffect(() => {
-    async function loadProducts() {
-      setLoading(true);
-      setError('');
+    setLoading(true);
+    setError('');
 
-      try {
-        const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
-        const snapshot = await getDocs(productsQuery);
+    const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
+    const unsubscribe = onSnapshot(
+      productsQuery,
+      (snapshot) => {
         const items = snapshot.docs
           .map((doc) => ({ id: doc.id, ...doc.data() }))
           .filter(isCustomerVisibleProduct);
         setProducts(items);
-      } catch (fetchError) {
-        setError('Unable to load products. Please try again later.');
-      } finally {
         setLoading(false);
-      }
-    }
+      },
+      () => {
+        setError('Unable to load products. Please try again later.');
+        setLoading(false);
+      },
+    );
 
-    loadProducts();
+    return unsubscribe;
   }, []);
 
   const filteredAndSortedProducts = useMemo(() => {

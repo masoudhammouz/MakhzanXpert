@@ -5,6 +5,7 @@ import { db } from '../../firebase/firebase.js';
 
 const SYSTEM_SETTINGS_REF = doc(db, 'settings', 'system');
 const AUTOMATION_STATUS_REF = doc(db, 'automation', 'status');
+const ESP_DEVICE_REF = doc(db, 'devices', 'esp-main-01');
 const TOTAL_MOVEMENT_POSITIONS = 18;
 const ONLINE_WINDOW_MS = 30000;
 
@@ -137,6 +138,7 @@ function AdminControlPanel() {
   const [scanQueue, setScanQueue] = useState([]);
   const [orderQueue, setOrderQueue] = useState([]);
   const [automationStatus, setAutomationStatus] = useState(DEFAULT_AUTOMATION_STATUS);
+  const [espDevice, setEspDevice] = useState(null);
   const [products, setProducts] = useState([]);
   const [quickRetrieve, setQuickRetrieve] = useState({ brand: '', model: '', color: '', size: '' });
   const [productSearch, setProductSearch] = useState('');
@@ -178,6 +180,16 @@ function AdminControlPanel() {
         });
       },
       () => setAutomationStatus(DEFAULT_AUTOMATION_STATUS),
+    );
+
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      ESP_DEVICE_REF,
+      (snapshot) => setEspDevice(snapshot.exists() ? snapshot.data() : null),
+      () => setEspDevice(null),
     );
 
     return unsubscribe;
@@ -409,6 +421,29 @@ function AdminControlPanel() {
     }, action.replaceAll('_', ' '));
   };
 
+  const handleClearError = async () => {
+    setSaving('Clear Error');
+    setError('');
+    setNotice('');
+    try {
+      await setDoc(AUTOMATION_STATUS_REF, {
+        currentState: automationStatus.automationStarted ? 'WAIT_BOX_AT_CAMERA' : 'WAIT_FOR_AUTOMATION',
+        beltBlocked: !automationStatus.automationStarted,
+        beltRunning: false,
+        cameraBusy: false,
+        lifterBusy: false,
+        currentOperation: '',
+        lastError: null,
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+      setNotice('Automation error cleared.');
+    } catch {
+      setError('Unable to clear automation error.');
+    } finally {
+      setSaving('');
+    }
+  };
+
   const createPickRequestForLocation = async (location, source = 'retrieval-panel') => {
     const locationId = locationIdOf(location);
     if (!isRetrievableLocation(location)) {
@@ -581,7 +616,30 @@ function AdminControlPanel() {
               <span>Last Error</span>
               <strong>{automationStatus.lastError || '--'}</strong>
             </div>
+            <div>
+              <span>IR Camera</span>
+              <strong>{espDevice?.irCamera ? 'Detected' : 'Clear'}</strong>
+            </div>
+            <div>
+              <span>IR Lifter</span>
+              <strong>{espDevice?.irLifter ? 'Detected' : 'Clear'}</strong>
+            </div>
+            <div>
+              <span>Ultrasonic Ready</span>
+              <strong>{espDevice?.ultrasonicReady ? 'Ready' : 'Not Ready'}</strong>
+            </div>
+            <div>
+              <span>Location 8 IR</span>
+              <strong>{espDevice?.loc8Detected ? 'Detected' : 'Clear'}</strong>
+            </div>
+            <div>
+              <span>Location 9 IR</span>
+              <strong>{espDevice?.loc9Detected ? 'Detected' : 'Clear'}</strong>
+            </div>
           </div>
+          <button className="button button-secondary" type="button" onClick={handleClearError} disabled={Boolean(saving)}>
+            Clear Error
+          </button>
         </div>
       </section>
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { collection, getDocs, limit, orderBy, query, where } from 'firebase/firestore';
+import { collection, limit, onSnapshot, orderBy, query, where } from 'firebase/firestore';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import ProductCard from '../../components/ProductCard.jsx';
@@ -28,36 +28,50 @@ export default function ProductDetails() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    async function loadProduct() {
-      setLoading(true);
-      setError('');
+    if (!slug) return undefined;
 
-      try {
-        const productQuery = query(collection(db, 'products'), where('slug', '==', slug), limit(1));
-        const productResult = await getDocs(productQuery);
+    setLoading(true);
+    setError('');
+
+    const productQuery = query(collection(db, 'products'), where('slug', '==', slug), limit(1));
+    const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
+
+    const unsubscribeProduct = onSnapshot(
+      productQuery,
+      (productResult) => {
         const productSnap = productResult.docs[0];
-
         if (!productSnap) {
           setProduct(null);
-          setAllProducts([]);
+          setLoading(false);
           return;
         }
 
-        const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
-        const productsSnap = await getDocs(productsQuery);
         const loadedProduct = { id: productSnap.id, ...productSnap.data() };
         setProduct(isCustomerVisibleProduct(loadedProduct) ? loadedProduct : null);
+        setLoading(false);
+      },
+      () => {
+        setError('Unable to load product.');
+        setLoading(false);
+      },
+    );
+
+    const unsubscribeProducts = onSnapshot(
+      productsQuery,
+      (productsSnap) => {
         setAllProducts(productsSnap.docs
           .map((item) => ({ id: item.id, ...item.data() }))
           .filter(isCustomerVisibleProduct));
-      } catch (err) {
+      },
+      () => {
         setError('Unable to load product.');
-      } finally {
-        setLoading(false);
-      }
-    }
+      },
+    );
 
-    if (slug) loadProduct();
+    return () => {
+      unsubscribeProduct();
+      unsubscribeProducts();
+    };
   }, [slug]);
 
   const relatedProducts = useMemo(() => {
