@@ -4,10 +4,12 @@ import { addDoc, collection, doc, getDocs, limit, onSnapshot, orderBy, query, se
 import { db } from '../../firebase/firebase.js';
 
 const SYSTEM_SETTINGS_REF = doc(db, 'settings', 'system');
+const AUTOMATION_STATUS_REF = doc(db, 'automation', 'status');
 const TOTAL_MOVEMENT_POSITIONS = 18;
 const ONLINE_WINDOW_MS = 30000;
 
 const SORTING_OPTIONS = [
+  { value: '', label: 'Select strategy' },
   { value: 'brand', label: 'Brand' },
   { value: 'model', label: 'Model' },
   { value: 'size', label: 'Size' },
@@ -15,13 +17,10 @@ const SORTING_OPTIONS = [
   { value: 'brand_size', label: 'Brand + Size' },
   { value: 'model_size', label: 'Model + Size' },
   { value: 'color_size', label: 'Color + Size' },
-  { value: 'custom', label: 'Custom' },
-  { value: 'nearest_empty', label: 'Nearest Empty' },
-  { value: 'most_requested', label: 'Most Requested' },
 ];
 
 const DEFAULT_SETTINGS = {
-  sortingMode: 'brand',
+  sortingMode: '',
   automationEnabled: false,
   autoConveyor: true,
   autoOCR: true,
@@ -29,6 +28,18 @@ const DEFAULT_SETTINGS = {
   autoInventoryUpdate: true,
   requireIRVerification: false,
   firebaseLogging: true,
+};
+
+const DEFAULT_AUTOMATION_STATUS = {
+  automationStarted: false,
+  sortingStrategy: '',
+  currentState: 'WAIT_FOR_AUTOMATION',
+  cameraBusy: false,
+  beltRunning: false,
+  beltBlocked: true,
+  lifterBusy: false,
+  currentOperation: '',
+  lastError: null,
 };
 
 const AUTOMATION_OPTIONS = [
@@ -123,6 +134,9 @@ function AdminControlPanel() {
   const [latestScan, setLatestScan] = useState(null);
   const [storeQueue, setStoreQueue] = useState([]);
   const [pickQueue, setPickQueue] = useState([]);
+  const [scanQueue, setScanQueue] = useState([]);
+  const [orderQueue, setOrderQueue] = useState([]);
+  const [automationStatus, setAutomationStatus] = useState(DEFAULT_AUTOMATION_STATUS);
   const [products, setProducts] = useState([]);
   const [quickRetrieve, setQuickRetrieve] = useState({ brand: '', model: '', color: '', size: '' });
   const [productSearch, setProductSearch] = useState('');
@@ -149,6 +163,21 @@ function AdminControlPanel() {
         setFirebaseOnline(false);
         setError('Unable to read automation settings from Firestore.');
       },
+    );
+
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      AUTOMATION_STATUS_REF,
+      (snapshot) => {
+        setAutomationStatus({
+          ...DEFAULT_AUTOMATION_STATUS,
+          ...(snapshot.exists() ? snapshot.data() : {}),
+        });
+      },
+      () => setAutomationStatus(DEFAULT_AUTOMATION_STATUS),
     );
 
     return unsubscribe;
@@ -186,6 +215,20 @@ function AdminControlPanel() {
       () => setPickQueue([]),
     );
 
+    const scanQueueQuery = query(collection(db, 'scanQueue'), orderBy('updatedAt', 'desc'), limit(25));
+    const unsubscribeScanQueue = onSnapshot(
+      scanQueueQuery,
+      (snapshot) => setScanQueue(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+      () => setScanQueue([]),
+    );
+
+    const orderQueueQuery = query(collection(db, 'pickRequests'), orderBy('updatedAt', 'desc'), limit(25));
+    const unsubscribeOrderQueue = onSnapshot(
+      orderQueueQuery,
+      (snapshot) => setOrderQueue(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+      () => setOrderQueue([]),
+    );
+
     const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
     const unsubscribeProducts = onSnapshot(
       productsQuery,
@@ -198,6 +241,8 @@ function AdminControlPanel() {
       unsubscribeScans();
       unsubscribeStoreQueue();
       unsubscribePickQueue();
+      unsubscribeScanQueue();
+      unsubscribeOrderQueue();
       unsubscribeProducts();
     };
   }, []);
@@ -235,7 +280,9 @@ function AdminControlPanel() {
     };
   }, [pickQueue, storeQueue]);
 
-  const lifterStatus = currentOperation ? 'Working' : queueSummary.pick.error + queueSummary.store.error > 0 ? 'Error' : 'Idle';
+  const lifterStatus = automationStatus.lifterBusy || currentOperation ? 'Working' : automationStatus.lastError ? 'Error' : 'Idle';
+  const selectedStrategy = automationStatus.sortingStrategy || sortingMode;
+  const missingStrategy = !selectedStrategy;
 
   const productResults = useMemo(() => {
     const term = productSearch.trim().toLowerCase();
@@ -271,15 +318,77 @@ function AdminControlPanel() {
   };
 
   const handleAutomationToggle = (enabled) => {
-    updateSettings({
-      automationEnabled: enabled,
-      lastControlAction: enabled ? 'START_AUTOMATION' : 'STOP_AUTOMATION',
-      controlRequestedAt: serverTimestamp(),
-    }, enabled ? 'Start Automation' : 'Stop Automation');
+    if (enabled && !sortingMode) {
+      setError('Choose a sorting strategy before starting automation.');
+      return;
+    }
+
+    setSaving(enabled ? 'Start Automation' : 'Stop Automation');
+    setError('');
+    setNotice('');
+
+    const writes = [
+      setDoc(SYSTEM_SETTINGS_REF, {
+        automationEnabled: enabled,
+        sortingMode,
+        lastControlAction: enabled ? 'START_AUTOMATION' : 'STOP_AUTOMATION',
+        controlRequestedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }, { merge: true }),
+      setDoc(AUTOMATION_STATUS_REF, {
+        automationStarted: enabled,
+        sortingStrategy: sortingMode,
+        currentState: enabled ? 'WAIT_BOX_AT_CAMERA' : 'STOPPED',
+        cameraBusy: false,
+        beltRunning: false,
+        beltBlocked: !enabled,
+        lifterBusy: false,
+        currentOperation: '',
+        lastError: enabled ? null : 'Stopped by operator',
+        updatedAt: serverTimestamp(),
+      }, { merge: true }),
+    ];
+
+    if (!enabled) {
+      writes.push(addDoc(collection(db, 'commands'), {
+        type: 'COMMAND',
+        command: 'STOP',
+        status: 'pending',
+        source: 'website',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }));
+    }
+
+    Promise.all(writes)
+      .then(() => setNotice(enabled ? 'Automation started.' : 'Automation stopped.'))
+      .catch(() => setError(enabled ? 'Unable to start automation.' : 'Unable to stop automation.'))
+      .finally(() => setSaving(''));
   };
 
   const handleSortingSave = () => {
-    updateSettings({ sortingMode }, 'Sorting Strategy');
+    if (!sortingMode) {
+      setError('Choose a sorting strategy first.');
+      return;
+    }
+    setSaving('Sorting Strategy');
+    setError('');
+    setNotice('');
+    Promise.all([
+      setDoc(SYSTEM_SETTINGS_REF, {
+        sortingMode,
+        updatedAt: serverTimestamp(),
+      }, { merge: true }),
+      setDoc(AUTOMATION_STATUS_REF, {
+        sortingStrategy: sortingMode,
+        currentState: automationStatus.automationStarted ? 'WAIT_BOX_AT_CAMERA' : 'WAIT_FOR_AUTOMATION',
+        lastError: null,
+        updatedAt: serverTimestamp(),
+      }, { merge: true }),
+    ])
+      .then(() => setNotice('Sorting Strategy saved.'))
+      .catch(() => setError('Unable to save Sorting Strategy.'))
+      .finally(() => setSaving(''));
   };
 
   const handleOptionChange = (key, checked) => {
@@ -288,9 +397,13 @@ function AdminControlPanel() {
   };
 
   const handleEmergencyAction = (action) => {
+    if (action === 'EMERGENCY_STOP') {
+      handleAutomationToggle(false);
+      return;
+    }
     updateSettings({
-      automationEnabled: action === 'EMERGENCY_STOP' ? false : settings.automationEnabled,
-      emergencyStop: action === 'EMERGENCY_STOP',
+      automationEnabled: settings.automationEnabled,
+      emergencyStop: false,
       lastControlAction: action,
       controlRequestedAt: serverTimestamp(),
     }, action.replaceAll('_', ' '));
@@ -397,8 +510,8 @@ function AdminControlPanel() {
           <h1>Warehouse Automation Control Center</h1>
           <p>Manage automated scanning, sorting, lifter movement, and inventory synchronization.</p>
         </div>
-        <span className={`control-mode-pill ${settings.automationEnabled ? 'enabled' : 'disabled'}`}>
-          {settings.automationEnabled ? 'Automation Enabled' : 'Automation Disabled'}
+        <span className={`control-mode-pill ${automationStatus.automationStarted ? 'enabled' : 'disabled'}`}>
+          {automationStatus.automationStarted ? 'Automation Enabled' : 'Automation Disabled'}
         </span>
       </section>
 
@@ -416,7 +529,7 @@ function AdminControlPanel() {
               className="button button-primary"
               type="button"
               onClick={() => handleAutomationToggle(true)}
-              disabled={Boolean(saving) || settings.automationEnabled}
+              disabled={Boolean(saving) || automationStatus.automationStarted}
             >
               Start Automation
             </button>
@@ -424,7 +537,7 @@ function AdminControlPanel() {
               className="button button-secondary"
               type="button"
               onClick={() => handleAutomationToggle(false)}
-              disabled={Boolean(saving) || !settings.automationEnabled}
+              disabled={Boolean(saving) || !automationStatus.automationStarted}
             >
               Stop Automation
             </button>
@@ -434,27 +547,39 @@ function AdminControlPanel() {
         <div className="control-system-grid">
           <div className="automation-status-panel">
             <span>Automation Status</span>
-            <strong className={settings.automationEnabled ? 'enabled' : 'disabled'}>
-              {settings.automationEnabled ? 'Enabled' : 'Disabled'}
+            <strong className={automationStatus.automationStarted ? 'enabled' : 'disabled'}>
+              {automationStatus.automationStarted ? 'Enabled' : 'Disabled'}
             </strong>
-            <p>{firebaseOnline ? 'Settings synced with Firestore.' : 'Waiting for Firestore settings.'}</p>
+            <p>{missingStrategy ? 'Waiting for sorting strategy.' : firebaseOnline ? 'Settings synced with Firestore.' : 'Waiting for Firestore settings.'}</p>
           </div>
           <div className="control-detail-grid">
             <div>
               <span>Current Sorting Mode</span>
-              <strong>{SORTING_OPTIONS.find((option) => option.value === sortingMode)?.label || sortingMode}</strong>
+              <strong>{SORTING_OPTIONS.find((option) => option.value === selectedStrategy)?.label || 'Waiting'}</strong>
             </div>
             <div>
               <span>Lifter Status</span>
               <strong>{lifterStatus}</strong>
             </div>
             <div>
-              <span>Current Operation</span>
-              <strong>{currentOperation ? currentOperation.type : 'Idle'}</strong>
+              <span>Current State</span>
+              <strong>{automationStatus.currentState || 'WAIT_FOR_AUTOMATION'}</strong>
             </div>
             <div>
-              <span>Movement</span>
-              <strong>{currentOperation ? `${currentOperation.movement} / Location ${currentOperation.locationId}` : '--'}</strong>
+              <span>Current Operation</span>
+              <strong>{automationStatus.currentOperation || (currentOperation ? `${currentOperation.type} ${currentOperation.movement}` : '--')}</strong>
+            </div>
+            <div>
+              <span>Belt</span>
+              <strong>{automationStatus.beltRunning ? 'Running' : 'Stopped'} / {automationStatus.beltBlocked ? 'Blocked' : 'Clear'}</strong>
+            </div>
+            <div>
+              <span>Camera</span>
+              <strong>{automationStatus.cameraBusy ? 'Reading' : 'Idle'}</strong>
+            </div>
+            <div>
+              <span>Last Error</span>
+              <strong>{automationStatus.lastError || '--'}</strong>
             </div>
           </div>
         </div>
@@ -672,6 +797,40 @@ function AdminControlPanel() {
               Retrieve Box ID
             </button>
           </form>
+        </article>
+      </section>
+
+      <section className="control-dashboard-grid">
+        <article className="control-card">
+          <div className="control-card-heading compact">
+            <h2>Scan Queue</h2>
+          </div>
+          <div className="queue-list">
+            {scanQueue.length === 0 ? (
+              <p className="orders-customer-meta">No cartons waiting for lifter.</p>
+            ) : scanQueue.slice(0, 8).map((item) => (
+              <div className="queue-row" key={item.id}>
+                <strong>{item.productKey || [item.brand, item.model, item.color, item.size].filter(Boolean).join('|')}</strong>
+                <span>{item.status || 'WAITING'} / Location {item.targetLocation || '-'}</span>
+              </div>
+            ))}
+          </div>
+        </article>
+
+        <article className="control-card">
+          <div className="control-card-heading compact">
+            <h2>Order Queue</h2>
+          </div>
+          <div className="queue-list">
+            {orderQueue.length === 0 ? (
+              <p className="orders-customer-meta">No order retrieval requests.</p>
+            ) : orderQueue.slice(0, 8).map((item) => (
+              <div className="queue-row" key={item.id}>
+                <strong>{item.orderNumber || item.orderId || item.productKey || item.queryValue}</strong>
+                <span>{item.status || 'waiting'} / Location {item.locationId || '-'}</span>
+              </div>
+            ))}
+          </div>
         </article>
       </section>
 
