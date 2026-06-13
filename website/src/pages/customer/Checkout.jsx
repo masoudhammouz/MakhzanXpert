@@ -10,6 +10,12 @@ function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
 }
 
+function buildProductKey(product) {
+  return ['brand', 'model', 'color', 'size']
+    .map((field) => String(product[field] || '').trim().toUpperCase())
+    .join('|');
+}
+
 function Checkout() {
   const navigate = useNavigate();
   const { items, subtotal, clearCart } = useCart();
@@ -59,6 +65,7 @@ function Checkout() {
         category: item.category || '',
         size: item.size || '',
         color: item.color || '',
+        productKey: item.productKey || buildProductKey(item),
         price: Number(item.price || 0),
         quantity: Number(item.quantity || 0),
         imageUrl: item.imageUrl || '',

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { addDoc, collection, doc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
+import { addDoc, collection, doc, getDocs, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
 import { db } from '../../firebase/firebase.js';
 
 const SYSTEM_SETTINGS_REF = doc(db, 'settings', 'system');
@@ -18,13 +18,6 @@ const SORTING_OPTIONS = [
   { value: 'custom', label: 'Custom' },
   { value: 'nearest_empty', label: 'Nearest Empty' },
   { value: 'most_requested', label: 'Most Requested' },
-];
-
-const PICK_TYPES = [
-  { value: 'single', label: 'Box ID' },
-  { value: 'size', label: 'Size' },
-  { value: 'model', label: 'Model' },
-  { value: 'brand', label: 'Brand' },
 ];
 
 const DEFAULT_SETTINGS = {
@@ -97,6 +90,32 @@ function getSelectedMovement(scan) {
   return '--';
 }
 
+function normalize(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function productKeyFromParts(parts) {
+  return ['brand', 'model', 'color', 'size'].map((field) => normalize(parts[field])).join('|');
+}
+
+function locationIdOf(location) {
+  return Number(location.locationId || location.position || location.id);
+}
+
+function isRetrievableLocation(location) {
+  const id = locationIdOf(location);
+  return Number.isInteger(id) && id >= 1 && id <= 9 && location.status === 'full' && Boolean(location.boxId);
+}
+
+function queueCounts(items) {
+  return {
+    waiting: items.filter((item) => item.status === 'waiting').length,
+    running: items.filter((item) => item.status === 'running').length,
+    done: items.filter((item) => item.status === 'done').length,
+    error: items.filter((item) => item.status === 'error').length,
+  };
+}
+
 function AdminControlPanel() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [sortingMode, setSortingMode] = useState(DEFAULT_SETTINGS.sortingMode);
@@ -104,8 +123,10 @@ function AdminControlPanel() {
   const [latestScan, setLatestScan] = useState(null);
   const [storeQueue, setStoreQueue] = useState([]);
   const [pickQueue, setPickQueue] = useState([]);
-  const [pickType, setPickType] = useState('single');
-  const [pickValue, setPickValue] = useState('');
+  const [products, setProducts] = useState([]);
+  const [quickRetrieve, setQuickRetrieve] = useState({ brand: '', model: '', color: '', size: '' });
+  const [productSearch, setProductSearch] = useState('');
+  const [advancedBoxId, setAdvancedBoxId] = useState('');
   const [firebaseOnline, setFirebaseOnline] = useState(false);
   const [saving, setSaving] = useState('');
   const [notice, setNotice] = useState('');
@@ -165,11 +186,19 @@ function AdminControlPanel() {
       () => setPickQueue([]),
     );
 
+    const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
+    const unsubscribeProducts = onSnapshot(
+      productsQuery,
+      (snapshot) => setProducts(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+      () => setProducts([]),
+    );
+
     return () => {
       unsubscribeLocations();
       unsubscribeScans();
       unsubscribeStoreQueue();
       unsubscribePickQueue();
+      unsubscribeProducts();
     };
   }, []);
 
@@ -188,16 +217,40 @@ function AdminControlPanel() {
   }, [locations]);
 
   const queueSummary = useMemo(() => {
-    const combined = [...storeQueue, ...pickQueue];
-    const countByStatus = (status) => combined.filter((item) => item.status === status).length;
-
     return {
-      waiting: countByStatus('waiting'),
-      running: countByStatus('running'),
-      done: countByStatus('done'),
-      error: countByStatus('error'),
+      store: queueCounts(storeQueue),
+      pick: queueCounts(pickQueue),
     };
   }, [pickQueue, storeQueue]);
+
+  const currentOperation = useMemo(() => {
+    const runningPick = pickQueue.find((item) => item.status === 'running');
+    const runningStore = storeQueue.find((item) => item.status === 'running');
+    const active = runningPick || runningStore;
+    if (!active) return null;
+    return {
+      type: runningPick ? 'GET' : 'PUT',
+      locationId: active.locationId,
+      movement: active.outPosition ? `GO ${active.outPosition}` : active.inPosition ? `GO ${active.inPosition}` : active.goPosition ? `GO ${active.goPosition}` : '--',
+    };
+  }, [pickQueue, storeQueue]);
+
+  const lifterStatus = currentOperation ? 'Working' : queueSummary.pick.error + queueSummary.store.error > 0 ? 'Error' : 'Idle';
+
+  const productResults = useMemo(() => {
+    const term = productSearch.trim().toLowerCase();
+    if (!term) return products.slice(0, 8);
+    return products
+      .filter((product) => [
+        product.productKey,
+        product.brand,
+        product.model,
+        product.color,
+        product.size,
+        product.name,
+      ].some((value) => String(value || '').toLowerCase().includes(term)))
+      .slice(0, 12);
+  }, [productSearch, products]);
 
   const updateSettings = async (updates, actionLabel) => {
     setSaving(actionLabel);
@@ -243,31 +296,94 @@ function AdminControlPanel() {
     }, action.replaceAll('_', ' '));
   };
 
-  const handlePickRequest = async (event) => {
-    event.preventDefault();
-    const trimmedValue = pickValue.trim();
-    if (!trimmedValue) {
-      setError('Enter a value for the pick request.');
+  const createPickRequestForLocation = async (location, source = 'retrieval-panel') => {
+    const locationId = locationIdOf(location);
+    if (!isRetrievableLocation(location)) {
+      throw new Error(`Location ${locationId || '-'} is not full.`);
+    }
+    await addDoc(collection(db, 'pickRequests'), {
+      requestType: 'location',
+      queryValue: String(locationId),
+      locationId,
+      boxId: location.boxId,
+      productKey: location.productKey || productKeyFromParts(location),
+      brand: normalize(location.brand),
+      model: normalize(location.model),
+      color: normalize(location.color),
+      size: normalize(location.size),
+      status: 'waiting',
+      source,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  };
+
+  const handleRetrieveLocations = async (matchingLocations, label) => {
+    if (matchingLocations.length === 0) {
+      setError(`No full locations found for ${label}.`);
       return;
     }
-
-    setSaving('Pick Request');
+    setSaving(label);
     setError('');
     setNotice('');
 
     try {
+      await Promise.all(matchingLocations.map((location) => createPickRequestForLocation(location)));
+      setNotice(`${matchingLocations.length} retrieval task${matchingLocations.length === 1 ? '' : 's'} sent to Raspberry Pi.`);
+    } catch (requestError) {
+      setError(requestError.message || 'Unable to create retrieval request.');
+    } finally {
+      setSaving('');
+    }
+  };
+
+  const handleQuickRetrieve = (event) => {
+    event.preventDefault();
+    const wantedKey = productKeyFromParts(quickRetrieve);
+    const matches = locations.filter((location) =>
+      isRetrievableLocation(location) &&
+      normalize(location.productKey || productKeyFromParts(location)) === wantedKey,
+    );
+    handleRetrieveLocations(matches, wantedKey);
+  };
+
+  const handleRetrieveLocation = (locationId) => {
+    const location = locations.find((item) => locationIdOf(item) === locationId);
+    handleRetrieveLocations(location ? [location] : [], `Location ${locationId}`);
+  };
+
+  const handleRetrieveProduct = (product) => {
+    const key = product.productKey || productKeyFromParts(product);
+    const matches = locations.filter((location) =>
+      isRetrievableLocation(location) &&
+      normalize(location.productKey || productKeyFromParts(location)) === normalize(key),
+    );
+    handleRetrieveLocations(matches, key);
+  };
+
+  const handleAdvancedBoxRetrieve = async (event) => {
+    event.preventDefault();
+    const value = advancedBoxId.trim();
+    if (!value) {
+      setError('Enter a Box ID.');
+      return;
+    }
+    setSaving('Advanced Box Retrieval');
+    setError('');
+    setNotice('');
+    try {
       await addDoc(collection(db, 'pickRequests'), {
-        requestType: pickType,
-        queryValue: trimmedValue,
+        requestType: 'single',
+        queryValue: value,
         status: 'waiting',
-        source: 'website',
+        source: 'advanced',
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      setPickValue('');
-      setNotice('Pick request sent to Raspberry Pi.');
+      setAdvancedBoxId('');
+      setNotice('Advanced Box ID retrieval request sent.');
     } catch {
-      setError('Unable to create pick request.');
+      setError('Unable to create advanced retrieval request.');
     } finally {
       setSaving('');
     }
@@ -323,10 +439,24 @@ function AdminControlPanel() {
             </strong>
             <p>{firebaseOnline ? 'Settings synced with Firestore.' : 'Waiting for Firestore settings.'}</p>
           </div>
-          <p className="control-description">
-            When automation is enabled: Worker places cartons into dispenser. System automatically scans labels,
-            chooses positions, moves lifter, updates inventory and waits for next carton.
-          </p>
+          <div className="control-detail-grid">
+            <div>
+              <span>Current Sorting Mode</span>
+              <strong>{SORTING_OPTIONS.find((option) => option.value === sortingMode)?.label || sortingMode}</strong>
+            </div>
+            <div>
+              <span>Lifter Status</span>
+              <strong>{lifterStatus}</strong>
+            </div>
+            <div>
+              <span>Current Operation</span>
+              <strong>{currentOperation ? currentOperation.type : 'Idle'}</strong>
+            </div>
+            <div>
+              <span>Movement</span>
+              <strong>{currentOperation ? `${currentOperation.movement} / Location ${currentOperation.locationId}` : '--'}</strong>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -411,56 +541,135 @@ function AdminControlPanel() {
         </Link>
       </section>
 
+      <section className="control-card warehouse-control-card">
+        <div className="control-card-heading">
+          <div>
+            <h2>Retrieval Panel</h2>
+            <p>Retrieve by product or location. Box IDs stay in Advanced.</p>
+          </div>
+        </div>
+
+        <div className="retrieval-panel-grid">
+          <article className="retrieval-section">
+            <h3>Quick Retrieve</h3>
+            <form className="quick-retrieve-grid" onSubmit={handleQuickRetrieve}>
+              {['brand', 'model', 'color', 'size'].map((field) => (
+                <label className="control-field" htmlFor={`quick-${field}`} key={field}>
+                  <span>{field}</span>
+                  <input
+                    id={`quick-${field}`}
+                    value={quickRetrieve[field]}
+                    onChange={(event) => setQuickRetrieve((current) => ({ ...current, [field]: event.target.value }))}
+                    placeholder={field === 'brand' ? 'NIKE' : field === 'model' ? 'AIR FORCE' : field === 'color' ? 'WHITE' : '40'}
+                    type="text"
+                  />
+                </label>
+              ))}
+              <button className="button button-primary" type="submit" disabled={Boolean(saving)}>
+                Retrieve Matching Boxes
+              </button>
+            </form>
+          </article>
+
+          <article className="retrieval-section">
+            <h3>Retrieve By Location</h3>
+            <div className="location-retrieve-grid">
+              {Array.from({ length: 9 }, (_, index) => index + 1).map((locationId) => {
+                const location = locations.find((item) => locationIdOf(item) === locationId);
+                return (
+                  <button
+                    className="button button-secondary"
+                    type="button"
+                    key={locationId}
+                    disabled={Boolean(saving) || !isRetrievableLocation(location || {})}
+                    onClick={() => handleRetrieveLocation(locationId)}
+                  >
+                    Location {locationId}
+                  </button>
+                );
+              })}
+            </div>
+          </article>
+
+          <article className="retrieval-section retrieval-section-wide">
+            <h3>Retrieve By Product</h3>
+            <label className="control-field" htmlFor="product-retrieve-search">
+              <span>Search brand/model/color/size</span>
+              <input
+                id="product-retrieve-search"
+                value={productSearch}
+                onChange={(event) => setProductSearch(event.target.value)}
+                placeholder="SAMBA, AIR FORCE, 43, WHITE"
+                type="search"
+              />
+            </label>
+            <div className="product-retrieve-list">
+              {productResults.map((product) => (
+                <div className="product-retrieve-row" key={product.id}>
+                  <div>
+                    <strong>{product.productKey || productKeyFromParts(product)}</strong>
+                    <span>{Number(product.availableStock ?? product.quantity ?? 0)} available</span>
+                  </div>
+                  <button className="button button-secondary" type="button" disabled={Boolean(saving)} onClick={() => handleRetrieveProduct(product)}>
+                    Retrieve
+                  </button>
+                </div>
+              ))}
+            </div>
+          </article>
+        </div>
+      </section>
+
       <section className="control-dashboard-grid">
         <article className="control-card">
           <div className="control-card-heading compact">
-            <h2>Queue Status</h2>
+            <h2>Queue Monitor</h2>
           </div>
           <div className="control-detail-grid">
             <div>
-              <span>Waiting</span>
-              <strong>{queueSummary.waiting}</strong>
+              <span>Pick Waiting</span>
+              <strong>{queueSummary.pick.waiting}</strong>
             </div>
             <div>
-              <span>Running</span>
-              <strong>{queueSummary.running}</strong>
+              <span>Pick Running</span>
+              <strong>{queueSummary.pick.running}</strong>
             </div>
             <div>
-              <span>Done</span>
-              <strong>{queueSummary.done}</strong>
+              <span>Pick Done</span>
+              <strong>{queueSummary.pick.done}</strong>
             </div>
             <div>
-              <span>Error</span>
-              <strong>{queueSummary.error}</strong>
+              <span>Store Waiting</span>
+              <strong>{queueSummary.store.waiting}</strong>
+            </div>
+            <div>
+              <span>Store Running</span>
+              <strong>{queueSummary.store.running}</strong>
+            </div>
+            <div>
+              <span>Store Done</span>
+              <strong>{queueSummary.store.done}</strong>
             </div>
           </div>
         </article>
 
         <article className="control-card">
           <div className="control-card-heading compact">
-            <h2>Pick Request</h2>
+            <h2>Advanced Retrieval</h2>
           </div>
-          <form className="pick-request-form" onSubmit={handlePickRequest}>
-            <label className="control-field" htmlFor="pick-request-type">
-              <span>Request By</span>
-              <select id="pick-request-type" value={pickType} onChange={(event) => setPickType(event.target.value)}>
-                {PICK_TYPES.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            <label className="control-field" htmlFor="pick-request-value">
-              <span>Value</span>
+          <form className="pick-request-form" onSubmit={handleAdvancedBoxRetrieve}>
+            <label className="control-field" htmlFor="advanced-box-id">
+              <span>Box ID</span>
               <input
-                id="pick-request-value"
-                value={pickValue}
-                onChange={(event) => setPickValue(event.target.value)}
-                placeholder={pickType === 'single' ? 'BOX-...' : `Enter ${pickType}`}
+                id="advanced-box-id"
+                value={advancedBoxId}
+                onChange={(event) => setAdvancedBoxId(event.target.value)}
+                placeholder="BOX-..."
                 type="text"
               />
             </label>
             <button className="button button-primary" type="submit" disabled={Boolean(saving)}>
-              Request Pick
+              Retrieve Box ID
             </button>
           </form>
         </article>

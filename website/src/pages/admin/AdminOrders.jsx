@@ -1,18 +1,24 @@
 import { useEffect, useMemo, useState } from 'react';
-import { addDoc, collection, doc, onSnapshot, orderBy, query, serverTimestamp, updateDoc, where, getDocs } from 'firebase/firestore';
+import {
+  addDoc,
+  collection,
+  doc,
+  getDocs,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  updateDoc,
+  where,
+  writeBatch,
+} from 'firebase/firestore';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
 import { formatCurrency } from '../../utils/formatCurrency.js';
 
-const ORDER_STATUSES = ['pending', 'preparing', 'retrieving', 'ready', 'completed', 'cancelled'];
-
-const STATUS_FLOW = ['pending', 'preparing', 'retrieving', 'ready', 'completed'];
-const ESP_DEVICE_ID = 'esp-main-01';
-
-function physicalLocationToOutMovement(locationNumber) {
-  return locationNumber * 2;
-}
+const ORDER_STATUSES = ['pending', 'retrieving', 'ready', 'completed', 'cancelled'];
+const COMPLETABLE_STATUSES = ['ready', 'completed'];
 
 function getTimestampValue(value) {
   if (value?.toMillis) return value.toMillis();
@@ -30,6 +36,18 @@ function formatDate(value) {
   }).format(new Date(timestamp));
 }
 
+function normalize(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function buildProductKey(item) {
+  return item.productKey || ['brand', 'model', 'color', 'size'].map((field) => normalize(item[field] || (field === 'model' ? item.name : ''))).join('|');
+}
+
+function productLabel(item) {
+  return buildProductKey(item).split('|').filter(Boolean).join(' ');
+}
+
 function getItemsCount(order) {
   return (order.items || []).reduce((sum, item) => sum + Number(item.quantity || 0), 0);
 }
@@ -39,6 +57,20 @@ function getOrderTotal(order) {
   return (order.items || []).reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0), 0);
 }
 
+function getRetrievalTotal(order) {
+  return Number(order.retrievalTotal ?? getItemsCount(order) ?? 0);
+}
+
+function getRetrievedCount(order) {
+  return Number(order.retrievalDone ?? 0);
+}
+
+function getProgressLabel(order) {
+  const total = getRetrievalTotal(order);
+  if (!total) return '-';
+  return `${getRetrievedCount(order)} / ${total} Retrieved`;
+}
+
 function getStatusClass(status) {
   if (status === 'cancelled') return 'status-unavailable';
   if (status === 'completed') return 'status-available';
@@ -46,8 +78,30 @@ function getStatusClass(status) {
   return 'status-low-stock';
 }
 
-function sameText(left, right) {
-  return (left || '').toString().trim().toLowerCase() === (right || '').toString().trim().toLowerCase();
+function isLocationMatch(location, item) {
+  const key = buildProductKey(item);
+  return (
+    location.status === 'full' &&
+    normalize(location.productKey) === normalize(key)
+  ) || (
+    location.status === 'full' &&
+    normalize(location.brand) === normalize(item.brand) &&
+    normalize(location.model) === normalize(item.model || item.name) &&
+    normalize(location.color) === normalize(item.color) &&
+    normalize(location.size) === normalize(item.size)
+  );
+}
+
+function expandOrderItems(items) {
+  return (items || []).flatMap((item, itemIndex) => {
+    const quantity = Math.max(1, Number(item.quantity || 1));
+    return Array.from({ length: quantity }, (_, unitIndex) => ({
+      ...item,
+      itemIndex,
+      unitIndex,
+      itemKey: `${item.productId || buildProductKey(item)}-${itemIndex}-${unitIndex}`,
+    }));
+  });
 }
 
 function AdminOrders() {
@@ -81,9 +135,15 @@ function AdminOrders() {
     return unsubscribe;
   }, []);
 
+  useEffect(() => {
+    if (!selectedOrder) return;
+    const latest = orders.find((order) => order.id === selectedOrder.id);
+    if (latest) setSelectedOrder(latest);
+  }, [orders, selectedOrder?.id]);
+
   const summary = useMemo(() => ({
-    pending: orders.filter((order) => order.status === 'pending').length,
-    preparing: orders.filter((order) => order.status === 'preparing').length,
+    pending: orders.filter((order) => (order.status || 'pending') === 'pending').length,
+    retrieving: orders.filter((order) => order.status === 'retrieving').length,
     ready: orders.filter((order) => order.status === 'ready').length,
     completed: orders.filter((order) => order.status === 'completed').length,
   }), [orders]);
@@ -103,14 +163,20 @@ function AdminOrders() {
             .map((value) => value?.toString().toLowerCase() || '')
             .some((value) => value.includes(term))
           : true;
-        const matchesStatus = statusFilter === 'all' || order.status === statusFilter;
-
-        return matchesSearch && matchesStatus;
+        return matchesSearch && (statusFilter === 'all' || (order.status || 'pending') === statusFilter);
       })
       .sort((a, b) => getTimestampValue(b.createdAt) - getTimestampValue(a.createdAt));
   }, [orders, searchText, statusFilter]);
 
+  const refreshSelectedOrder = (orderId, updates) => {
+    setOrders((current) => current.map((item) => (item.id === orderId ? { ...item, ...updates, updatedAt: Date.now() } : item)));
+    if (selectedOrder?.id === orderId) {
+      setSelectedOrder((current) => ({ ...current, ...updates, updatedAt: Date.now() }));
+    }
+  };
+
   const handleStatusChange = async (order, nextStatus) => {
+    if (!COMPLETABLE_STATUSES.includes(nextStatus)) return;
     setUpdatingId(order.id);
     setError('');
 
@@ -119,10 +185,7 @@ function AdminOrders() {
         status: nextStatus,
         updatedAt: serverTimestamp(),
       });
-      setOrders((current) => current.map((item) => (item.id === order.id ? { ...item, status: nextStatus, updatedAt: Date.now() } : item)));
-      if (selectedOrder?.id === order.id) {
-        setSelectedOrder((current) => ({ ...current, status: nextStatus, updatedAt: Date.now() }));
-      }
+      refreshSelectedOrder(order.id, { status: nextStatus });
     } catch {
       setError('Unable to update order status. Please try again.');
     } finally {
@@ -130,24 +193,38 @@ function AdminOrders() {
     }
   };
 
-  const findPositionForItem = async (item) => {
-    const locationsQuery = query(
-      collection(db, 'locations'),
-      where('brand', '==', item.brand || ''),
-      where('model', '==', item.model || item.name || ''),
-      where('color', '==', item.color || ''),
-      where('size', '==', item.size || ''),
-    );
-    const snapshot = await getDocs(locationsQuery);
-    return snapshot.docs
-      .map((positionDoc) => ({ id: positionDoc.id, ...positionDoc.data() }))
-      .find((position) =>
-        (position.status === 'full' || position.isOccupied) &&
-        sameText(position.brand, item.brand) &&
-        sameText(position.model, item.model || item.name) &&
-        sameText(position.color, item.color) &&
-        sameText(position.size, item.size),
-      );
+  const findBoxesForOrder = async (order) => {
+    const locationsSnapshot = await getDocs(collection(db, 'locations'));
+    const availableLocations = locationsSnapshot.docs
+      .map((locationDoc) => ({ id: locationDoc.id, ...locationDoc.data() }))
+      .filter((location) => location.status === 'full' && location.boxId);
+
+    const assignedBoxIds = new Set();
+    const assignments = [];
+    const missingItems = [];
+
+    for (const item of expandOrderItems(order.items)) {
+      const match = availableLocations.find((location) => !assignedBoxIds.has(location.boxId) && isLocationMatch(location, item));
+      if (!match) {
+        missingItems.push(productLabel(item));
+        continue;
+      }
+      assignedBoxIds.add(match.boxId);
+      assignments.push({
+        orderItemKey: item.itemKey,
+        productKey: buildProductKey(item),
+        productId: item.productId || '',
+        brand: normalize(item.brand),
+        model: normalize(item.model || item.name),
+        color: normalize(item.color),
+        size: normalize(item.size),
+        boxId: match.boxId,
+        locationId: Number(match.id || match.locationId),
+        status: 'waiting',
+      });
+    }
+
+    return { assignments, missingItems };
   };
 
   const handlePrepareOrder = async (order) => {
@@ -155,59 +232,85 @@ function AdminOrders() {
     setError('');
 
     try {
-      const items = order.items || [];
-      const commandWrites = [];
-      const missingItems = [];
-
-      for (const item of items) {
-        const storedPosition = await findPositionForItem(item);
-        if (!storedPosition) {
-          missingItems.push([item.brand, item.model || item.name, item.color, item.size].filter(Boolean).join(' '));
-          continue;
-        }
-
-        const physicalLocation = Number(storedPosition.position || storedPosition.id);
-        const position = physicalLocationToOutMovement(physicalLocation);
-
-        if (!Number.isInteger(physicalLocation) || physicalLocation < 1 || physicalLocation > 9) {
-          missingItems.push(`${[item.brand, item.model || item.name, item.color, item.size].filter(Boolean).join(' ')} has invalid location ${physicalLocation || '-'}`);
-          continue;
-        }
-
-        commandWrites.push(addDoc(collection(db, 'commands'), {
-          type: 'GO',
-          position,
-          arduinoCommand: `GO ${position}`,
-          status: 'pending',
-          source: 'website',
-          deviceId: ESP_DEVICE_ID,
-          brand: item.brand || '',
-          model: item.model || item.name || '',
-          color: item.color || '',
-          size: item.size || '',
-          createdAt: serverTimestamp(),
-        }));
-      }
-
-      if (commandWrites.length > 0) {
-        await Promise.all(commandWrites);
-        await updateDoc(doc(db, 'orders', order.id), {
-          status: 'retrieving',
-          updatedAt: serverTimestamp(),
-        });
-        setOrders((current) => current.map((item) => (item.id === order.id ? { ...item, status: 'retrieving', updatedAt: Date.now() } : item)));
-        if (selectedOrder?.id === order.id) {
-          setSelectedOrder((current) => ({ ...current, status: 'retrieving', updatedAt: Date.now() }));
-        }
-      }
-
+      const { assignments, missingItems } = await findBoxesForOrder(order);
       if (missingItems.length > 0) {
-        setError(`No matching warehouse position found for: ${missingItems.join(', ')}.`);
+        setError(`Not enough stored boxes for: ${missingItems.join(', ')}.`);
+        return;
       }
+      if (assignments.length === 0) {
+        setError('This order has no retrievable items.');
+        return;
+      }
+
+      await Promise.all(assignments.map((assignment) => addDoc(collection(db, 'pickRequests'), {
+        requestType: 'location',
+        queryValue: String(assignment.locationId),
+        orderId: order.id,
+        orderNumber: order.orderId || order.id,
+        orderItemKey: assignment.orderItemKey,
+        productKey: assignment.productKey,
+        productId: assignment.productId,
+        boxId: assignment.boxId,
+        locationId: assignment.locationId,
+        brand: assignment.brand,
+        model: assignment.model,
+        color: assignment.color,
+        size: assignment.size,
+        status: 'waiting',
+        source: 'order',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })));
+
+      const updates = {
+        status: 'retrieving',
+        retrievalTotal: assignments.length,
+        retrievalDone: 0,
+        retrievalProgressLabel: `0 / ${assignments.length} Retrieved`,
+        assignedBoxes: assignments,
+        retrievalStartedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+      await updateDoc(doc(db, 'orders', order.id), updates);
+      refreshSelectedOrder(order.id, { ...updates, retrievalStartedAt: Date.now(), updatedAt: Date.now() });
     } catch {
-      setError('Unable to prepare order. Please check warehouse positions and try again.');
+      setError('Unable to prepare order. Please check stored inventory and try again.');
     } finally {
       setPreparingId('');
+    }
+  };
+
+  const handleCancelOrder = async (order) => {
+    if (!['pending', 'retrieving'].includes(order.status || 'pending')) return;
+    setUpdatingId(order.id);
+    setError('');
+
+    try {
+      const batch = writeBatch(db);
+      batch.update(doc(db, 'orders', order.id), {
+        status: 'cancelled',
+        cancelRemainingPickTasks: true,
+        cancelledAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      const requestsSnapshot = await getDocs(query(collection(db, 'pickRequests'), where('orderId', '==', order.id)));
+      requestsSnapshot.docs.forEach((requestDoc) => {
+        const status = requestDoc.data().status;
+        if (!['done', 'picked', 'error'].includes(status)) {
+          batch.update(requestDoc.ref, {
+            status: 'cancelled',
+            updatedAt: serverTimestamp(),
+          });
+        }
+      });
+
+      await batch.commit();
+      refreshSelectedOrder(order.id, { status: 'cancelled', cancelRemainingPickTasks: true });
+    } catch {
+      setError('Unable to cancel order retrieval.');
+    } finally {
+      setUpdatingId('');
     }
   };
 
@@ -217,25 +320,25 @@ function AdminOrders() {
         <div>
           <p className="section-eyebrow">Orders management</p>
           <h1>Orders</h1>
-          <p>Track customer orders and move fulfillment status through the warehouse workflow.</p>
+          <p>Prepare orders by product and location. Operators never need Box IDs.</p>
         </div>
       </section>
 
       <section className="inventory-summary-grid" aria-label="Orders summary">
         <article className="admin-summary-card">
-          <p className="metric-label">Pending Orders</p>
+          <p className="metric-label">Pending</p>
           <p className="metric-value">{summary.pending}</p>
         </article>
         <article className="admin-summary-card">
-          <p className="metric-label">Preparing Orders</p>
-          <p className="metric-value">{summary.preparing}</p>
+          <p className="metric-label">Retrieving</p>
+          <p className="metric-value">{summary.retrieving}</p>
         </article>
         <article className="admin-summary-card">
-          <p className="metric-label">Ready Orders</p>
+          <p className="metric-label">Ready</p>
           <p className="metric-value">{summary.ready}</p>
         </article>
         <article className="admin-summary-card">
-          <p className="metric-label">Completed Orders</p>
+          <p className="metric-label">Completed</p>
           <p className="metric-value">{summary.completed}</p>
         </article>
       </section>
@@ -282,10 +385,11 @@ function AdminOrders() {
                       <tr>
                         <th>Order ID</th>
                         <th>Customer</th>
-                        <th>Items Count</th>
-                        <th>Total Price</th>
+                        <th>Items</th>
+                        <th>Total</th>
                         <th>Status</th>
-                        <th>Created Date</th>
+                        <th>Retrieval</th>
+                        <th>Created</th>
                         <th>Actions</th>
                       </tr>
                     </thead>
@@ -302,27 +406,28 @@ function AdminOrders() {
                           <td>
                             <span className={`status-badge ${getStatusClass(order.status)}`}>{order.status || 'pending'}</span>
                           </td>
+                          <td>{order.status === 'ready' ? 'Ready For Pickup' : getProgressLabel(order)}</td>
                           <td>{formatDate(order.createdAt)}</td>
                           <td>
                             <div className="inventory-actions order-actions">
                               <button type="button" onClick={() => setSelectedOrder(order)}>View Details</button>
                               <button
                                 type="button"
-                                disabled={preparingId === order.id || order.status === 'retrieving' || order.status === 'completed' || order.status === 'cancelled'}
+                                disabled={preparingId === order.id || (order.status || 'pending') !== 'pending'}
                                 onClick={() => handlePrepareOrder(order)}
                               >
                                 {preparingId === order.id ? 'Preparing...' : 'Prepare Order'}
                               </button>
-                              <select
-                                value={order.status || 'pending'}
-                                disabled={updatingId === order.id}
-                                onChange={(event) => handleStatusChange(order, event.target.value)}
-                                aria-label={`Update status for ${order.orderId || order.id}`}
-                              >
-                                {ORDER_STATUSES.map((status) => (
-                                  <option key={status} value={status}>{status}</option>
-                                ))}
-                              </select>
+                              {order.status === 'ready' && (
+                                <button type="button" disabled={updatingId === order.id} onClick={() => handleStatusChange(order, 'completed')}>
+                                  Complete
+                                </button>
+                              )}
+                              {['pending', 'retrieving'].includes(order.status || 'pending') && (
+                                <button className="button-danger" type="button" disabled={updatingId === order.id} onClick={() => handleCancelOrder(order)}>
+                                  Cancel
+                                </button>
+                              )}
                             </div>
                           </td>
                         </tr>
@@ -357,35 +462,56 @@ function AdminOrders() {
                 <p>{selectedOrder.customerAddress || '-'}</p>
               </article>
               <article>
-                <p className="spec-label">Current status</p>
+                <p className="spec-label">Fulfillment</p>
                 <span className={`status-badge ${getStatusClass(selectedOrder.status)}`}>{selectedOrder.status || 'pending'}</span>
-                <label className="order-modal-status">
-                  Update Status
-                  <select
-                    value={selectedOrder.status || 'pending'}
-                    disabled={updatingId === selectedOrder.id}
-                    onChange={(event) => handleStatusChange(selectedOrder, event.target.value)}
-                  >
-                    {STATUS_FLOW.map((status) => (
-                      <option key={status} value={status}>{status}</option>
-                    ))}
-                  </select>
-                </label>
+                <p className="order-progress-text">{selectedOrder.status === 'ready' ? 'Ready For Pickup' : getProgressLabel(selectedOrder)}</p>
+                {selectedOrder.status === 'ready' && (
+                  <label className="order-modal-status">
+                    Finish Order
+                    <select
+                      value={selectedOrder.status}
+                      disabled={updatingId === selectedOrder.id}
+                      onChange={(event) => handleStatusChange(selectedOrder, event.target.value)}
+                    >
+                      {COMPLETABLE_STATUSES.map((status) => (
+                        <option key={status} value={status}>{status}</option>
+                      ))}
+                    </select>
+                  </label>
+                )}
               </article>
             </div>
 
             <div className="ordered-products-list">
-              <h3>Ordered products</h3>
+              <h3>Items requested</h3>
               {(selectedOrder.items || []).map((item, index) => (
                 <div className="ordered-product-row" key={item.productId || `${selectedOrder.id}-${index}`}>
                   <div>
-                    <p className="inventory-product-name">{[item.brand, item.model || item.name].filter(Boolean).join(' ') || 'Product'}</p>
-                    <p className="orders-customer-meta">{[item.size, item.color].filter(Boolean).join(' / ')}</p>
+                    <p className="inventory-product-name">{productLabel(item) || 'Product'}</p>
+                    <p className="orders-customer-meta">{buildProductKey(item)}</p>
                   </div>
                   <p>Qty {Number(item.quantity || 0)}</p>
                   <p>{formatCurrency(Number(item.price || 0) * Number(item.quantity || 0))}</p>
                 </div>
               ))}
+            </div>
+
+            <div className="ordered-products-list">
+              <h3>Boxes assigned</h3>
+              {(selectedOrder.assignedBoxes || []).length === 0 ? (
+                <p className="orders-customer-meta">No boxes assigned yet.</p>
+              ) : (
+                selectedOrder.assignedBoxes.map((box, index) => (
+                  <div className="ordered-product-row order-box-row" key={`${box.boxId || box.locationId}-${index}`}>
+                    <div>
+                      <p className="inventory-product-name">{box.productKey}</p>
+                      <p className="orders-customer-meta">Location {box.locationId}</p>
+                    </div>
+                    <p>{box.status || 'waiting'}</p>
+                    <p>{box.boxId || '-'}</p>
+                  </div>
+                ))
+              )}
             </div>
 
             <div className="order-modal-total">

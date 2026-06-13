@@ -2644,6 +2644,79 @@ button {
   gap: 0.9rem;
 }
 
+.retrieval-panel-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.retrieval-section {
+  display: grid;
+  gap: 0.85rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-page);
+}
+
+.retrieval-section h3 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 0.98rem;
+}
+
+.retrieval-section-wide {
+  grid-column: 1 / -1;
+}
+
+.quick-retrieve-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.75rem;
+  align-items: end;
+}
+
+.quick-retrieve-grid .button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.location-retrieve-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.product-retrieve-list {
+  display: grid;
+  gap: 0.65rem;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.product-retrieve-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-surface);
+}
+
+.product-retrieve-row strong,
+.product-retrieve-row span {
+  display: block;
+}
+
+.product-retrieve-row span {
+  margin-top: 0.25rem;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+
 .control-detail-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3962,6 +4035,11 @@ html.dark .location-low {
   .control-system-grid,
   .control-dashboard-grid,
   .control-dashboard-grid.lower {
+    grid-template-columns: 1fr;
+  }
+
+  .retrieval-panel-grid,
+  .quick-retrieve-grid {
     grid-template-columns: 1fr;
   }
 
