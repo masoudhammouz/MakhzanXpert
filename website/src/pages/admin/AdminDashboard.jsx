@@ -31,6 +31,25 @@ function getCommandStatusClass(status) {
   return 'command-status-pending';
 }
 
+function parseNumericSensorValue(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+function getDhtReading(reading, fieldName) {
+  if (!reading || reading.dhtOk !== true) return null;
+  return parseNumericSensorValue(reading[fieldName]);
+}
+
+function formatTemperature(value) {
+  return value === null ? '-1°C' : `${value.toFixed(1)}°C`;
+}
+
+function formatHumidity(value) {
+  return value === null ? '-1%' : `${value.toFixed(1)}%`;
+}
+
 function AdminDashboard() {
   const { logout } = useAuth();
   const navigate = useNavigate();
@@ -50,7 +69,11 @@ function AdminDashboard() {
     const unsubscribe = onSnapshot(
       readingsQuery,
       (snapshot) => {
-        setLatestReading(snapshot.docs[0]?.data() || null);
+        const data = snapshot.docs[0]?.data() || null;
+        if (data) {
+          console.log('Sensor data from Firestore:', data);
+        }
+        setLatestReading(data);
       },
       () => setLatestReading(null),
     );
@@ -147,6 +170,9 @@ function AdminDashboard() {
     }
   };
 
+  const latestTemperature = getDhtReading(latestReading, 'temperature');
+  const latestHumidity = getDhtReading(latestReading, 'humidity');
+
   return (
     <div className="admin-dashboard-page">
       <section className="dashboard-hero card admin-dashboard-hero">
@@ -188,12 +214,12 @@ function AdminDashboard() {
         </article>
         <article className="metric-card admin-metric-card">
           <p className="metric-label">Latest Temperature</p>
-          <p className="metric-value">{latestReading?.temperature ?? '-'}{latestReading?.temperature !== undefined ? ' C' : ''}</p>
+          <p className="metric-value">{formatTemperature(latestTemperature)}</p>
           <p className="metric-note">From latest sensorReadings document.</p>
         </article>
         <article className="metric-card admin-metric-card">
           <p className="metric-label">Latest Humidity</p>
-          <p className="metric-value">{latestReading?.humidity ?? '-'}{latestReading?.humidity !== undefined ? '%' : ''}</p>
+          <p className="metric-value">{formatHumidity(latestHumidity)}</p>
           <p className="metric-note">From latest sensorReadings document.</p>
         </article>
         <article className="metric-card admin-metric-card">

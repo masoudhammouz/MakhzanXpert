@@ -34,6 +34,25 @@ function displaySensorValue(value, suffix = '') {
   return `${value}${suffix}`;
 }
 
+function parseNumericSensorValue(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+function getDhtReading(reading, fieldName) {
+  if (!reading || reading.dhtOk !== true) return null;
+  return parseNumericSensorValue(reading[fieldName]);
+}
+
+function formatTemperature(value) {
+  return value === null ? '-1°C' : `${value.toFixed(1)}°C`;
+}
+
+function formatHumidity(value) {
+  return value === null ? '-1%' : `${value.toFixed(1)}%`;
+}
+
 function getReadingTimestamp(reading) {
   if (!reading) return null;
   return reading.createdAt || reading.timestamp || reading.time || reading.recordedAt;
@@ -102,6 +121,9 @@ function AdminSensors() {
 
         const nextReadings = readingsSnapshot.docs
           .map((item) => ({ id: item.id, ...item.data() }));
+        if (nextReadings[0]) {
+          console.log('Sensor data from Firestore:', nextReadings[0]);
+        }
         const nextDevices = devicesSnapshot.docs
           .map((item) => ({ id: item.id, ...item.data() }))
           .sort((a, b) => getTimestampMs(getDeviceLastSeen(b)) - getTimestampMs(getDeviceLastSeen(a)));
@@ -152,14 +174,14 @@ function AdminSensors() {
   const lastSensorUpdate = getReadingTimestamp(latest);
 
   const summary = useMemo(() => ({
-    temperature: latest?.temperature,
-    humidity: latest?.humidity,
-    mq3: latest?.mq3,
-    mq135: latest?.mq135,
-    waterValue: latest?.waterValue,
+    temperature: getDhtReading(latest, 'temperature'),
+    humidity: getDhtReading(latest, 'humidity'),
+    mq3: parseNumericSensorValue(latest?.mq3),
+    mq135: parseNumericSensorValue(latest?.mq135),
+    waterValue: parseNumericSensorValue(latest?.waterValue),
     waterDetected: latest?.waterDetected,
     waterStatus: latest?.waterStatus,
-    motion: latest?.motion,
+    motion: parseNumericSensorValue(latest?.motion),
     motionStatus: latest?.motionStatus,
   }), [latest]);
 
@@ -174,11 +196,13 @@ function AdminSensors() {
       ? 'No Motion'
       : 'No data';
 
-  const temperatureTrend = getTrend(summary.temperature, previous?.temperature, '°C');
-  const humidityTrend = getTrend(summary.humidity, previous?.humidity, '%');
+  const previousTemperature = getDhtReading(previous, 'temperature');
+  const previousHumidity = getDhtReading(previous, 'humidity');
+  const temperatureTrend = getTrend(summary.temperature, previousTemperature, '°C');
+  const humidityTrend = getTrend(summary.humidity, previousHumidity, '%');
   const highTemperature = typeof summary.temperature === 'number' && summary.temperature >= 45;
-  const gasWarning = Number(summary.mq3 || 0) >= 1500 || Number(summary.mq135 || 0) >= 1500;
-  const gasAlert = Number(summary.mq3 || 0) >= 2500 || Number(summary.mq135 || 0) >= 2500;
+  const gasWarning = Number(summary.mq3 ?? 0) >= 1500 || Number(summary.mq135 ?? 0) >= 1500;
+  const gasAlert = Number(summary.mq3 ?? 0) >= 2500 || Number(summary.mq135 ?? 0) >= 2500;
   const fireAlert = gasAlert || (gasWarning && highTemperature);
   const fireWarning = !fireAlert && (gasWarning || highTemperature);
   const fireStatus = fireAlert ? 'Fire Alert' : fireWarning ? 'Warning' : latest ? 'Normal' : 'No data';
@@ -282,7 +306,7 @@ function AdminSensors() {
               <span className={`sensor-pill ${sensorOnline ? 'online' : 'offline'}`}>{sensorConnectivity}</span>
             </div>
           </header>
-          <div className="large-reading">{displaySensorValue(summary.temperature, ' °C')}</div>
+          <div className="large-reading">{formatTemperature(summary.temperature)}</div>
           <dl className="sensor-details-list">
             <div>
               <dt>Temperature Trend</dt>
@@ -303,7 +327,7 @@ function AdminSensors() {
               <span className={`sensor-pill ${sensorOnline ? 'online' : 'offline'}`}>{sensorConnectivity}</span>
             </div>
           </header>
-          <div className="large-reading purple">{displaySensorValue(summary.humidity, '%')}</div>
+          <div className="large-reading purple">{formatHumidity(summary.humidity)}</div>
           <dl className="sensor-details-list">
             <div>
               <dt>Humidity Trend</dt>
