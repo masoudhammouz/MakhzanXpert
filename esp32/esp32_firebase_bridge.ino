@@ -51,10 +51,21 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 // ================= DEVICE STATE =================
 String lastArduinoStatus = "waiting";
 String serialLine = "";
+String lastArduinoJson = "{}";
+String lastUltraJson = "{}";
+String lastVerifyJson = "{}";
 long lastX = 0;
 long lastY = 0;
 long lastZ = 0;
 int lastBelt = 0;
+bool lastIrCamera = false;
+bool lastIrLifter = false;
+bool lastUltrasonicReady = false;
+bool lastLoc8Detected = false;
+bool lastLoc9Detected = false;
+bool lastAtStartingPoint = false;
+bool lastArduinoBusy = false;
+float lastUltrasonicCm = -1;
 bool commandRunning = false;
 String keypadInput = "";
 bool keypadAwaitingResponse = false;
@@ -64,8 +75,19 @@ const unsigned long LCD_MESSAGE_HOLD = 3000;
 
 void setupGoServer();
 void handleGoRequest();
+void handleStatusRequest();
+void handleBeltStartRequest();
+void handleBeltStopRequest();
+void handleBeltRunRequest();
+void handleDropRequest();
+void handleStartRequest();
+void handleVerifyLocationRequest();
+void handleUltraRequest();
+void handleCommandRequest();
 void sendCommandToArduino(String command);
 bool waitForArduinoDone(int position, String &errorMessage);
+bool runArduinoCommand(String command, String source, String activityType, String &errorMessage);
+bool automationAllowsMotion(String &errorMessage);
 void setupKeypadLcd();
 void handleKeypad();
 void handleNumericKey(char key);
@@ -88,6 +110,7 @@ void patchAutomationEnabled(bool enabled);
 void readArduinoData();
 void processArduinoLine(String line);
 void sendSensorReading(DynamicJsonDocument& doc);
+void cacheArduinoJson(DynamicJsonDocument& doc, String line);
 void updateDeviceStatus(String status, String task);
 void addActivityLog(String activityType, String message, String source);
 void postActivityDocument(WiFiClientSecure &client, String collectionName, String body);
@@ -133,8 +156,44 @@ void setupGoServer() {
   server.on("/go", HTTP_OPTIONS, []() {
     sendJsonResponse(204, "");
   });
+  server.on("/start", HTTP_OPTIONS, []() {
+    sendJsonResponse(204, "");
+  });
+  server.on("/command", HTTP_OPTIONS, []() {
+    sendJsonResponse(204, "");
+  });
+  server.on("/status", HTTP_OPTIONS, []() {
+    sendJsonResponse(204, "");
+  });
+  server.on("/belt/start", HTTP_OPTIONS, []() {
+    sendJsonResponse(204, "");
+  });
+  server.on("/belt/stop", HTTP_OPTIONS, []() {
+    sendJsonResponse(204, "");
+  });
+  server.on("/belt/run", HTTP_OPTIONS, []() {
+    sendJsonResponse(204, "");
+  });
+  server.on("/drop", HTTP_OPTIONS, []() {
+    sendJsonResponse(204, "");
+  });
+  server.on("/verify-location", HTTP_OPTIONS, []() {
+    sendJsonResponse(204, "");
+  });
+  server.on("/ultra", HTTP_OPTIONS, []() {
+    sendJsonResponse(204, "");
+  });
 
   server.on("/go", HTTP_GET, handleGoRequest);
+  server.on("/status", HTTP_GET, handleStatusRequest);
+  server.on("/belt/start", HTTP_GET, handleBeltStartRequest);
+  server.on("/belt/stop", HTTP_GET, handleBeltStopRequest);
+  server.on("/belt/run", HTTP_GET, handleBeltRunRequest);
+  server.on("/drop", HTTP_GET, handleDropRequest);
+  server.on("/start", HTTP_GET, handleStartRequest);
+  server.on("/verify-location", HTTP_GET, handleVerifyLocationRequest);
+  server.on("/ultra", HTTP_GET, handleUltraRequest);
+  server.on("/command", HTTP_GET, handleCommandRequest);
 
   server.onNotFound([]() {
     sendJsonResponse(404, "{\"ok\":false,\"error\":\"Not found\"}");
@@ -142,9 +201,22 @@ void setupGoServer() {
 
   server.begin();
   Serial.println("Raspberry endpoint ready: GET /go?position=X&source=raspberry&queueId=Y");
+  Serial.println("Raspberry endpoint ready: GET /status");
+  Serial.println("Raspberry endpoint ready: GET /belt/start|stop|run?ms=1200");
+  Serial.println("Raspberry endpoint ready: GET /drop");
+  Serial.println("Raspberry endpoint ready: GET /start?source=raspberry&queueId=Y");
+  Serial.println("Raspberry endpoint ready: GET /verify-location?id=8|9");
+  Serial.println("Raspberry endpoint ready: GET /ultra");
+  Serial.println("Raspberry endpoint ready: GET /command?command=BELT|STOP|STATUS|TESTIR|ULTRA|CAMERA|DISPENSE");
 }
 
 void handleGoRequest() {
+  String automationError = "";
+  if (!automationAllowsMotion(automationError)) {
+    sendJsonResponse(409, "{\"ok\":false,\"error\":\"" + escapeJson(automationError) + "\"}");
+    return;
+  }
+
   if (commandRunning) {
     sendJsonResponse(409, "{\"ok\":false,\"error\":\"Lifter is busy\"}");
     return;
@@ -190,6 +262,198 @@ void handleGoRequest() {
   } else {
     updateDeviceStatus("online", "error_" + arduinoCommand);
     addActivityLog("go_error", errorMessage, source);
+    sendJsonResponse(500, "{\"ok\":false,\"error\":\"" + escapeJson(errorMessage) + "\"}");
+  }
+}
+
+void handleStartRequest() {
+  String automationError = "";
+  if (!automationAllowsMotion(automationError)) {
+    sendJsonResponse(409, "{\"ok\":false,\"error\":\"" + escapeJson(automationError) + "\"}");
+    return;
+  }
+
+  if (commandRunning) {
+    sendJsonResponse(409, "{\"ok\":false,\"error\":\"Lifter is busy\"}");
+    return;
+  }
+
+  String source = server.hasArg("source") ? server.arg("source") : "raspberry";
+  String queueId = server.hasArg("queueId") ? server.arg("queueId") : "";
+
+  commandRunning = true;
+  String arduinoCommand = "START";
+
+  Serial.print("HTTP START request source=");
+  Serial.print(source);
+  Serial.print(" queueId=");
+  Serial.println(queueId);
+
+  addActivityLog("start_received", arduinoCommand + " from " + source, source);
+  updateDeviceStatus("online", "running_START");
+  sendCommandToArduino(arduinoCommand);
+
+  String errorMessage = "";
+  bool done = waitForArduinoDone(0, errorMessage);
+
+  commandRunning = false;
+
+  if (done) {
+    updateDeviceStatus("online", "done_START");
+    addActivityLog("returned_to_start", "START done", source);
+    sendJsonResponse(200, "{\"ok\":true,\"command\":\"START\"}");
+  } else {
+    updateDeviceStatus("online", "error_START");
+    addActivityLog("start_error", errorMessage, source);
+    sendJsonResponse(500, "{\"ok\":false,\"error\":\"" + escapeJson(errorMessage) + "\"}");
+  }
+}
+
+void handleStatusRequest() {
+  sendCommandToArduino("STATUS");
+  delay(60);
+  readArduinoData();
+  sendJsonResponse(200, "{\"ok\":true,\"status\":" + lastArduinoJson + "}");
+}
+
+void handleBeltStartRequest() {
+  String automationError = "";
+  if (!automationAllowsMotion(automationError)) {
+    sendJsonResponse(409, "{\"ok\":false,\"error\":\"" + escapeJson(automationError) + "\"}");
+    return;
+  }
+  String errorMessage = "";
+  if (runArduinoCommand("BELT_START", "raspberry", "belt_start", errorMessage)) {
+    sendJsonResponse(200, "{\"ok\":true,\"command\":\"BELT_START\"}");
+  } else {
+    sendJsonResponse(500, "{\"ok\":false,\"error\":\"" + escapeJson(errorMessage) + "\"}");
+  }
+}
+
+void handleBeltStopRequest() {
+  String errorMessage = "";
+  if (runArduinoCommand("BELT_STOP", "raspberry", "belt_stop", errorMessage)) {
+    sendJsonResponse(200, "{\"ok\":true,\"command\":\"BELT_STOP\"}");
+  } else {
+    sendJsonResponse(500, "{\"ok\":false,\"error\":\"" + escapeJson(errorMessage) + "\"}");
+  }
+}
+
+void handleBeltRunRequest() {
+  String automationError = "";
+  if (!automationAllowsMotion(automationError)) {
+    sendJsonResponse(409, "{\"ok\":false,\"error\":\"" + escapeJson(automationError) + "\"}");
+    return;
+  }
+  int durationMs = server.hasArg("ms") ? server.arg("ms").toInt() : 1200;
+  if (durationMs <= 0 || durationMs > 10000) {
+    sendJsonResponse(400, "{\"ok\":false,\"error\":\"Invalid ms\"}");
+    return;
+  }
+  String errorMessage = "";
+  String command = "BELT_RUN_MS " + String(durationMs);
+  if (runArduinoCommand(command, "raspberry", "belt_run_ms", errorMessage)) {
+    sendJsonResponse(200, "{\"ok\":true,\"command\":\"" + escapeJson(command) + "\"}");
+  } else {
+    sendJsonResponse(500, "{\"ok\":false,\"error\":\"" + escapeJson(errorMessage) + "\"}");
+  }
+}
+
+void handleDropRequest() {
+  String automationError = "";
+  if (!automationAllowsMotion(automationError)) {
+    sendJsonResponse(409, "{\"ok\":false,\"error\":\"" + escapeJson(automationError) + "\"}");
+    return;
+  }
+  String errorMessage = "";
+  if (runArduinoCommand("DROP_TO_LIFTER", "raspberry", "drop_to_lifter", errorMessage)) {
+    sendJsonResponse(200, "{\"ok\":true,\"command\":\"DROP_TO_LIFTER\"}");
+  } else {
+    sendJsonResponse(500, "{\"ok\":false,\"error\":\"" + escapeJson(errorMessage) + "\"}");
+  }
+}
+
+void handleVerifyLocationRequest() {
+  int locationId = server.hasArg("id") ? server.arg("id").toInt() : 0;
+  if (locationId != 8 && locationId != 9) {
+    sendJsonResponse(400, "{\"ok\":false,\"error\":\"id must be 8 or 9\"}");
+    return;
+  }
+  String errorMessage = "";
+  String command = "VERIFY_LOCATION " + String(locationId);
+  if (runArduinoCommand(command, "raspberry", "verify_location", errorMessage)) {
+    sendJsonResponse(200, "{\"ok\":true,\"verification\":" + lastVerifyJson + "}");
+  } else {
+    sendJsonResponse(500, "{\"ok\":false,\"error\":\"" + escapeJson(errorMessage) + "\"}");
+  }
+}
+
+void handleUltraRequest() {
+  String errorMessage = "";
+  if (runArduinoCommand("ULTRA", "raspberry", "ultra_check", errorMessage)) {
+    sendJsonResponse(200, "{\"ok\":true,\"ultra\":" + lastUltraJson + "}");
+  } else {
+    sendJsonResponse(500, "{\"ok\":false,\"error\":\"" + escapeJson(errorMessage) + "\"}");
+  }
+}
+
+bool isAllowedHttpCommand(String command) {
+  command.toUpperCase();
+  return command == "BELT" ||
+         command == "STOP" ||
+         command == "STATUS" ||
+         command == "TESTIR" ||
+         command == "ULTRA" ||
+         command == "CAMERA" ||
+         command == "SCAN" ||
+         command == "DISPENSE" ||
+         command == "D" ||
+         command == "HOME" ||
+         command == "START" ||
+         command == "BELT_START" ||
+         command == "BELT_STOP" ||
+         command.startsWith("BELT_RUN_MS ") ||
+         command == "DROP_TO_LIFTER" ||
+         command.startsWith("VERIFY_LOCATION ");
+}
+
+void handleCommandRequest() {
+  if (commandRunning) {
+    sendJsonResponse(409, "{\"ok\":false,\"error\":\"Lifter is busy\"}");
+    return;
+  }
+
+  if (!server.hasArg("command")) {
+    sendJsonResponse(400, "{\"ok\":false,\"error\":\"Missing command\"}");
+    return;
+  }
+
+  String command = server.arg("command");
+  command.trim();
+  command.toUpperCase();
+  String source = server.hasArg("source") ? server.arg("source") : "raspberry";
+
+  if (!isAllowedHttpCommand(command)) {
+    sendJsonResponse(400, "{\"ok\":false,\"error\":\"Command not allowed\"}");
+    return;
+  }
+
+  commandRunning = true;
+  addActivityLog("command_received", command + " from " + source, source);
+  updateDeviceStatus("online", "running_" + command);
+  sendCommandToArduino(command);
+
+  String errorMessage = "";
+  bool done = waitForArduinoDone(0, errorMessage);
+  commandRunning = false;
+
+  if (done) {
+    updateDeviceStatus("online", "done_" + command);
+    addActivityLog("command_done", command + " done", source);
+    sendJsonResponse(200, "{\"ok\":true,\"command\":\"" + escapeJson(command) + "\"}");
+  } else {
+    updateDeviceStatus("online", "error_" + command);
+    addActivityLog("command_error", errorMessage, source);
     sendJsonResponse(500, "{\"ok\":false,\"error\":\"" + escapeJson(errorMessage) + "\"}");
   }
 }
@@ -480,6 +744,7 @@ void processArduinoLine(String line) {
     DynamicJsonDocument doc(1024);
     DeserializationError error = deserializeJson(doc, line);
     if (!error) {
+      cacheArduinoJson(doc, line);
       sendSensorReading(doc);
     }
     return;
@@ -512,6 +777,7 @@ bool waitForArduinoDone(int position, String &errorMessage) {
         DynamicJsonDocument sensorDoc(1024);
         DeserializationError parseError = deserializeJson(sensorDoc, line);
         if (!parseError) {
+          cacheArduinoJson(sensorDoc, line);
           sendSensorReading(sensorDoc);
         }
         continue;
@@ -519,7 +785,7 @@ bool waitForArduinoDone(int position, String &errorMessage) {
 
       lastArduinoStatus = line;
 
-      if (line == "DONE" || line == expectedDone || line.startsWith("DONE:")) {
+      if (line == "DONE" || line == expectedDone || line.startsWith("DONE:") || line.startsWith("OK ")) {
         updateLcdFromArduinoLine(line);
         return true;
       }
@@ -540,7 +806,123 @@ bool waitForArduinoDone(int position, String &errorMessage) {
   return false;
 }
 
+bool runArduinoCommand(String command, String source, String activityType, String &errorMessage) {
+  if (commandRunning) {
+    errorMessage = "Lifter is busy";
+    return false;
+  }
+
+  commandRunning = true;
+  addActivityLog(activityType, command + " from " + source, source);
+  updateDeviceStatus("online", "running_" + command);
+  sendCommandToArduino(command);
+  bool done = waitForArduinoDone(0, errorMessage);
+  commandRunning = false;
+
+  if (done) {
+    updateDeviceStatus("online", "done_" + command);
+    addActivityLog(activityType + "_done", command + " done", source);
+  } else {
+    updateDeviceStatus("online", "error_" + command);
+    addActivityLog(activityType + "_error", errorMessage, source);
+  }
+  return done;
+}
+
+bool automationAllowsMotion(String &errorMessage) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID +
+               "/databases/(default)/documents/automation/status?key=" + API_KEY;
+
+  http.begin(client, url);
+  http.setTimeout(6000);
+  int httpCode = http.GET();
+
+  if (httpCode == 404) {
+    http.end();
+    errorMessage = "Waiting for Start Automation";
+    return false;
+  }
+
+  if (httpCode < 200 || httpCode >= 300) {
+    http.end();
+    errorMessage = "Unable to read automation/status";
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(4096);
+  DeserializationError parseError = deserializeJson(doc, payload);
+  if (parseError) {
+    errorMessage = "Invalid automation/status payload";
+    return false;
+  }
+
+  JsonObject fields = doc["fields"];
+  bool automationStarted = fields["automationStarted"]["booleanValue"] | false;
+  String sortingStrategy = fields["sortingStrategy"]["stringValue"] | "";
+  String currentState = fields["currentState"]["stringValue"] | "";
+
+  bool strategyValid =
+    sortingStrategy == "brand" ||
+    sortingStrategy == "size" ||
+    sortingStrategy == "color" ||
+    sortingStrategy == "model" ||
+    sortingStrategy == "brand_size" ||
+    sortingStrategy == "color_size" ||
+    sortingStrategy == "model_size";
+
+  if (!strategyValid) {
+    errorMessage = "Waiting for sorting strategy";
+    return false;
+  }
+
+  if (!automationStarted) {
+    errorMessage = "Waiting for Start Automation";
+    return false;
+  }
+
+  if (currentState == "STOPPED" || currentState == "ERROR") {
+    errorMessage = "Automation is " + currentState;
+    return false;
+  }
+
+  return true;
+}
+
 // ================= SENSOR UPLOAD =================
+
+void cacheArduinoJson(DynamicJsonDocument& doc, String line) {
+  lastArduinoJson = line;
+  lastBelt = doc["belt"] | lastBelt;
+  lastX = doc["x"] | lastX;
+  lastY = doc["y"] | lastY;
+  lastZ = doc["z"] | lastZ;
+  lastIrCamera = doc["irCamera"] | lastIrCamera;
+  lastIrLifter = doc["irLifter"] | lastIrLifter;
+  lastUltrasonicCm = doc["ultrasonicCm"] | lastUltrasonicCm;
+  lastUltrasonicReady = doc["ultrasonicReady"] | lastUltrasonicReady;
+  lastLoc8Detected = doc["loc8Detected"] | lastLoc8Detected;
+  lastLoc9Detected = doc["loc9Detected"] | lastLoc9Detected;
+  lastAtStartingPoint = doc["atStartingPoint"] | lastAtStartingPoint;
+  lastArduinoBusy = doc["busy"] | lastArduinoBusy;
+
+  if (doc.containsKey("ultrasonicCm") || doc.containsKey("ultrasonicReady")) {
+    lastUltraJson = "{";
+    lastUltraJson += "\"ultrasonicCm\":" + String(lastUltrasonicCm, 2) + ",";
+    lastUltraJson += "\"ultrasonicReady\":" + String(lastUltrasonicReady ? "true" : "false");
+    lastUltraJson += "}";
+  }
+
+  if (doc.containsKey("locationId") && doc.containsKey("detected")) {
+    lastVerifyJson = line;
+  }
+}
 
 void sendSensorReading(DynamicJsonDocument& doc) {
   int motion = doc["motion"] | 0;
@@ -603,6 +985,14 @@ void sendSensorReading(DynamicJsonDocument& doc) {
         "\"x\":{\"integerValue\":\"" + String(lastX) + "\"},"
         "\"y\":{\"integerValue\":\"" + String(lastY) + "\"},"
         "\"z\":{\"integerValue\":\"" + String(lastZ) + "\"},"
+        "\"irCamera\":{\"booleanValue\":" + String(lastIrCamera ? "true" : "false") + "},"
+        "\"irLifter\":{\"booleanValue\":" + String(lastIrLifter ? "true" : "false") + "},"
+        "\"ultrasonicCm\":{\"doubleValue\":" + String(lastUltrasonicCm, 2) + "},"
+        "\"ultrasonicReady\":{\"booleanValue\":" + String(lastUltrasonicReady ? "true" : "false") + "},"
+        "\"loc8Detected\":{\"booleanValue\":" + String(lastLoc8Detected ? "true" : "false") + "},"
+        "\"loc9Detected\":{\"booleanValue\":" + String(lastLoc9Detected ? "true" : "false") + "},"
+        "\"atStartingPoint\":{\"booleanValue\":" + String(lastAtStartingPoint ? "true" : "false") + "},"
+        "\"busy\":{\"booleanValue\":" + String(lastArduinoBusy ? "true" : "false") + "},"
         "\"createdAt\":{\"timestampValue\":\"" + getTimestamp() + "\"}"
       "}"
     "}";
@@ -640,6 +1030,14 @@ void updateDeviceStatus(String status, String task) {
         "\"x\":{\"integerValue\":\"" + String(lastX) + "\"},"
         "\"y\":{\"integerValue\":\"" + String(lastY) + "\"},"
         "\"z\":{\"integerValue\":\"" + String(lastZ) + "\"},"
+        "\"irCamera\":{\"booleanValue\":" + String(lastIrCamera ? "true" : "false") + "},"
+        "\"irLifter\":{\"booleanValue\":" + String(lastIrLifter ? "true" : "false") + "},"
+        "\"ultrasonicCm\":{\"doubleValue\":" + String(lastUltrasonicCm, 2) + "},"
+        "\"ultrasonicReady\":{\"booleanValue\":" + String(lastUltrasonicReady ? "true" : "false") + "},"
+        "\"loc8Detected\":{\"booleanValue\":" + String(lastLoc8Detected ? "true" : "false") + "},"
+        "\"loc9Detected\":{\"booleanValue\":" + String(lastLoc9Detected ? "true" : "false") + "},"
+        "\"atStartingPoint\":{\"booleanValue\":" + String(lastAtStartingPoint ? "true" : "false") + "},"
+        "\"busy\":{\"booleanValue\":" + String(lastArduinoBusy ? "true" : "false") + "},"
         "\"lastSeen\":{\"timestampValue\":\"" + getTimestamp() + "\"}"
       "}"
     "}";

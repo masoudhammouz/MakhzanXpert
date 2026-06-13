@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import shutil
@@ -17,7 +18,7 @@ import requests
 
 # ================= SETTINGS =================
 
-DEFAULT_ESP32_BASE_URL = "http://192.168.1.50"
+DEFAULT_ESP32_BASE_URL = "http://172.23.250.165"
 DEFAULT_CAMERA_INDEX = 0
 DEFAULT_DB_PATH = "makhzanxpert_pi.sqlite3"
 
@@ -35,6 +36,31 @@ UPSCALE_FACTOR = 1.5
 LOGO_FOLDER = "logos"
 STABLE_N = 3
 SAME_LABEL_SUPPRESS_SECONDS = 15
+CAMERA_ALIGN_DELAY_MS = 1200
+DROP_TO_LIFTER_DELAY_MS = 3000
+AUTOMATION_STATUS_PATH = "automation/status"
+VALID_SORTING_STRATEGIES = {
+    "brand",
+    "size",
+    "color",
+    "model",
+    "brand_size",
+    "color_size",
+    "model_size",
+}
+
+STATE_WAIT_FOR_AUTOMATION = "WAIT_FOR_AUTOMATION"
+STATE_WAIT_BOX_AT_CAMERA = "WAIT_BOX_AT_CAMERA"
+STATE_CAMERA_ALIGNING = "CAMERA_ALIGNING"
+STATE_CAMERA_READING = "CAMERA_READING"
+STATE_MOVE_BOX_TO_LIFTER_IR = "MOVE_BOX_TO_LIFTER_IR"
+STATE_CHECK_LIFTER_READY = "CHECK_LIFTER_READY"
+STATE_DROP_BOX_TO_LIFTER = "DROP_BOX_TO_LIFTER"
+STATE_LIFTER_DELIVERY = "LIFTER_DELIVERY"
+STATE_PROCESS_ORDERS = "PROCESS_ORDERS"
+STATE_RETURN_TO_START = "RETURN_TO_START"
+STATE_STOPPED = "STOPPED"
+STATE_ERROR = "ERROR"
 
 SYSTEM_SETTING_KEYS = [
     "sortingMode",
@@ -48,7 +74,7 @@ SYSTEM_SETTING_KEYS = [
 ]
 
 DEFAULT_SETTINGS = {
-    "sortingMode": "brand",
+    "sortingMode": "",
     "automationEnabled": "false",
     "autoConveyor": "true",
     "autoOCR": "true",
@@ -70,6 +96,25 @@ NEIGHBORS = {
     9: [6, 8],
 }
 
+INTERNAL_PRODUCT_CATALOG = [
+    {"brand": "NIKE", "model": "AIR FORCE", "color": "WHITE", "size": "40", "price": 120.0},
+    {"brand": "NIKE", "model": "AIR FORCE", "color": "WHITE", "size": "42", "price": 120.0},
+    {"brand": "NIKE", "model": "AIR MAX", "color": "BLACK", "size": "42", "price": 150.0},
+    {"brand": "NIKE", "model": "DUNK LOW", "color": "GREEN", "size": "40", "price": 115.0},
+    {"brand": "ADIDAS", "model": "SAMBA", "color": "WHITE", "size": "38", "price": 100.0},
+    {"brand": "ADIDAS", "model": "SAMBA", "color": "WHITE", "size": "40", "price": 100.0},
+    {"brand": "ADIDAS", "model": "GAZELLE", "color": "GREEN", "size": "41", "price": 105.0},
+    {"brand": "ADIDAS", "model": "CAMPUS", "color": "BLACK", "size": "39", "price": 105.0},
+    {"brand": "PUMA", "model": "SUEDE CLASSIC", "color": "RED", "size": "38", "price": 90.0},
+    {"brand": "PUMA", "model": "SUEDE CLASSIC", "color": "RED", "size": "40", "price": 90.0},
+    {"brand": "PUMA", "model": "RS", "color": "BLACK", "size": "41", "price": 125.0},
+    {"brand": "PUMA", "model": "CALI", "color": "WHITE", "size": "39", "price": 95.0},
+    {"brand": "SKECHERS", "model": "GO WALK", "color": "NAVY", "size": "39", "price": 80.0},
+    {"brand": "SKECHERS", "model": "GO WALK", "color": "NAVY", "size": "41", "price": 80.0},
+    {"brand": "SKECHERS", "model": "ARCH FIT", "color": "NAVY", "size": "42", "price": 90.0},
+    {"brand": "SKECHERS", "model": "UNO", "color": "RED", "size": "43", "price": 85.0},
+]
+
 
 @dataclass
 class OCRResult:
@@ -83,12 +128,20 @@ def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def location_to_go_in(location_id: int) -> int:
+def get_in_position(location_id: int) -> int:
     return location_id * 2 - 1
 
 
-def location_to_go_out(location_id: int) -> int:
+def get_out_position(location_id: int) -> int:
     return location_id * 2
+
+
+def location_to_go_in(location_id: int) -> int:
+    return get_in_position(location_id)
+
+
+def location_to_go_out(location_id: int) -> int:
+    return get_out_position(location_id)
 
 
 # ================= FIREBASE REST =================
@@ -104,14 +157,14 @@ class FirebaseClient:
     def _documents_url(self) -> str:
         return f"{FIRESTORE_BASE_URL}:runQuery?key={self.api_key}"
 
-    def _commit_url(self) -> str:
-        return f"{FIRESTORE_BASE_URL}:commit?key={self.api_key}"
-
-    def _begin_transaction_url(self) -> str:
-        return f"{FIRESTORE_BASE_URL}:beginTransaction?key={self.api_key}"
-
     def _full_doc_name(self, path: str) -> str:
         return f"projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/{path.lstrip('/')}"
+
+    def _path_from_name(self, name: str) -> str:
+        marker = "/documents/"
+        if marker in name:
+            return name.split(marker, 1)[1]
+        return name.lstrip("/")
 
     def get_doc(self, path: str) -> Optional[dict]:
         if not self.enabled:
@@ -121,34 +174,6 @@ class FirebaseClient:
             return None
         response.raise_for_status()
         return firestore_to_plain(response.json().get("fields", {}))
-
-    def get_doc_raw(self, path: str, transaction: Optional[str] = None) -> Optional[dict]:
-        if not self.enabled:
-            return None
-        url = self._url(path)
-        if transaction:
-            url += f"&transaction={transaction}"
-        response = requests.get(url, timeout=15)
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        return response.json()
-
-    def begin_transaction(self) -> Optional[str]:
-        if not self.enabled:
-            return None
-        response = requests.post(self._begin_transaction_url(), json={"options": {"readWrite": {}}}, timeout=15)
-        response.raise_for_status()
-        return response.json().get("transaction")
-
-    def commit_writes(self, writes: list[dict], transaction: Optional[str] = None) -> None:
-        if not self.enabled:
-            return
-        body = {"writes": writes}
-        if transaction:
-            body["transaction"] = transaction
-        response = requests.post(self._commit_url(), json=body, timeout=20)
-        response.raise_for_status()
 
     def set_doc(self, path: str, data: dict, merge: bool = True) -> None:
         if not self.enabled:
@@ -160,6 +185,43 @@ class FirebaseClient:
         response = requests.patch(self._url(path) + mask, json={"fields": fields}, timeout=15)
         response.raise_for_status()
 
+    def increment_doc_fields(self, path: str, data: dict, increments: dict[str, int]) -> None:
+        if not self.enabled:
+            return
+        current = self.get_doc(path) or {}
+        updated = dict(data)
+        for field, amount in increments.items():
+            updated[field] = int(current.get(field) or 0) + amount
+        self.set_doc(path, updated, merge=True)
+
+    def delete_doc(self, path_or_name: str) -> None:
+        if not self.enabled:
+            return
+        response = requests.delete(self._url(self._path_from_name(path_or_name)), timeout=15)
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+
+    def list_docs(self, collection_path: str, page_size: int = 100) -> list[dict]:
+        if not self.enabled:
+            return []
+
+        docs = []
+        page_token = ""
+        while True:
+            params = {"pageSize": page_size}
+            if page_token:
+                params["pageToken"] = page_token
+            response = requests.get(self._url(collection_path), params=params, timeout=20)
+            if response.status_code == 404:
+                return docs
+            response.raise_for_status()
+            payload = response.json()
+            docs.extend(payload.get("documents", []))
+            page_token = payload.get("nextPageToken", "")
+            if not page_token:
+                return docs
+
     def add_doc(self, collection_name: str, data: dict) -> Optional[str]:
         if not self.enabled:
             return None
@@ -167,7 +229,7 @@ class FirebaseClient:
         response.raise_for_status()
         return response.json().get("name")
 
-    def query(self, collection_name: str, filters: dict, order_field: str = "createdAt", limit_count: int = 20) -> list[dict]:
+    def query(self, collection_name: str, filters: dict, order_field: Optional[str] = None, limit_count: int = 20) -> list[dict]:
         if not self.enabled:
             return []
 
@@ -181,20 +243,27 @@ class FirebaseClient:
                 }
             })
 
+        structured_query = {
+            "from": [{"collectionId": collection_name}],
+            "limit": limit_count,
+        }
+        if query_filters:
+            structured_query["where"] = {
+                "compositeFilter": {
+                    "op": "AND",
+                    "filters": query_filters,
+                }
+            } if len(query_filters) > 1 else query_filters[0]
+        if order_field:
+            structured_query["orderBy"] = [{"field": {"fieldPath": order_field}, "direction": "ASCENDING"}]
+
         body = {
             "structuredQuery": {
-                "from": [{"collectionId": collection_name}],
-                "where": {
-                    "compositeFilter": {
-                        "op": "AND",
-                        "filters": query_filters,
-                    }
-                } if len(query_filters) > 1 else query_filters[0],
-                "orderBy": [{"field": {"fieldPath": order_field}, "direction": "ASCENDING"}],
-                "limit": limit_count,
+                **structured_query,
             }
         }
 
+        print("RUNQUERY_BODY", json.dumps(body))
         response = requests.post(self._documents_url(), json=body, timeout=20)
         response.raise_for_status()
 
@@ -223,11 +292,9 @@ def plain_value_to_firestore(value):
         return {"arrayValue": {"values": [plain_value_to_firestore(item) for item in value]}}
     if isinstance(value, dict) and value.get("__timestamp__"):
         return {"timestampValue": value["value"]}
+    if isinstance(value, dict):
+        return {"mapValue": {"fields": plain_to_firestore(value)}}
     return {"stringValue": str(value)}
-
-
-def firestore_increment(amount: int = 1) -> dict:
-    return {"integerValue": str(amount)}
 
 
 def plain_to_firestore(data: dict) -> dict:
@@ -254,11 +321,93 @@ def firestore_to_plain(fields: dict) -> dict:
                 firestore_to_plain({"value": item}).get("value")
                 for item in value.get("arrayValue", {}).get("values", [])
             ]
+        elif "mapValue" in value:
+            output[key] = firestore_to_plain(value.get("mapValue", {}).get("fields", {}))
     return output
 
 
 def timestamp(value: Optional[str] = None) -> dict:
     return {"__timestamp__": True, "value": value or utc_now()}
+
+
+def print_firestore_error(prefix: str, exc: Exception) -> None:
+    print(prefix)
+    print(str(exc))
+    response = getattr(exc, "response", None)
+    if response is not None:
+        print(f"{prefix}_STATUS = {response.status_code}")
+        print(f"{prefix}_RESPONSE = {response.text}")
+
+
+def esp_url(esp_base_url: str, path: str) -> str:
+    return f"{esp_base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def esp_get_json(esp_base_url: str, path: str, params: Optional[dict] = None, timeout: int = 30) -> dict:
+    response = requests.get(esp_url(esp_base_url, path), params=params or {}, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    if data.get("ok") is False:
+        raise RuntimeError(data.get("error") or f"ESP request failed: {path}")
+    return data
+
+
+def get_esp_status(esp_base_url: str) -> dict:
+    data = esp_get_json(esp_base_url, "/status", timeout=10)
+    return data.get("status") or data
+
+
+def bool_status(status: dict, key: str) -> bool:
+    return bool(status.get(key))
+
+
+def valid_sorting_strategy(value: Optional[str]) -> bool:
+    return str(value or "").strip() in VALID_SORTING_STRATEGIES
+
+
+def automation_status_defaults() -> dict:
+    return {
+        "automationStarted": False,
+        "sortingStrategy": "",
+        "currentState": STATE_WAIT_FOR_AUTOMATION,
+        "cameraBusy": False,
+        "beltRunning": False,
+        "beltBlocked": True,
+        "lifterBusy": False,
+        "currentOperation": "",
+        "lastError": None,
+        "updatedAt": timestamp(),
+    }
+
+
+def get_automation_status(firebase: FirebaseClient) -> dict:
+    status = firebase.get_doc(AUTOMATION_STATUS_PATH) or {}
+    return {**automation_status_defaults(), **status}
+
+
+def set_automation_status(firebase: FirebaseClient, updates: dict) -> None:
+    if not firebase.enabled:
+        return
+    data = {"updatedAt": timestamp(), **updates}
+    firebase.set_doc(AUTOMATION_STATUS_PATH, data, merge=True)
+
+
+def ensure_automation_status(firebase: FirebaseClient) -> None:
+    if not firebase.enabled:
+        return
+    if firebase.get_doc(AUTOMATION_STATUS_PATH):
+        return
+    firebase.set_doc(AUTOMATION_STATUS_PATH, automation_status_defaults(), merge=False)
+
+
+def automation_ready(firebase: FirebaseClient) -> tuple[bool, dict, str]:
+    status = get_automation_status(firebase)
+    strategy = status.get("sortingStrategy") or status.get("sortingMode")
+    if not valid_sorting_strategy(strategy):
+        return False, status, "Waiting for sorting strategy"
+    if not bool(status.get("automationStarted")):
+        return False, status, "Waiting for Start Automation"
+    return True, status, ""
 
 
 def normalize_sku_part(value: str) -> str:
@@ -268,11 +417,209 @@ def normalize_sku_part(value: str) -> str:
     return normalized.strip("_") or "unknown"
 
 
+def normalize_label(label: dict) -> dict:
+    normalized = {}
+    for key in ("brand", "model", "color", "size"):
+        value = str(label.get(key, "") or "").strip().upper()
+        normalized[key] = re.sub(r"\s+", " ", value)
+    model_aliases = {
+        "AIR FORCE 1": "AIR FORCE",
+        "AIRFORCE": "AIR FORCE",
+        "DUNK": "DUNK LOW",
+        "RS-X": "RS",
+        "RS X": "RS",
+        "SUEDE": "SUEDE CLASSIC",
+    }
+    normalized["model"] = model_aliases.get(normalized["model"], normalized["model"])
+    if "price" in label:
+        normalized["price"] = label["price"]
+    return normalized
+
+
+def product_key(label: dict) -> str:
+    normalized = normalize_label(label)
+    return "|".join(normalized.get(key, "") for key in ("brand", "model", "color", "size"))
+
+
 def build_normalized_sku(label: dict) -> str:
+    label = normalize_label(label)
     return "_".join(
         normalize_sku_part(label.get(key, ""))
         for key in ("brand", "model", "color", "size")
     )
+
+
+def normalize_slug_part(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", normalized)
+    normalized = re.sub(r"-+", "-", normalized)
+    return normalized.strip("-") or "unknown"
+
+
+def build_product_slug(label: dict) -> str:
+    label = normalize_label(label)
+    return "-".join(
+        normalize_slug_part(label.get(key, ""))
+        for key in ("brand", "model", "color", "size")
+    )
+
+
+def build_product_name(label: dict) -> str:
+    return product_key(label)
+
+
+def catalog_product_data(label: dict) -> dict:
+    label = normalize_label(label)
+    now = utc_now()
+    sku = build_normalized_sku(label)
+    key = product_key(label)
+    return {
+        "id": sku,
+        "normalizedSku": sku,
+        "productKey": key,
+        "slug": build_product_slug(label),
+        "brand": label["brand"],
+        "model": label["model"],
+        "color": label["color"],
+        "size": label["size"],
+        "name": build_product_name(label),
+        "category": "Shoes",
+        "status": "active",
+        "needsDetails": False,
+        "isAvailable": True,
+        "price": float(label.get("price", 99.0)),
+        "quantity": 0,
+        "stock": 0,
+        "inventoryCount": 0,
+        "availableStock": 0,
+        "images": [],
+        "imageUrl": "",
+        "description": "",
+        "createdAt": timestamp(now),
+        "updatedAt": timestamp(now),
+    }
+
+
+def ensure_internal_product_catalog(firebase: FirebaseClient, log_ready: bool = True) -> None:
+    if not firebase.enabled:
+        return
+
+    created_count = 0
+    for product in INTERNAL_PRODUCT_CATALOG:
+        sku = build_normalized_sku(product)
+        path = f"products/{sku}"
+        existing = firebase.get_doc(path)
+        if existing:
+            continue
+        firebase.set_doc(path, catalog_product_data(product), merge=False)
+        created_count += 1
+
+    print(f"PRODUCT_CATALOG_READY count={len(INTERNAL_PRODUCT_CATALOG)} created={created_count}")
+    if log_ready:
+        log_activity(firebase, "PRODUCT_CATALOG_READY", f"{len(INTERNAL_PRODUCT_CATALOG)} predefined products ready.", "raspberry")
+
+
+def delete_all_collection_docs(firebase: FirebaseClient, collection_path: str) -> int:
+    deleted = 0
+    while True:
+        docs = firebase.list_docs(collection_path)
+        if not docs:
+            return deleted
+        for document in docs:
+            firebase.delete_doc(document["name"])
+            deleted += 1
+
+
+def recreate_empty_locations(firebase: FirebaseClient) -> None:
+    now = utc_now()
+    for location_id in range(1, 10):
+        firebase.set_doc(f"locations/{location_id}", {
+            "id": location_id,
+            "status": "empty",
+            "normalizedSku": "",
+            "productId": "",
+            "productKey": "",
+            "boxId": "",
+            "brand": "",
+            "model": "",
+            "color": "",
+            "size": "",
+            "updatedAt": timestamp(now),
+        }, merge=False)
+
+
+def cleanup_firebase_runtime_data(firebase: FirebaseClient) -> None:
+    if not firebase.enabled:
+        print("CLEANUP_FAILED Firebase client is disabled.")
+        return
+
+    collections_to_clear = [
+        "locations",
+        "scans",
+        "storeQueue",
+        "pickQueue",
+        "pickRequests",
+        "scanQueue",
+        "processedScans",
+        "commands",
+        "activityLog",
+        "systemActivity",
+        "products",
+        "boxes",
+    ]
+
+    print("CLEANUP_START")
+    for collection_path in collections_to_clear:
+        deleted = delete_all_collection_docs(firebase, collection_path)
+        print(f"CLEANUP_DELETED {collection_path} = {deleted}")
+
+    recreate_empty_locations(firebase)
+    ensure_internal_product_catalog(firebase, log_ready=False)
+    firebase.set_doc(AUTOMATION_STATUS_PATH, automation_status_defaults(), merge=False)
+    log_activity(firebase, "CLEANUP_DONE", "Firebase runtime data cleaned; locations and products rebuilt.", "raspberry")
+
+    verification = {
+        "locations": len(firebase.list_docs("locations")),
+        "products": len(firebase.list_docs("products")),
+        "scans": len(firebase.list_docs("scans")),
+        "storeQueue": len(firebase.list_docs("storeQueue")),
+        "pickQueue": len(firebase.list_docs("pickQueue")),
+        "pickRequests": len(firebase.list_docs("pickRequests")),
+        "scanQueue": len(firebase.list_docs("scanQueue")),
+        "processedScans": len(firebase.list_docs("processedScans")),
+        "boxes": len(firebase.list_docs("boxes")),
+        "activityLog": len(firebase.list_docs("activityLog")),
+        "systemActivity": len(firebase.list_docs("systemActivity")),
+    }
+    product_ids = [document["name"].split("/")[-1] for document in firebase.list_docs("products")]
+    expected_product_ids = {build_normalized_sku(product) for product in INTERNAL_PRODUCT_CATALOG}
+    random_product_ids = sorted(set(product_ids) - expected_product_ids)
+    duplicate_product_ids = len(product_ids) != len(set(product_ids))
+
+    print("CLEANUP_VERIFY")
+    for key, count in verification.items():
+        print(f"{key} = {count}")
+    print(f"duplicateProducts = {str(duplicate_product_ids).lower()}")
+    print(f"randomProductIds = {random_product_ids}")
+
+    if (
+        verification["locations"] == 9
+        and verification["products"] == len(INTERNAL_PRODUCT_CATALOG)
+        and verification["scans"] == 0
+        and verification["storeQueue"] == 0
+        and verification["pickQueue"] == 0
+        and verification["pickRequests"] == 0
+        and verification["scanQueue"] == 0
+        and verification["processedScans"] == 0
+        and verification["boxes"] == 0
+        and verification["activityLog"] <= 1
+        and verification["systemActivity"] <= 1
+        and not duplicate_product_ids
+        and not random_product_ids
+    ):
+        print("CLEANUP_OK")
+    else:
+        print("CLEANUP_VERIFY_FAILED")
 
 
 def product_is_draft(product: Optional[dict]) -> bool:
@@ -281,206 +628,166 @@ def product_is_draft(product: Optional[dict]) -> bool:
     return bool(product.get("needsDetails")) or product.get("status") in ("draft", "pending_details")
 
 
-def make_update_write(firebase: FirebaseClient, path: str, data: dict, exists: Optional[bool] = None) -> dict:
-    write = {
-        "update": {
-            "name": firebase._full_doc_name(path),
-            "fields": plain_to_firestore(data),
-        }
-    }
-    if exists is not None:
-        write["currentDocument"] = {"exists": exists}
-    return write
-
-
-def make_merge_write(firebase: FirebaseClient, path: str, data: dict) -> dict:
-    write = make_update_write(firebase, path, data)
-    write["updateMask"] = {"fieldPaths": list(data.keys())}
-    return write
-
-
-def make_transform_write(firebase: FirebaseClient, path: str, transforms: dict[str, int]) -> dict:
-    return {
-        "transform": {
-            "document": firebase._full_doc_name(path),
-            "fieldTransforms": [
-                {
-                    "fieldPath": field,
-                    "increment": firestore_increment(amount),
-                }
-                for field, amount in transforms.items()
-            ],
-        }
-    }
-
-
-def make_merge_increment_write(firebase: FirebaseClient, path: str, data: dict, transforms: dict[str, int]) -> dict:
-    write = make_merge_write(firebase, path, data)
-    write["updateTransforms"] = [
-        {
-            "fieldPath": field,
-            "increment": firestore_increment(amount),
-        }
-        for field, amount in transforms.items()
-    ]
-    return write
-
-
 def sync_product_from_label(
     firebase: FirebaseClient,
     label: dict,
     scan_id: str,
     box_id: str,
     location_id: int,
-    go_position: int,
+    in_position: int,
+    out_position: int,
     max_retries: int = 3,
-) -> tuple[str, bool]:
+) -> tuple[str, str]:
+    label = normalize_label(label)
     sku = build_normalized_sku(label)
+    slug = build_product_slug(label)
+    key = product_key(label)
+    product_path = f"products/{sku}"
+
+    print("BEFORE_SYNC_PRODUCT")
+    print(f"NORMALIZED_SKU = {sku}")
+    print(f"PRODUCT_PATH = {product_path}")
+    print(f"FIREBASE_ENABLED = {firebase.enabled}")
+    print(f"FIREBASE_PROJECT_ID = {FIREBASE_PROJECT_ID}")
+    print(f"FIREBASE_API_KEY_SET = {bool(FIREBASE_API_KEY)}")
+
     if not firebase.enabled:
-        return sku, False
+        print("PRODUCT_SYNC_FAILED Firebase client is disabled.")
+        return sku, "error"
 
     for attempt in range(max_retries):
-        transaction_id = firebase.begin_transaction()
-        processed_raw = firebase.get_doc_raw(f"processedScans/{scan_id}", transaction=transaction_id)
-        if processed_raw:
-            print(f"Scan {scan_id} already processed; inventory increment ignored.")
-            return sku, True
+        try:
+            processed = firebase.get_doc(f"processedScans/{scan_id}")
+            if processed:
+                print("DUPLICATE_SCAN_IGNORED")
+                print(f"SCAN_ID = {scan_id}")
+                log_activity(firebase, "DUPLICATE_SCAN_IGNORED", f"{scan_id} already processed; no queue or inventory increment.", "raspberry")
+                return sku, "duplicate_scan"
 
-        product_raw = firebase.get_doc_raw(f"products/{sku}", transaction=transaction_id)
-        product_exists = bool(product_raw)
-        product = firestore_to_plain(product_raw.get("fields", {})) if product_raw else None
-        now = utc_now()
+            product = firebase.get_doc(product_path)
+            product_exists = bool(product)
+            print(f"PRODUCT_EXISTS = {'true' if product_exists else 'false'}")
+            now = utc_now()
 
-        processed_data = {
-            "scanId": scan_id,
-            "boxId": box_id,
-            "normalizedSku": sku,
-            "brand": label["brand"],
-            "model": label["model"],
-            "color": label["color"],
-            "size": label["size"],
-            "locationId": location_id,
-            "goPosition": go_position,
-            "inventoryApplied": True,
-            "availableStockPosted": False,
-            "status": "label_confirmed",
-            "createdAt": timestamp(now),
-            "updatedAt": timestamp(now),
-        }
-
-        if product_exists:
-            product_update = {
+            processed_data = {
+                "scanId": scan_id,
+                "boxId": box_id,
                 "normalizedSku": sku,
-                "brand": product.get("brand") or label["brand"],
-                "model": product.get("model") or label["model"],
-                "color": product.get("color") or label["color"],
-                "size": product.get("size") or label["size"],
-                "lastLabelScanId": scan_id,
-                "lastBoxId": box_id,
-                "lastAssignedLocationId": location_id,
-                "lastMovementGoPosition": go_position,
-                "updatedAt": timestamp(now),
-            }
-            writes = [
-                make_update_write(firebase, f"processedScans/{scan_id}", processed_data, exists=False),
-                make_merge_increment_write(firebase, f"products/{sku}", product_update, {"quantity": 1, "stock": 1, "inventoryCount": 1}),
-            ]
-        else:
-            product_data = {
-                "normalizedSku": sku,
-                "status": "pending_details",
-                "needsDetails": True,
+                "productKey": key,
+                "slug": slug,
                 "brand": label["brand"],
                 "model": label["model"],
                 "color": label["color"],
                 "size": label["size"],
-                "quantity": 1,
-                "stock": 1,
-                "inventoryCount": 1,
-                "availableStock": 0,
-                "price": None,
-                "images": [],
-                "imageUrl": "",
-                "description": "",
-                "category": "",
-                "isAvailable": False,
-                "createdFromLabel": True,
-                "lastLabelScanId": scan_id,
-                "lastBoxId": box_id,
-                "lastAssignedLocationId": location_id,
-                "lastMovementGoPosition": go_position,
+                "locationId": location_id,
+                "inPosition": in_position,
+                "outPosition": out_position,
+                "inventoryApplied": True,
+                "availableStockPosted": False,
+                "status": "label_confirmed",
                 "createdAt": timestamp(now),
                 "updatedAt": timestamp(now),
             }
-            writes = [
-                make_update_write(firebase, f"processedScans/{scan_id}", processed_data, exists=False),
-                make_update_write(firebase, f"products/{sku}", product_data, exists=False),
-            ]
 
-        try:
-            firebase.commit_writes(writes, transaction=transaction_id)
-            log_activity(firebase, "LABEL_CONFIRMED", f"{scan_id} confirmed as {sku}.", "raspberry")
-            if product_exists:
-                log_activity(firebase, "INVENTORY_INCREMENTED", f"{sku} quantity incremented by 1.", "raspberry")
-            else:
-                log_activity(firebase, "PRODUCT_CREATED_FROM_LABEL", f"{sku} created from label scan.", "raspberry")
-                log_activity(firebase, "INVENTORY_PENDING_DETAILS", f"{sku} needs price/details before publishing.", "raspberry")
-            log_activity(firebase, "LOCATION_ASSIGNED", f"{sku} assigned to location {location_id}, GO {go_position}.", "raspberry")
-            return sku, False
+            if not product_exists:
+                processed_data["inventoryApplied"] = False
+                processed_data["status"] = "unknown_label_rejected"
+                firebase.set_doc(f"processedScans/{scan_id}", processed_data, merge=False)
+                print("UNKNOWN_LABEL_REJECTED")
+                log_activity(firebase, "UNKNOWN_LABEL_REJECTED", f"{sku} is not in predefined products; no queue, location, or inventory change.", "raspberry")
+                return sku, "unknown"
+
+            product_update = {
+                "id": product.get("id") or sku,
+                "normalizedSku": sku,
+                "productKey": product.get("productKey") or key,
+                "slug": product.get("slug") or slug,
+                "brand": product.get("brand") or label["brand"],
+                "model": product.get("model") or label["model"],
+                "color": product.get("color") or label["color"],
+                "size": product.get("size") or label["size"],
+                "name": product.get("name") or build_product_name(label),
+                "status": product.get("status") or "active",
+                "needsDetails": bool(product.get("needsDetails", False)),
+                "isAvailable": bool(product.get("isAvailable", True)),
+                "lastLabelScanId": scan_id,
+                "lastBoxId": box_id,
+                "lastAssignedLocationId": location_id,
+                "lastInPosition": in_position,
+                "lastOutPosition": out_position,
+                "updatedAt": timestamp(now),
+            }
+
+            firebase.increment_doc_fields(product_path, product_update, {"quantity": 1, "stock": 1, "inventoryCount": 1})
+            firebase.set_doc(f"processedScans/{scan_id}", processed_data, merge=False)
+            print("PRODUCT_FOUND")
+            print("INVENTORY_INCREMENTED")
+            log_activity(firebase, "scan_confirmed", f"{scan_id} confirmed as {key}.", "raspberry")
+            log_activity(firebase, "PRODUCT_FOUND", f"{sku} found in predefined products.", "raspberry")
+            log_activity(firebase, "INVENTORY_INCREMENTED", f"{sku} quantity, stock, and inventoryCount incremented by 1.", "raspberry")
+            return sku, "ok"
         except requests.HTTPError as exc:
+            print_firestore_error("PRODUCT_SYNC_FAILED", exc)
+            log_activity(firebase, "INVENTORY_SYNC_ERROR", f"{sku}: {str(exc)}", "raspberry")
             status_code = exc.response.status_code if exc.response is not None else 0
             if status_code in (409, 412, 429) and attempt < max_retries - 1:
                 time.sleep(0.4 * (attempt + 1))
                 continue
             raise
+        except requests.RequestException as exc:
+            print_firestore_error("PRODUCT_SYNC_FAILED", exc)
+            log_activity(firebase, "INVENTORY_SYNC_ERROR", f"{sku}: {str(exc)}", "raspberry")
+            raise
 
-    return sku, False
+    return sku, "error"
 
 
 def post_available_stock_after_store(
     firebase: FirebaseClient,
     scan_id: str,
     sku: str,
+    key: str,
     box_id: str,
     location_id: int,
-    go_position: int,
+    in_position: int,
+    out_position: int,
     max_retries: int = 3,
 ) -> None:
     if not firebase.enabled or not scan_id or not sku:
         return
 
     for attempt in range(max_retries):
-        transaction_id = firebase.begin_transaction()
-        processed_raw = firebase.get_doc_raw(f"processedScans/{scan_id}", transaction=transaction_id)
-        processed = firestore_to_plain(processed_raw.get("fields", {})) if processed_raw else {}
+        try:
+            processed = firebase.get_doc(f"processedScans/{scan_id}") or {}
+            if processed.get("availableStockPosted"):
+                print(f"Scan {scan_id} already posted to availableStock; ignored.")
+                return
 
-        if processed.get("availableStockPosted"):
-            print(f"Scan {scan_id} already posted to availableStock; ignored.")
-            return
-
-        now = utc_now()
-        writes = [
-            make_merge_write(firebase, f"processedScans/{scan_id}", {
-                "availableStockPosted": True,
-                "status": "stored",
-                "storedAt": timestamp(now),
-                "updatedAt": timestamp(now),
-            }),
-            make_merge_increment_write(firebase, f"products/{sku}", {
+            now = utc_now()
+            firebase.increment_doc_fields(f"products/{sku}", {
                 "lastStoredBoxId": box_id,
                 "lastLocationId": location_id,
                 "locationId": location_id,
                 "location": str(location_id),
-                "lastMovementGoPosition": go_position,
+                "productKey": key,
+                "isAvailable": True,
+                "status": "active",
+                "needsDetails": False,
+                "lastInPosition": in_position,
+                "lastOutPosition": out_position,
                 "updatedAt": timestamp(now),
-            }, {"availableStock": 1}),
-        ]
-
-        try:
-            firebase.commit_writes(writes, transaction=transaction_id)
-            log_activity(firebase, "INVENTORY_INCREMENTED", f"{sku} availableStock incremented after storage DONE.", "raspberry")
+            }, {"availableStock": 1})
+            firebase.set_doc(f"processedScans/{scan_id}", {
+                "availableStockPosted": True,
+                "status": "stored",
+                "storedAt": timestamp(now),
+                "updatedAt": timestamp(now),
+            }, merge=True)
+            print("AVAILABLE_STOCK_INCREMENTED")
+            log_activity(firebase, "AVAILABLE_STOCK_INCREMENTED", f"{sku} availableStock incremented after storage DONE.", "raspberry")
             return
         except requests.HTTPError as exc:
+            print_firestore_error("PRODUCT_SYNC_FAILED", exc)
             status_code = exc.response.status_code if exc.response is not None else 0
             if status_code in (409, 412, 429) and attempt < max_retries - 1:
                 time.sleep(0.4 * (attempt + 1))
@@ -514,6 +821,7 @@ def init_sqlite(db_path: str) -> None:
             model TEXT,
             color TEXT,
             size TEXT,
+            product_key TEXT,
             box_id TEXT,
             updated_at TEXT
         )
@@ -523,6 +831,7 @@ def init_sqlite(db_path: str) -> None:
             box_id TEXT PRIMARY KEY,
             scan_id TEXT,
             product_sku TEXT,
+            product_key TEXT,
             brand TEXT,
             model TEXT,
             color TEXT,
@@ -539,9 +848,13 @@ def init_sqlite(db_path: str) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             scan_id TEXT,
             product_sku TEXT,
+            product_key TEXT,
             box_id TEXT,
+            operation TEXT DEFAULT 'put',
             location_id INTEGER,
             go_position INTEGER,
+            in_position INTEGER,
+            out_position INTEGER,
             status TEXT,
             available_stock_posted INTEGER DEFAULT 0,
             created_at TEXT,
@@ -553,9 +866,16 @@ def init_sqlite(db_path: str) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_type TEXT,
             query_value TEXT,
+            product_key TEXT,
+            order_id TEXT,
+            pick_request_id TEXT,
+            order_item_key TEXT,
             box_id TEXT,
+            operation TEXT DEFAULT 'get',
             location_id INTEGER,
             go_position INTEGER,
+            in_position INTEGER,
+            out_position INTEGER,
             status TEXT,
             created_at TEXT,
             updated_at TEXT
@@ -570,17 +890,30 @@ def init_sqlite(db_path: str) -> None:
 
     ensure_column(cur, "boxes", "scan_id", "TEXT")
     ensure_column(cur, "boxes", "product_sku", "TEXT")
+    ensure_column(cur, "boxes", "product_key", "TEXT")
     ensure_column(cur, "boxes", "inventory_counted", "INTEGER DEFAULT 0")
+    ensure_column(cur, "locations", "product_key", "TEXT")
     ensure_column(cur, "store_queue", "scan_id", "TEXT")
     ensure_column(cur, "store_queue", "product_sku", "TEXT")
+    ensure_column(cur, "store_queue", "product_key", "TEXT")
+    ensure_column(cur, "store_queue", "operation", "TEXT DEFAULT 'put'")
+    ensure_column(cur, "store_queue", "in_position", "INTEGER")
+    ensure_column(cur, "store_queue", "out_position", "INTEGER")
     ensure_column(cur, "store_queue", "available_stock_posted", "INTEGER DEFAULT 0")
+    ensure_column(cur, "pick_queue", "product_key", "TEXT")
+    ensure_column(cur, "pick_queue", "order_id", "TEXT")
+    ensure_column(cur, "pick_queue", "pick_request_id", "TEXT")
+    ensure_column(cur, "pick_queue", "order_item_key", "TEXT")
+    ensure_column(cur, "pick_queue", "operation", "TEXT DEFAULT 'get'")
+    ensure_column(cur, "pick_queue", "in_position", "INTEGER")
+    ensure_column(cur, "pick_queue", "out_position", "INTEGER")
 
     for location_id in range(1, 10):
         cur.execute(
             """
             INSERT OR IGNORE INTO locations
-              (id, status, brand, model, color, size, box_id, updated_at)
-            VALUES (?, 'empty', '', '', '', '', '', ?)
+              (id, status, brand, model, color, size, product_key, box_id, updated_at)
+            VALUES (?, 'empty', '', '', '', '', '', '', ?)
             """,
             (location_id, utc_now()),
         )
@@ -612,13 +945,15 @@ def get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
 
 
 def reserve_location(conn: sqlite3.Connection, location_id: int, label: dict, box_id: str) -> None:
+    label = normalize_label(label)
+    key = product_key(label)
     cursor = conn.execute(
         """
         UPDATE locations
-        SET status = 'reserved', brand = ?, model = ?, color = ?, size = ?, box_id = ?, updated_at = ?
+        SET status = 'reserved', brand = ?, model = ?, color = ?, size = ?, product_key = ?, box_id = ?, updated_at = ?
         WHERE id = ? AND status = 'empty'
         """,
-        (label["brand"], label["model"], label["color"], label["size"], box_id, utc_now(), location_id),
+        (label["brand"], label["model"], label["color"], label["size"], key, box_id, utc_now(), location_id),
     )
     if cursor.rowcount == 0:
         raise RuntimeError(f"Location {location_id} is no longer empty.")
@@ -629,7 +964,9 @@ def choose_storage_location(conn: sqlite3.Connection, label: dict) -> Optional[i
     if not rows:
         return None
 
-    sorting_mode = get_setting(conn, "sortingMode", "brand")
+    sorting_mode = get_setting(conn, "sortingMode", "")
+    if not valid_sorting_strategy(sorting_mode):
+        return None
     if sorting_mode == "nearest_empty":
         return rows[0]["id"]
     if sorting_mode == "most_requested":
@@ -675,36 +1012,70 @@ def score_neighbor(label: dict, location: sqlite3.Row, sorting_mode: str) -> int
 
 
 def create_store_task(db_path: str, firebase: FirebaseClient, label: dict) -> Optional[str]:
+    label = normalize_label(label)
+    now = utc_now()
+    scan_id = f"SCAN-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:6].upper()}"
+    box_id = f"BOX-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:6].upper()}"
+    product_sku = build_normalized_sku(label)
+    key = product_key(label)
+    product_slug = build_product_slug(label)
+
     conn = connect_db(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        automation_status = get_automation_status(firebase)
+        sorting_strategy = str(automation_status.get("sortingStrategy") or "").strip()
+        if not valid_sorting_strategy(sorting_strategy):
+            conn.rollback()
+            set_automation_status(firebase, {
+                "currentState": STATE_WAIT_FOR_AUTOMATION,
+                "lastError": "Waiting for sorting strategy",
+                "beltBlocked": True,
+            })
+            return None
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('sortingMode', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (sorting_strategy,),
+        )
         location_id = choose_storage_location(conn, label)
         if not location_id:
             conn.rollback()
             log_activity(firebase, "store_queue_error", "No empty storage location available.", "raspberry")
             return None
 
-        now = utc_now()
-        scan_id = f"SCAN-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:6].upper()}"
-        box_id = f"BOX-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:6].upper()}"
-        product_sku = build_normalized_sku(label)
-        go_position = location_to_go_in(location_id)
+        in_position = get_in_position(location_id)
+        out_position = get_out_position(location_id)
+
+        print("CALLING_SYNC_PRODUCT_FROM_LABEL")
+        product_sku, sync_status = sync_product_from_label(
+            firebase,
+            label,
+            scan_id,
+            box_id,
+            location_id,
+            in_position,
+            out_position,
+        )
+        if sync_status != "ok":
+            conn.rollback()
+            return None
 
         conn.execute(
             """
             INSERT INTO boxes
-              (box_id, scan_id, product_sku, brand, model, color, size, location_id, status, inventory_counted, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)
+              (box_id, scan_id, product_sku, product_key, brand, model, color, size, location_id, status, inventory_counted, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?)
             """,
-            (box_id, scan_id, product_sku, label["brand"], label["model"], label["color"], label["size"], location_id, now, now),
+            (box_id, scan_id, product_sku, key, label["brand"], label["model"], label["color"], label["size"], location_id, now, now),
         )
         reserve_location(conn, location_id, label, box_id)
         conn.execute(
             """
-            INSERT INTO store_queue (scan_id, product_sku, box_id, location_id, go_position, status, available_stock_posted, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'waiting', 0, ?, ?)
+            INSERT INTO store_queue
+              (scan_id, product_sku, product_key, box_id, operation, location_id, go_position, in_position, out_position, status, available_stock_posted, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'put', ?, ?, ?, ?, 'waiting', 0, ?, ?)
             """,
-            (scan_id, product_sku, box_id, location_id, go_position, now, now),
+            (scan_id, product_sku, key, box_id, location_id, in_position, in_position, out_position, now, now),
         )
         queue_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
         conn.commit()
@@ -714,41 +1085,28 @@ def create_store_task(db_path: str, firebase: FirebaseClient, label: dict) -> Op
     finally:
         conn.close()
 
-    try:
-        product_sku, already_processed = sync_product_from_label(
-            firebase,
-            label,
-            scan_id,
-            box_id,
-            location_id,
-            go_position,
-        )
-        if not already_processed:
-            conn = connect_db(db_path)
-            conn.execute("UPDATE boxes SET product_sku = ?, inventory_counted = 1, updated_at = ? WHERE box_id = ?", (product_sku, utc_now(), box_id))
-            conn.execute("UPDATE store_queue SET product_sku = ?, updated_at = ? WHERE id = ?", (product_sku, utc_now(), queue_id))
-            conn.commit()
-            conn.close()
-    except requests.RequestException as exc:
-        print("Product inventory sync failed:", exc)
-        log_activity(firebase, "INVENTORY_SYNC_ERROR", str(exc), "raspberry")
-
     scan_data = {
         "scanId": scan_id,
         "boxId": box_id,
         "normalizedSku": product_sku,
+        "productKey": key,
+        "slug": product_slug,
         "brand": label["brand"],
         "model": label["model"],
         "color": label["color"],
         "size": label["size"],
         "selectedLocation": location_id,
-        "goPosition": go_position,
+        "inPosition": in_position,
+        "outPosition": out_position,
         "status": "queued",
         "createdAt": timestamp(now),
     }
     firebase.add_doc("scans", scan_data)
     firebase.set_doc(f"locations/{location_id}", {
         "status": "reserved",
+        "productId": product_sku,
+        "normalizedSku": product_sku,
+        "productKey": key,
         "brand": label["brand"],
         "model": label["model"],
         "color": label["color"],
@@ -756,18 +1114,52 @@ def create_store_task(db_path: str, firebase: FirebaseClient, label: dict) -> Op
         "boxId": box_id,
         "updatedAt": timestamp(now),
     })
-    firebase.add_doc("storeQueue", {
-        "queueId": queue_id,
+    firebase.set_doc(f"boxes/{box_id}", {
+        "boxId": box_id,
         "scanId": scan_id,
         "normalizedSku": product_sku,
+        "productKey": key,
+        "brand": label["brand"],
+        "model": label["model"],
+        "color": label["color"],
+        "size": label["size"],
+        "locationId": location_id,
+        "status": "queued",
+        "updatedAt": timestamp(now),
+    }, merge=False)
+    firebase.add_doc("storeQueue", {
+        "queueId": queue_id,
+        "operation": "put",
+        "scanId": scan_id,
+        "normalizedSku": product_sku,
+        "productKey": key,
+        "slug": product_slug,
         "boxId": box_id,
         "locationId": location_id,
-        "goPosition": go_position,
+        "inPosition": in_position,
+        "outPosition": out_position,
         "status": "waiting",
         "createdAt": timestamp(now),
         "updatedAt": timestamp(now),
     })
-    log_activity(firebase, "scan_queued", f"{box_id} queued for location {location_id} with GO {go_position}.", "raspberry")
+    firebase.set_doc(f"scanQueue/{scan_id}", {
+        "scanId": scan_id,
+        "boxId": box_id,
+        "normalizedSku": product_sku,
+        "productKey": key,
+        "brand": label["brand"],
+        "model": label["model"],
+        "color": label["color"],
+        "size": label["size"],
+        "targetLocation": location_id,
+        "status": "WAITING_LIFTER",
+        "createdAt": timestamp(now),
+        "updatedAt": timestamp(now),
+    }, merge=False)
+    print("STORE_QUEUE_CREATED")
+    log_activity(firebase, "LOCATION_RESERVED", f"{product_sku} reserved location {location_id}.", "raspberry")
+    log_activity(firebase, "store_queued", f"{box_id} queued for location {location_id}: GO {in_position} then GO {out_position}.", "raspberry")
+    log_activity(firebase, "scan_queued", f"{box_id} queued for location {location_id}: IN {in_position}, OUT {out_position}.", "raspberry")
     return box_id
 
 
@@ -788,6 +1180,44 @@ def log_activity(firebase: FirebaseClient, activity_type: str, message: str, sou
         print("Firebase activity log failed:", exc)
 
 
+def update_order_retrieval_progress(firebase: FirebaseClient, order_id: str, box_id: str, task_status: str) -> None:
+    if not firebase.enabled or not order_id:
+        return
+
+    order = firebase.get_doc(f"orders/{order_id}") or {}
+    assigned_boxes = order.get("assignedBoxes") or []
+    if not isinstance(assigned_boxes, list):
+        assigned_boxes = []
+
+    updated_boxes = []
+    for item in assigned_boxes:
+        if isinstance(item, dict) and item.get("boxId") == box_id:
+            updated = dict(item)
+            updated["status"] = task_status
+            updated["retrievedAt"] = utc_now() if task_status == "done" else updated.get("retrievedAt", "")
+            updated_boxes.append(updated)
+        else:
+            updated_boxes.append(item)
+
+    if updated_boxes:
+        done_count = sum(1 for item in updated_boxes if isinstance(item, dict) and item.get("status") == "done")
+        total_count = len(updated_boxes)
+    else:
+        done_count = int(order.get("retrievalDone") or 0) + (1 if task_status == "done" else 0)
+        total_count = int(order.get("retrievalTotal") or done_count)
+
+    next_status = "ready" if total_count > 0 and done_count >= total_count else order.get("status", "retrieving")
+    firebase.set_doc(f"orders/{order_id}", {
+        "assignedBoxes": updated_boxes,
+        "retrievalDone": done_count,
+        "retrievalTotal": total_count,
+        "retrievalProgressLabel": f"{done_count} / {total_count} Retrieved",
+        "status": next_status,
+        "readyAt": timestamp() if next_status == "ready" else order.get("readyAt"),
+        "updatedAt": timestamp(),
+    }, merge=True)
+
+
 # ================= QUEUES =================
 
 class QueueWorker(threading.Thread):
@@ -798,29 +1228,214 @@ class QueueWorker(threading.Thread):
         self.firebase = firebase
         self.poll_commands = poll_commands
         self.stop_event = threading.Event()
+        self.lifter_busy = False
+        self.at_starting_point = False
 
     def run(self) -> None:
         while not self.stop_event.is_set():
             try:
-                if self.process_store_task():
+                ready, _, _ = automation_ready(self.firebase)
+                if ready and self.process_next_task():
                     continue
-                if self.process_pick_task():
+                if self.poll_commands and not self.lifter_busy and self.process_manual_command():
                     continue
-                if self.poll_commands and self.process_manual_command():
-                    continue
+                if ready:
+                    self.return_to_start_if_idle()
             except Exception as exc:
                 print("Queue worker error:", exc)
-                log_activity(self.firebase, "queue_worker_error", str(exc), "raspberry")
+                set_automation_status(self.firebase, {
+                    "currentState": "ERROR",
+                    "lastError": str(exc),
+                    "beltBlocked": True,
+                    "lifterBusy": self.lifter_busy,
+                })
+                log_activity(self.firebase, "error", str(exc), "raspberry")
             time.sleep(1.0)
 
-    def call_esp_go(self, position: int, source: str, queue_id: str | int) -> dict:
+    def send_go(self, position: int, source: str, queue_id: str | int) -> dict:
+        ready, _, reason = automation_ready(self.firebase)
+        if not ready:
+            raise RuntimeError(reason)
+        set_automation_status(self.firebase, {
+            "currentState": STATE_LIFTER_DELIVERY,
+            "lifterBusy": True,
+            "beltBlocked": True,
+            "currentOperation": f"GO {position}",
+            "lastError": None,
+        })
+        log_activity(self.firebase, "go_sent", f"GO {position} sent for {queue_id}.", source)
         response = requests.get(
             f"{self.esp_base_url}/go",
             params={"position": position, "source": source, "queueId": queue_id},
             timeout=140,
         )
         response.raise_for_status()
-        return response.json()
+        result = response.json()
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or f"GO {position} failed")
+        log_activity(self.firebase, "go_done", f"GO {position} done for {queue_id}.", source)
+        self.at_starting_point = False
+        return result
+
+    def call_esp_go(self, position: int, source: str, queue_id: str | int) -> dict:
+        return self.send_go(position, source, queue_id)
+
+    def call_esp_command(self, command: str, source: str, queue_id: str | int) -> dict:
+        response = requests.get(
+            f"{self.esp_base_url}/command",
+            params={"command": command, "source": source, "queueId": queue_id},
+            timeout=140,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or f"{command} failed")
+        return result
+
+    def get_status(self) -> dict:
+        return get_esp_status(self.esp_base_url)
+
+    def belt_stop(self) -> None:
+        esp_get_json(self.esp_base_url, "/belt/stop", timeout=20)
+        set_automation_status(self.firebase, {"beltRunning": False, "beltBlocked": True})
+
+    def belt_run_ms(self, duration_ms: int) -> None:
+        status = get_automation_status(self.firebase)
+        if status.get("cameraBusy"):
+            raise RuntimeError("Camera is busy; belt movement is blocked.")
+        esp_get_json(self.esp_base_url, "/belt/run", params={"ms": duration_ms}, timeout=max(20, duration_ms // 1000 + 10))
+
+    def drop_to_lifter(self) -> None:
+        status = get_automation_status(self.firebase)
+        if status.get("cameraBusy"):
+            raise RuntimeError("Camera is busy; drop is blocked.")
+        esp_get_json(self.esp_base_url, "/drop", timeout=30)
+
+    def read_ultra(self) -> dict:
+        data = esp_get_json(self.esp_base_url, "/ultra", timeout=20)
+        return data.get("ultra") or data
+
+    def verify_location(self, location_id: int) -> bool:
+        data = esp_get_json(self.esp_base_url, "/verify-location", params={"id": location_id}, timeout=20)
+        verification = data.get("verification") or data
+        return bool(verification.get("detected"))
+
+    def wait_for_lifter_ir(self, timeout_seconds: int = 30) -> None:
+        set_automation_status(self.firebase, {
+            "currentState": STATE_MOVE_BOX_TO_LIFTER_IR,
+            "beltRunning": True,
+            "beltBlocked": False,
+            "currentOperation": "Move box to lifter IR",
+            "lastError": None,
+        })
+        esp_get_json(self.esp_base_url, "/belt/start", timeout=20)
+        started_at = time.time()
+        while time.time() - started_at < timeout_seconds:
+            status = self.get_status()
+            if bool_status(status, "irLifter"):
+                self.belt_stop()
+                set_automation_status(self.firebase, {
+                    "currentState": STATE_CHECK_LIFTER_READY,
+                    "beltRunning": False,
+                    "beltBlocked": True,
+                    "currentOperation": "Check lifter ready",
+                })
+                return
+            time.sleep(0.2)
+        self.belt_stop()
+        raise RuntimeError("IR_LIFTER_DETECT timeout.")
+
+    def ensure_lifter_ready(self) -> None:
+        set_automation_status(self.firebase, {
+            "currentState": STATE_CHECK_LIFTER_READY,
+            "beltRunning": False,
+            "beltBlocked": True,
+            "currentOperation": "Check START + ultrasonic",
+        })
+        status = self.get_status()
+        if not bool_status(status, "atStartingPoint"):
+            self.send_start()
+            status = self.get_status()
+        ultra = self.read_ultra()
+        if not bool_status(status, "atStartingPoint"):
+            raise RuntimeError("Lifter is not at STARTING_POINT.")
+        if not bool_status(ultra, "ultrasonicReady"):
+            raise RuntimeError("Lifter ultrasonic check failed.")
+
+    def prepare_box_on_lifter(self, task_id: int | str) -> None:
+        self.wait_for_lifter_ir()
+        self.ensure_lifter_ready()
+        set_automation_status(self.firebase, {
+            "currentState": STATE_DROP_BOX_TO_LIFTER,
+            "beltRunning": True,
+            "beltBlocked": True,
+            "currentOperation": "DROP_TO_LIFTER",
+        })
+        log_activity(self.firebase, "drop_to_lifter_started", f"{task_id} drop to lifter.", "raspberry")
+        self.drop_to_lifter()
+        set_automation_status(self.firebase, {
+            "currentState": STATE_LIFTER_DELIVERY,
+            "beltRunning": False,
+            "beltBlocked": True,
+            "currentOperation": "Lifter delivery",
+        })
+
+    def send_start(self) -> bool:
+        ready, _, reason = automation_ready(self.firebase)
+        if not ready:
+            raise RuntimeError(reason)
+        set_automation_status(self.firebase, {
+            "currentState": "RETURNING_TO_START",
+            "lifterBusy": True,
+            "beltBlocked": True,
+            "currentOperation": "START",
+        })
+        response = requests.get(
+            f"{self.esp_base_url}/start",
+            params={"source": "raspberry", "queueId": "idle-start"},
+            timeout=140,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or "START failed")
+        self.at_starting_point = True
+        set_automation_status(self.firebase, {
+            "currentState": STATE_WAIT_BOX_AT_CAMERA,
+            "lifterBusy": False,
+            "currentOperation": "",
+            "beltBlocked": False,
+        })
+        log_activity(self.firebase, "returned_to_start", "Lifter returned to starting point.", "raspberry")
+        return True
+
+    def process_next_task(self) -> bool:
+        if self.lifter_busy:
+            return False
+        if self.process_pick_task():
+            return True
+        return self.process_store_task()
+
+    def return_to_start_if_idle(self) -> None:
+        if self.lifter_busy or self.at_starting_point:
+            return
+        conn = connect_db(self.db_path)
+        try:
+            waiting = conn.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM pick_queue WHERE status = 'waiting') +
+                  (SELECT COUNT(*) FROM store_queue WHERE status = 'waiting') AS waiting_count
+                """
+            ).fetchone()["waiting_count"]
+        finally:
+            conn.close()
+        if waiting == 0:
+            try:
+                self.send_start()
+            except requests.RequestException as exc:
+                print("Return to start failed:", exc)
+                log_activity(self.firebase, "error", f"Return to START failed: {exc}", "raspberry")
 
     def process_store_task(self) -> bool:
         conn = connect_db(self.db_path)
@@ -834,12 +1449,46 @@ class QueueWorker(threading.Thread):
         conn.commit()
         conn.close()
 
+        self.lifter_busy = True
+        set_automation_status(self.firebase, {
+            "currentState": STATE_LIFTER_DELIVERY,
+            "lifterBusy": True,
+            "beltBlocked": True,
+            "currentOperation": f"PUT Location {task['location_id']}",
+            "lastError": None,
+        })
+        in_position = int(task["in_position"] or get_in_position(int(task["location_id"])))
+        out_position = int(task["out_position"] or get_out_position(int(task["location_id"])))
+        product_sku = task["product_sku"]
+        key = task["product_key"] or ""
+        queue_ref = f"store-{task['id']}"
+        log_activity(self.firebase, "put_started", f"{task['box_id']} put started: GO {in_position}, GO {out_position}.", "raspberry")
+
         try:
-            result = self.call_esp_go(task["go_position"], "raspberry", f"store-{task['id']}")
-            ok = bool(result.get("ok"))
+            self.prepare_box_on_lifter(queue_ref)
+            self.firebase.set_doc(f"scanQueue/{task['scan_id']}", {
+                "status": "DELIVERING",
+                "updatedAt": timestamp(),
+            }, merge=True)
+            self.put(task, in_position, out_position)
+            if int(task["location_id"]) in (8, 9) and not self.verify_location(int(task["location_id"])):
+                raise RuntimeError(f"Location {task['location_id']} placement verification failed")
+            ok = True
+            status = "done"
         except Exception as exc:
-            result = {"ok": False, "error": str(exc)}
             ok = False
+            status = "error"
+            print("Store task failed:", exc)
+            set_automation_status(self.firebase, {
+                "currentState": "ERROR",
+                "lastError": str(exc),
+                "beltBlocked": True,
+                "lifterBusy": False,
+                "currentOperation": "",
+            })
+            log_activity(self.firebase, "error", f"{queue_ref}: {exc}", "raspberry")
+        finally:
+            self.lifter_busy = False
 
         conn = connect_db(self.db_path)
         now = utc_now()
@@ -848,16 +1497,17 @@ class QueueWorker(threading.Thread):
             conn.execute("UPDATE store_queue SET status = 'done', updated_at = ? WHERE id = ?", (now, task["id"]))
             conn.execute("UPDATE boxes SET status = 'stored', updated_at = ? WHERE box_id = ?", (now, task["box_id"]))
             conn.execute("UPDATE locations SET status = 'full', updated_at = ? WHERE id = ?", (now, task["location_id"]))
-            status = "done"
-            log_activity(self.firebase, "store_done", f"{task['box_id']} stored at location {task['location_id']}.", "raspberry")
+            log_activity(self.firebase, "put_done", f"{task['box_id']} stored at location {task['location_id']}.", "raspberry")
             try:
                 post_available_stock_after_store(
                     self.firebase,
                     task["scan_id"],
-                    task["product_sku"],
+                    product_sku,
+                    key,
                     task["box_id"],
                     task["location_id"],
-                    task["go_position"],
+                    in_position,
+                    out_position,
                 )
                 conn.execute("UPDATE store_queue SET available_stock_posted = 1, updated_at = ? WHERE id = ?", (now, task["id"]))
             except requests.RequestException as exc:
@@ -867,13 +1517,21 @@ class QueueWorker(threading.Thread):
             conn.execute("UPDATE store_queue SET status = 'error', updated_at = ? WHERE id = ?", (now, task["id"]))
             conn.execute("UPDATE boxes SET status = 'error', updated_at = ? WHERE box_id = ?", (now, task["box_id"]))
             status = "error"
-            log_activity(self.firebase, "store_error", result.get("error", "Store task failed."), "raspberry")
+            self.firebase.set_doc(f"scanQueue/{task['scan_id']}", {
+                "status": "ERROR",
+                "errorMessage": "Store task failed.",
+                "updatedAt": timestamp(now),
+            }, merge=True)
+            log_activity(self.firebase, "store_error", "Store task failed.", "raspberry")
         conn.commit()
         conn.close()
 
         if box:
             self.firebase.set_doc(f"locations/{task['location_id']}", {
                 "status": "full" if ok else "reserved",
+                "productId": product_sku,
+                "normalizedSku": product_sku,
+                "productKey": key,
                 "brand": box["brand"],
                 "model": box["model"],
                 "color": box["color"],
@@ -881,10 +1539,11 @@ class QueueWorker(threading.Thread):
                 "boxId": task["box_id"],
                 "updatedAt": timestamp(now),
             })
-            self.firebase.set_doc(f"inventory/boxes/{task['box_id']}", {
+            self.firebase.set_doc(f"boxes/{task['box_id']}", {
                 "boxId": task["box_id"],
                 "scanId": task["scan_id"],
-                "normalizedSku": task["product_sku"],
+                "normalizedSku": product_sku,
+                "productKey": key,
                 "brand": box["brand"],
                 "model": box["model"],
                 "color": box["color"],
@@ -892,18 +1551,39 @@ class QueueWorker(threading.Thread):
                 "locationId": task["location_id"],
                 "status": "stored" if ok else "error",
                 "updatedAt": timestamp(now),
-            })
+            }, merge=True)
+            if ok:
+                self.firebase.set_doc(f"scanQueue/{task['scan_id']}", {
+                    "status": "DONE",
+                    "updatedAt": timestamp(now),
+                }, merge=True)
+                log_activity(self.firebase, "LOCATION_FILLED", f"{product_sku} stored in location {task['location_id']}.", "raspberry")
         self.firebase.add_doc("storeQueue", {
             "queueId": task["id"],
+            "operation": "put",
             "scanId": task["scan_id"],
-            "normalizedSku": task["product_sku"],
+            "normalizedSku": product_sku,
+            "productKey": key,
             "boxId": task["box_id"],
             "locationId": task["location_id"],
-            "goPosition": task["go_position"],
+            "inPosition": in_position,
+            "outPosition": out_position,
             "status": status,
             "updatedAt": timestamp(now),
         })
+        if ok:
+            set_automation_status(self.firebase, {
+                "currentState": STATE_WAIT_BOX_AT_CAMERA,
+                "lifterBusy": False,
+                "currentOperation": "",
+                "beltBlocked": False,
+                "lastError": None,
+            })
         return True
+
+    def put(self, task: sqlite3.Row, in_position: int, out_position: int) -> None:
+        self.send_go(in_position, "raspberry-put", f"store-{task['id']}-in")
+        self.send_go(out_position, "raspberry-put", f"store-{task['id']}-out")
 
     def process_pick_task(self) -> bool:
         conn = connect_db(self.db_path)
@@ -912,67 +1592,142 @@ class QueueWorker(threading.Thread):
             conn.close()
             return False
 
+        order_id = task["order_id"] or ""
+        if order_id:
+            order = self.firebase.get_doc(f"orders/{order_id}") or {}
+            if order.get("status") == "cancelled" or order.get("cancelRemainingPickTasks"):
+                now = utc_now()
+                conn.execute("UPDATE pick_queue SET status = 'cancelled', updated_at = ? WHERE id = ?", (now, task["id"]))
+                conn.commit()
+                conn.close()
+                if task["pick_request_id"]:
+                    self.firebase.set_doc(f"pickRequests/{task['pick_request_id']}", {
+                        "status": "cancelled",
+                        "updatedAt": timestamp(now),
+                    }, merge=True)
+                log_activity(self.firebase, "pick_cancelled", f"{task['box_id']} skipped because order {order_id} was cancelled.", "raspberry")
+                return True
+
         now = utc_now()
         conn.execute("UPDATE pick_queue SET status = 'running', updated_at = ? WHERE id = ?", (now, task["id"]))
         conn.commit()
         conn.close()
 
+        self.lifter_busy = True
+        set_automation_status(self.firebase, {
+            "currentState": STATE_LIFTER_DELIVERY,
+            "lifterBusy": True,
+            "beltBlocked": True,
+            "currentOperation": f"GET Location {task['location_id']}",
+            "lastError": None,
+        })
+        in_position = int(task["in_position"] or get_in_position(int(task["location_id"])))
+        out_position = int(task["out_position"] or get_out_position(int(task["location_id"])))
+        key = task["product_key"] or ""
+        log_activity(self.firebase, "get_started", f"{task['box_id']} get started: GO {out_position}, GO {in_position}.", "raspberry")
+
         try:
-            result = self.call_esp_go(task["go_position"], "raspberry-pick", f"pick-{task['id']}")
-            ok = bool(result.get("ok"))
+            self.get(task, out_position, in_position)
+            ok = True
+            status = "done"
         except Exception as exc:
-            result = {"ok": False, "error": str(exc)}
             ok = False
+            status = "error"
+            print("Pick task failed:", exc)
+            set_automation_status(self.firebase, {
+                "currentState": "ERROR",
+                "lastError": str(exc),
+                "beltBlocked": True,
+                "lifterBusy": False,
+                "currentOperation": "",
+            })
+            log_activity(self.firebase, "error", f"pick-{task['id']}: {exc}", "raspberry")
+        finally:
+            self.lifter_busy = False
 
         conn = connect_db(self.db_path)
         now = utc_now()
+        box = conn.execute("SELECT * FROM boxes WHERE box_id = ?", (task["box_id"],)).fetchone()
         if ok:
             conn.execute("UPDATE pick_queue SET status = 'done', updated_at = ? WHERE id = ?", (now, task["id"]))
             conn.execute("UPDATE boxes SET status = 'picked', updated_at = ? WHERE box_id = ?", (now, task["box_id"]))
             conn.execute(
-                "UPDATE locations SET status = 'empty', brand = '', model = '', color = '', size = '', box_id = '', updated_at = ? WHERE id = ?",
+                "UPDATE locations SET status = 'empty', brand = '', model = '', color = '', size = '', product_key = '', box_id = '', updated_at = ? WHERE id = ?",
                 (now, task["location_id"]),
             )
-            status = "done"
-            log_activity(self.firebase, "pick_done", f"{task['box_id']} picked from location {task['location_id']}.", "raspberry")
+            log_activity(self.firebase, "get_done", f"{task['box_id']} picked from location {task['location_id']}.", "raspberry")
         else:
             conn.execute("UPDATE pick_queue SET status = 'error', updated_at = ? WHERE id = ?", (now, task["id"]))
             conn.execute("UPDATE boxes SET status = 'error', updated_at = ? WHERE box_id = ?", (now, task["box_id"]))
-            status = "error"
-            log_activity(self.firebase, "pick_error", result.get("error", "Pick task failed."), "raspberry")
         conn.commit()
         conn.close()
 
-        self.firebase.set_doc(f"locations/{task['location_id']}", {
+        location_data = {
             "status": "empty" if ok else "full",
-            "brand": "",
-            "model": "",
-            "color": "",
-            "size": "",
-            "boxId": "",
+            "productId": "" if ok else (box["product_sku"] if box else ""),
+            "normalizedSku": "" if ok else (box["product_sku"] if box else ""),
+            "productKey": "" if ok else key,
+            "brand": "" if ok else (box["brand"] if box else ""),
+            "model": "" if ok else (box["model"] if box else ""),
+            "color": "" if ok else (box["color"] if box else ""),
+            "size": "" if ok else (box["size"] if box else ""),
+            "boxId": "" if ok else task["box_id"],
             "updatedAt": timestamp(now),
-        })
-        self.firebase.set_doc(f"inventory/boxes/{task['box_id']}", {
-            "boxId": task["box_id"],
-            "locationId": task["location_id"],
-            "status": "picked" if ok else "error",
-            "updatedAt": timestamp(now),
-        })
+        }
+        self.firebase.set_doc(f"locations/{task['location_id']}", location_data)
+        if box:
+            self.firebase.set_doc(f"boxes/{task['box_id']}", {
+                "boxId": task["box_id"],
+                "normalizedSku": box["product_sku"],
+                "productKey": key,
+                "brand": box["brand"],
+                "model": box["model"],
+                "color": box["color"],
+                "size": box["size"],
+                "locationId": task["location_id"],
+                "status": "picked" if ok else "error",
+                "updatedAt": timestamp(now),
+            }, merge=True)
         self.firebase.add_doc("pickQueue", {
             "queueId": task["id"],
+            "operation": "get",
             "requestType": task["request_type"],
             "queryValue": task["query_value"],
+            "orderId": order_id,
+            "pickRequestId": task["pick_request_id"] or "",
+            "orderItemKey": task["order_item_key"] or "",
+            "productKey": key,
             "boxId": task["box_id"],
             "locationId": task["location_id"],
-            "goPosition": task["go_position"],
+            "outPosition": out_position,
+            "inPosition": in_position,
             "status": status,
             "updatedAt": timestamp(now),
         })
+        if task["pick_request_id"]:
+            self.firebase.set_doc(f"pickRequests/{task['pick_request_id']}", {
+                "status": "done" if ok else "error",
+                "updatedAt": timestamp(now),
+            }, merge=True)
+        if order_id:
+            update_order_retrieval_progress(self.firebase, order_id, task["box_id"], "done" if ok else "error")
+        if ok:
+            set_automation_status(self.firebase, {
+                "currentState": STATE_WAIT_BOX_AT_CAMERA,
+                "lifterBusy": False,
+                "currentOperation": "",
+                "beltBlocked": False,
+                "lastError": None,
+            })
         return True
+
+    def get(self, task: sqlite3.Row, out_position: int, in_position: int) -> None:
+        self.send_go(out_position, "raspberry-get", f"pick-{task['id']}-out")
+        self.send_go(in_position, "raspberry-get", f"pick-{task['id']}-in")
 
     def process_manual_command(self) -> bool:
         try:
-            commands = self.firebase.query("commands", {"status": "pending", "type": "GO"}, limit_count=1)
+            commands = self.firebase.query("commands", {"status": "pending"}, limit_count=1)
         except requests.RequestException as exc:
             print("Manual command poll failed:", exc)
             return False
@@ -980,6 +1735,45 @@ class QueueWorker(threading.Thread):
             return False
 
         command = commands[0]
+        command_type = str(command.get("type") or "GO").strip().upper()
+        if command_type == "COMMAND":
+            raw_command = str(command.get("command") or command.get("arduinoCommand") or "").strip().upper()
+            if raw_command not in ("STOP", "STATUS", "TESTIR", "ULTRA", "CAMERA", "SCAN", "DISPENSE", "D", "HOME", "START", "BELT"):
+                self.firebase.set_doc(f"commands/{command['_id']}", {
+                    "status": "error",
+                    "errorMessage": f"Invalid command {raw_command}",
+                    "updatedAt": timestamp(),
+                })
+                return True
+
+            self.firebase.set_doc(f"commands/{command['_id']}", {
+                "status": "sent_to_arduino",
+                "sentAt": timestamp(),
+            })
+            try:
+                result = self.call_esp_command(raw_command, "website", command["_id"])
+                ok = bool(result.get("ok"))
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)}
+                ok = False
+
+            self.firebase.set_doc(f"commands/{command['_id']}", {
+                "status": "done" if ok else "error",
+                "errorMessage": "" if ok else result.get("error", "Manual command failed."),
+                "doneAt": timestamp() if ok else timestamp(),
+                "updatedAt": timestamp(),
+            })
+            return True
+
+        ready, _, reason = automation_ready(self.firebase)
+        if not ready:
+            self.firebase.set_doc(f"commands/{command['_id']}", {
+                "status": "error",
+                "errorMessage": reason,
+                "updatedAt": timestamp(),
+            })
+            return True
+
         position = int(command.get("position") or 0)
         if position < 1 or position > 18:
             self.firebase.set_doc(f"commands/{command['_id']}", {
@@ -1030,7 +1824,7 @@ class PickRequestPoller(threading.Thread):
         for request in requests_waiting:
             if request["_id"] in self.seen_request_ids:
                 continue
-            task_count = enqueue_pick_request(self.db_path, request)
+            task_count = enqueue_pick_request(self.db_path, self.firebase, request)
             self.firebase.set_doc(f"pickRequests/{request['_id']}", {
                 "status": "queued" if task_count else "error",
                 "queuedCount": task_count,
@@ -1039,22 +1833,40 @@ class PickRequestPoller(threading.Thread):
             self.seen_request_ids.add(request["_id"])
 
 
-def enqueue_pick_request(db_path: str, request: dict) -> int:
+def enqueue_pick_request(db_path: str, firebase: FirebaseClient, request: dict) -> int:
     request_type = (request.get("requestType") or request.get("request_type") or "single").strip()
     query_value = str(request.get("queryValue") or request.get("query_value") or "").strip()
+    if request.get("status") == "cancelled":
+        return 0
     if not query_value:
         return 0
 
     conn = connect_db(db_path)
+    normalized_query = query_value.upper().strip()
     if request_type in ("single", "box_id"):
         rows = conn.execute(
             "SELECT * FROM boxes WHERE box_id = ? AND status = 'stored'",
             (query_value,),
         ).fetchall()
-    elif request_type in ("size", "model", "brand"):
+    elif request_type == "location":
+        try:
+            requested_location_id = int(request.get("locationId") or query_value)
+        except ValueError:
+            rows = []
+        else:
+            rows = conn.execute(
+                "SELECT * FROM boxes WHERE location_id = ? AND status = 'stored' ORDER BY created_at LIMIT 1",
+                (requested_location_id,),
+            ).fetchall()
+    elif request_type in ("productKey", "product_key"):
+        rows = conn.execute(
+            "SELECT * FROM boxes WHERE product_key = ? AND status = 'stored' ORDER BY created_at",
+            (normalized_query,),
+        ).fetchall()
+    elif request_type in ("size", "model", "brand", "color"):
         rows = conn.execute(
             f"SELECT * FROM boxes WHERE {request_type} = ? AND status = 'stored' ORDER BY created_at",
-            (query_value,),
+            (normalized_query,),
         ).fetchall()
     else:
         rows = []
@@ -1063,14 +1875,44 @@ def enqueue_pick_request(db_path: str, request: dict) -> int:
     count = 0
     for box in rows:
         location_id = int(box["location_id"])
+        in_position = get_in_position(location_id)
+        out_position = get_out_position(location_id)
+        key = box["product_key"] or product_key(box)
+        order_id = str(request.get("orderId") or "")
+        pick_request_id = str(request.get("_id") or "")
+        order_item_key = str(request.get("orderItemKey") or "")
         conn.execute(
             """
             INSERT INTO pick_queue
-              (request_type, query_value, box_id, location_id, go_position, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'waiting', ?, ?)
+              (request_type, query_value, product_key, order_id, pick_request_id, order_item_key, box_id, operation, location_id, go_position, in_position, out_position, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'get', ?, ?, ?, ?, 'waiting', ?, ?)
             """,
-            (request_type, query_value, box["box_id"], location_id, location_to_go_out(location_id), now, now),
+            (request_type, query_value, key, order_id, pick_request_id, order_item_key, box["box_id"], location_id, out_position, in_position, out_position, now, now),
         )
+        queue_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        conn.execute("UPDATE boxes SET status = 'queued_for_pick', updated_at = ? WHERE box_id = ?", (now, box["box_id"]))
+        firebase.add_doc("pickQueue", {
+            "queueId": queue_id,
+            "operation": "get",
+            "requestType": request_type,
+            "queryValue": query_value,
+            "orderId": order_id,
+            "pickRequestId": pick_request_id,
+            "orderItemKey": order_item_key,
+            "productKey": key,
+            "boxId": box["box_id"],
+            "locationId": location_id,
+            "outPosition": out_position,
+            "inPosition": in_position,
+            "status": "waiting",
+            "createdAt": timestamp(now),
+            "updatedAt": timestamp(now),
+        })
+        firebase.set_doc(f"boxes/{box['box_id']}", {
+            "status": "queued_for_pick",
+            "updatedAt": timestamp(now),
+        }, merge=True)
+        log_activity(firebase, "pick_queued", f"{box['box_id']} queued for pick from location {location_id}: GO {out_position} then GO {in_position}.", "raspberry")
         count += 1
     conn.commit()
     conn.close()
@@ -1345,6 +2187,8 @@ def parse_args():
     parser.add_argument("--esp-url", default=DEFAULT_ESP32_BASE_URL)
     parser.add_argument("--no-firebase", action="store_true")
     parser.add_argument("--no-command-poll", action="store_true")
+    parser.add_argument("--init-catalog-only", action="store_true")
+    parser.add_argument("--cleanup-firebase-runtime", action="store_true")
     return parser.parse_args()
 
 
@@ -1354,11 +2198,30 @@ def main():
     args = parse_args()
     firebase = FirebaseClient(FIREBASE_API_KEY, enabled=not args.no_firebase)
 
+    if args.cleanup_firebase_runtime:
+        try:
+            cleanup_firebase_runtime_data(firebase)
+        except requests.RequestException as exc:
+            print_firestore_error("CLEANUP_FAILED", exc)
+        return
+
+    ensure_automation_status(firebase)
     init_sqlite(args.db)
     try:
         sync_settings_from_firebase(args.db, firebase)
     except requests.RequestException as exc:
         print("Firebase settings sync failed, using local defaults:", exc)
+
+    try:
+        ensure_internal_product_catalog(firebase)
+    except requests.RequestException as exc:
+        print_firestore_error("PRODUCT_SYNC_FAILED", exc)
+        log_activity(firebase, "INVENTORY_SYNC_ERROR", str(exc), "raspberry")
+        if args.init_catalog_only:
+            return
+
+    if args.init_catalog_only:
+        return
 
     configure_tesseract()
     templates = load_logo_templates()
@@ -1377,6 +2240,8 @@ def main():
     tick_freq = cv2.getTickFrequency()
     last_tick = cv2.getTickCount()
     frame_counter = 0
+    last_automation_status_sync = 0.0
+    camera_aligned_for_current_box = False
     last_result = OCRResult(text="", confidence=0.0, fields={}, debug_name="waiting")
     last_status = "waiting"
     last_logo_score = 0.0
@@ -1396,11 +2261,121 @@ def main():
 
             roi, roi_rect = extract_roi(frame)
             sharpness = frame_sharpness(roi)
+            ready, automation_status, wait_reason = automation_ready(firebase)
+            now_seconds = time.time()
+            if not ready:
+                camera_aligned_for_current_box = False
+                if now_seconds - last_automation_status_sync > 2.0:
+                    set_automation_status(firebase, {
+                        "currentState": STATE_WAIT_FOR_AUTOMATION if not automation_status.get("automationStarted") else STATE_STOPPED,
+                        "cameraBusy": False,
+                        "beltRunning": False,
+                        "beltBlocked": True,
+                        "lifterBusy": False,
+                        "currentOperation": "",
+                        "lastError": wait_reason,
+                    })
+                    last_automation_status_sync = now_seconds
+                last_status = wait_reason
+                frame_counter += 1
+                output = draw_overlay(frame, roi_rect, last_result, fps if "fps" in locals() else 0.0, sharpness, last_status, last_logo_score)
+                cv2.imshow("MakhzanXpert OCR Queue Controller", output)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("r"):
+                    print("RESET FOR NEW LABEL")
+                    reset_stability()
+                    last_status = "reset"
+                continue
+
+            try:
+                esp_status = get_esp_status(args.esp_url)
+            except requests.RequestException as exc:
+                print("ESP status failed:", exc)
+                set_automation_status(firebase, {
+                    "currentState": STATE_ERROR,
+                    "beltBlocked": True,
+                    "beltRunning": False,
+                    "lastError": f"ESP status failed: {exc}",
+                })
+                last_status = "esp status error"
+                frame_counter += 1
+                output = draw_overlay(frame, roi_rect, last_result, fps if "fps" in locals() else 0.0, sharpness, last_status, last_logo_score)
+                cv2.imshow("MakhzanXpert OCR Queue Controller", output)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                continue
+
+            if not bool_status(esp_status, "irCamera"):
+                camera_aligned_for_current_box = False
+                set_automation_status(firebase, {
+                    "currentState": STATE_WAIT_BOX_AT_CAMERA,
+                    "cameraBusy": False,
+                    "beltRunning": False,
+                    "beltBlocked": False,
+                    "lastError": None,
+                })
+                last_status = "waiting for IR_CAMERA"
+                frame_counter += 1
+                current_tick = cv2.getTickCount()
+                fps = tick_freq / max(current_tick - last_tick, 1)
+                last_tick = current_tick
+                output = draw_overlay(frame, roi_rect, last_result, fps, sharpness, last_status, last_logo_score)
+                cv2.imshow("MakhzanXpert OCR Queue Controller", output)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("r"):
+                    print("RESET FOR NEW LABEL")
+                    reset_stability()
+                    last_status = "reset"
+                continue
+
+            if not camera_aligned_for_current_box:
+                try:
+                    set_automation_status(firebase, {
+                        "currentState": STATE_CAMERA_ALIGNING,
+                        "cameraBusy": False,
+                        "beltRunning": True,
+                        "beltBlocked": True,
+                        "currentOperation": "Align box at camera",
+                        "lastError": None,
+                    })
+                    esp_get_json(args.esp_url, "/belt/run", params={"ms": CAMERA_ALIGN_DELAY_MS}, timeout=20)
+                    esp_get_json(args.esp_url, "/belt/stop", timeout=20)
+                    camera_aligned_for_current_box = True
+                except Exception as exc:
+                    print("Camera alignment failed:", exc)
+                    set_automation_status(firebase, {
+                        "currentState": STATE_ERROR,
+                        "beltRunning": False,
+                        "beltBlocked": True,
+                        "lastError": f"Camera alignment failed: {exc}",
+                    })
+                    last_status = "camera align error"
+                    continue
 
             if frame_counter % OCR_EVERY_N_FRAMES == 0:
                 if sharpness >= MIN_SHARPNESS:
-                    last_result, _, last_logo_score = best_ocr_result(roi, templates)
-                    confirmed_label = update_field_stability(last_result.fields)
+                    set_automation_status(firebase, {
+                        "currentState": STATE_CAMERA_READING,
+                        "cameraBusy": True,
+                        "beltBlocked": True,
+                        "beltRunning": False,
+                        "lastError": None,
+                    })
+                    try:
+                        last_result, _, last_logo_score = best_ocr_result(roi, templates)
+                        confirmed_label = update_field_stability(last_result.fields)
+                    finally:
+                        set_automation_status(firebase, {
+                            "currentState": STATE_WAIT_BOX_AT_CAMERA,
+                            "cameraBusy": False,
+                            "beltBlocked": False,
+                            "beltRunning": False,
+                        })
                     print("\n========== FIELDS ==========")
                     print(last_result.fields)
                     print("Counts:", field_count)
@@ -1415,7 +2390,10 @@ def main():
                             print("Queue creation failed:", exc)
                             last_status = "queue error"
                         reset_stability()
+                        camera_aligned_for_current_box = False
                     elif confirmed_label:
+                        print("DUPLICATE_LABEL_SUPPRESSED")
+                        log_activity(firebase, "DUPLICATE_LABEL_SUPPRESSED", label_signature(confirmed_label), "raspberry")
                         last_status = "duplicate label suppressed"
                     else:
                         last_status = "confirming fields"

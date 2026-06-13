@@ -19,6 +19,8 @@ int lastMotionState = LOW;
 
 unsigned long lastSensorSend = 0;
 #define SENSOR_INTERVAL 3000
+#define DROP_TO_LIFTER_DELAY_MS 3000
+#define ULTRASONIC_READY_MAX_CM 12.0
 
 // ================= BELT RELAY =================
 #define RELAY_PIN 13
@@ -29,6 +31,7 @@ unsigned long lastSensorSend = 0;
 
 bool beltRunning = false;
 bool autoMode = false;
+bool motionBusy = false;
 
 // ================= LOCATION IR MUX =================
 #define LOC_MUX_OUT 41
@@ -249,7 +252,13 @@ void updateSensors() {
   data += "\"belt\":" + String(beltRunning ? 1 : 0) + ",";
   data += "\"x\":" + String(currentX) + ",";
   data += "\"y\":" + String(currentY) + ",";
-  data += "\"z\":" + String(currentZ);
+  data += "\"z\":" + String(currentZ) + ",";
+  data += "\"irCamera\":" + String(irStartDetected() ? "true" : "false") + ",";
+  data += "\"irLifter\":" + String(irEndDetected() ? "true" : "false") + ",";
+  data += "\"loc8Detected\":" + String(locationDetected(8) ? "true" : "false") + ",";
+  data += "\"loc9Detected\":" + String(locationDetected(9) ? "true" : "false") + ",";
+  data += "\"atStartingPoint\":" + String(atStartingPoint() ? "true" : "false") + ",";
+  data += "\"busy\":" + String(motionBusy ? "true" : "false");
   data += "}";
 
   Serial.println(data);
@@ -270,6 +279,7 @@ void handleCommand(String cmd, Stream &replyPort) {
 
   else if (cmd == "STOP") {
     autoMode = false;
+    beltStop();
     reply(replyPort, "OK AUTO STOPPED");
   }
 
@@ -283,6 +293,7 @@ void handleCommand(String cmd, Stream &replyPort) {
   }
 
   else if (cmd == "START" || cmd == "S") {
+    beltStop();
     if (goStartingPoint()) {
       reply(replyPort, "DONE:START");
     } else {
@@ -293,6 +304,31 @@ void handleCommand(String cmd, Stream &replyPort) {
   else if (cmd == "BELT") {
     beltToggle();
     reply(replyPort, "DONE:BELT");
+  }
+
+  else if (cmd == "BELT_START") {
+    beltStart();
+    reply(replyPort, "DONE:BELT_START");
+  }
+
+  else if (cmd == "BELT_STOP") {
+    beltStop();
+    reply(replyPort, "DONE:BELT_STOP");
+  }
+
+  else if (cmd.startsWith("BELT_RUN_MS ")) {
+    unsigned long durationMs = cmd.substring(12).toInt();
+    if (durationMs <= 0 || durationMs > 10000) {
+      reply(replyPort, "ERROR BAD BELT_RUN_MS");
+    } else {
+      beltRunMs(durationMs);
+      reply(replyPort, "DONE:BELT_RUN_MS");
+    }
+  }
+
+  else if (cmd == "DROP_TO_LIFTER") {
+    beltRunMs(DROP_TO_LIFTER_DELAY_MS);
+    reply(replyPort, "DONE:DROP_TO_LIFTER");
   }
 
   else if (cmd == "DISPENSE" || cmd == "D") {
@@ -306,7 +342,7 @@ void handleCommand(String cmd, Stream &replyPort) {
   }
 
   else if (cmd == "STATUS") {
-    printStatus();
+    sendStatusJson(replyPort);
     reply(replyPort, "DONE:STATUS");
   }
 
@@ -321,10 +357,18 @@ void handleCommand(String cmd, Stream &replyPort) {
   }
 
   else if (cmd == "ULTRA") {
-    Serial.print("ULTRA = ");
-    Serial.print(readAverageDistanceCM());
-    Serial.println(" cm");
+    sendUltraJson(replyPort);
     reply(replyPort, "DONE:ULTRA");
+  }
+
+  else if (cmd.startsWith("VERIFY_LOCATION ")) {
+    int locationId = cmd.substring(16).toInt();
+    if (locationId == 8 || locationId == 9) {
+      sendVerifyLocationJson(replyPort, locationId);
+      reply(replyPort, "DONE:VERIFY_LOCATION");
+    } else {
+      reply(replyPort, "ERROR BAD VERIFY_LOCATION");
+    }
   }
 
   else if (cmd.startsWith("GO ")) {
@@ -398,6 +442,30 @@ void beltToggle() {
   logBoth(beltRunning ? "BELT STATE = ON" : "BELT STATE = OFF");
 }
 
+void beltStart() {
+  if (!beltRunning) {
+    beltToggle();
+  }
+}
+
+void beltStop() {
+  if (beltRunning) {
+    beltToggle();
+  }
+}
+
+void beltRunMs(unsigned long durationMs) {
+  beltStart();
+  unsigned long startedAt = millis();
+  while (millis() - startedAt < durationMs) {
+    updateSensors();
+    readCommandFrom(Serial);
+    readCommandFrom(Serial1);
+    delay(5);
+  }
+  beltStop();
+}
+
 bool irStartDetected() {
   return digitalRead(IR_START_PIN) == IR_DETECTED_STATE;
 }
@@ -436,6 +504,12 @@ bool readLocationIR(byte channel) {
   return digitalRead(LOC_MUX_OUT) == IR_DETECTED_STATE;
 }
 
+bool locationDetected(int locationId) {
+  if (locationId == 8) return readLocationIR(0);
+  if (locationId == 9) return readLocationIR(1);
+  return false;
+}
+
 void printLocationIRs() {
   Serial.print("LOC IR 1 CH0 = ");
   Serial.println(readLocationIR(0) ? "DETECTED" : "CLEAR");
@@ -454,6 +528,7 @@ void printLocationIRs() {
 
 bool goStartingPoint() {
   lastMotionError = "";
+  motionBusy = true;
   logBoth("GO STARTING POINT");
 
   if (!moveToXYZ(
@@ -461,16 +536,19 @@ bool goStartingPoint() {
     STARTING_POINT.y,
     STARTING_POINT.z
   )) {
+    motionBusy = false;
     return false;
   }
 
   currentPositionIndex = -1;
   logBoth("DONE STARTING POINT");
+  motionBusy = false;
   return true;
 }
 
 bool goPosition(int n) {
   lastMotionError = "";
+  motionBusy = true;
   logBoth("GO POSITION " + String(n));
 
   if (isSamePairInOut(currentPositionIndex, n)) {
@@ -487,6 +565,7 @@ bool goPosition(int n) {
       positions[n - 1].y,
       positions[n - 1].z
     )) {
+      motionBusy = false;
       return false;
     }
   }
@@ -494,6 +573,7 @@ bool goPosition(int n) {
   currentPositionIndex = n;
 
   logBoth("DONE POSITION " + String(n));
+  motionBusy = false;
   return true;
 }
 
@@ -795,6 +875,55 @@ void printStatus() {
   printCurrent();
 }
 
+bool atStartingPoint() {
+  return currentX == STARTING_POINT.x && currentY == STARTING_POINT.y && currentZ == STARTING_POINT.z;
+}
+
+bool ultrasonicReady(float cm) {
+  return cm > 0 && cm <= ULTRASONIC_READY_MAX_CM;
+}
+
+String statusJson() {
+  float ultrasonicCm = readAverageDistanceCM();
+  String data = "{";
+  data += "\"belt\":" + String(beltRunning ? 1 : 0) + ",";
+  data += "\"irCamera\":" + String(irStartDetected() ? "true" : "false") + ",";
+  data += "\"irLifter\":" + String(irEndDetected() ? "true" : "false") + ",";
+  data += "\"ultrasonicCm\":" + String(ultrasonicCm, 2) + ",";
+  data += "\"ultrasonicReady\":" + String(ultrasonicReady(ultrasonicCm) ? "true" : "false") + ",";
+  data += "\"loc8Detected\":" + String(locationDetected(8) ? "true" : "false") + ",";
+  data += "\"loc9Detected\":" + String(locationDetected(9) ? "true" : "false") + ",";
+  data += "\"x\":" + String(currentX) + ",";
+  data += "\"y\":" + String(currentY) + ",";
+  data += "\"z\":" + String(currentZ) + ",";
+  data += "\"atStartingPoint\":" + String(atStartingPoint() ? "true" : "false") + ",";
+  data += "\"busy\":" + String(motionBusy ? "true" : "false");
+  data += "}";
+  return data;
+}
+
+void sendStatusJson(Stream &replyPort) {
+  reply(replyPort, statusJson());
+}
+
+void sendUltraJson(Stream &replyPort) {
+  float cm = readAverageDistanceCM();
+  String data = "{";
+  data += "\"ultrasonicCm\":" + String(cm, 2) + ",";
+  data += "\"ultrasonicReady\":" + String(ultrasonicReady(cm) ? "true" : "false");
+  data += "}";
+  reply(replyPort, data);
+}
+
+void sendVerifyLocationJson(Stream &replyPort, int locationId) {
+  bool detected = locationDetected(locationId);
+  String data = "{";
+  data += "\"locationId\":" + String(locationId) + ",";
+  data += "\"detected\":" + String(detected ? "true" : "false");
+  data += "}";
+  reply(replyPort, data);
+}
+
 void testIRs() {
   Serial.print("IR START D40 = ");
   Serial.println(digitalRead(IR_START_PIN));
@@ -829,10 +958,15 @@ void printHelp() {
   Serial.println("HOME / H");
   Serial.println("START / S");
   Serial.println("BELT");
+  Serial.println("BELT_START");
+  Serial.println("BELT_STOP");
+  Serial.println("BELT_RUN_MS 1200");
+  Serial.println("DROP_TO_LIFTER");
   Serial.println("DISPENSE / D");
   Serial.println("CAMERA / SCAN");
   Serial.println("GO 1 to GO 18");
   Serial.println("STATUS");
+  Serial.println("VERIFY_LOCATION 8/9");
   Serial.println("TESTIR");
   Serial.println("TESTLIM");
   Serial.println("ULTRA");

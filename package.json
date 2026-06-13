@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "cleanup:firebase": "node scripts/cleanupFirebase.js"
+  },
   "devDependencies": {
     "vite": "^8.0.16"
   }
