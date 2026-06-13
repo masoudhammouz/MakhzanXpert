@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { addDoc, collection, doc, getDoc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
+import { addDoc, collection, doc, getDocFromServer, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
 import { db } from '../../firebase/firebase.js';
 
 const SYSTEM_SETTINGS_REF = doc(db, 'settings', 'system');
@@ -9,6 +9,15 @@ const ESP_DEVICE_REF = doc(db, 'devices', 'esp-main-01');
 const ESP_DEVICE_ID = 'esp-main-01';
 const TOTAL_MOVEMENT_POSITIONS = 18;
 const ONLINE_WINDOW_MS = 30000;
+const VALID_SORTING_STRATEGIES = new Set([
+  'brand',
+  'size',
+  'color',
+  'model',
+  'brand_size',
+  'color_size',
+  'model_size',
+]);
 
 const SORTING_OPTIONS = [
   { value: '', label: 'Select strategy' },
@@ -41,7 +50,7 @@ const DEFAULT_AUTOMATION_STATUS = {
   beltBlocked: true,
   lifterBusy: false,
   currentOperation: '',
-  lastError: null,
+  lastError: '',
 };
 
 const AUTOMATION_OPTIONS = [
@@ -81,12 +90,35 @@ async function createAutomationCommand(command) {
     commandId,
   });
 
-  const createdCommand = await getDoc(commandRef);
+  const createdCommand = await getDocFromServer(commandRef);
   if (!createdCommand.exists()) {
     throw new Error(`${command} command was not created in Firestore.`);
   }
 
   return commandId;
+}
+
+async function verifyAutomationStatus(expected) {
+  const snapshot = await getDocFromServer(AUTOMATION_STATUS_REF);
+  if (!snapshot.exists()) {
+    throw new Error('automation/status was not found after update.');
+  }
+
+  const actual = snapshot.data();
+  const mismatchedField = Object.entries(expected).find(([key, value]) => actual[key] !== value);
+  if (mismatchedField) {
+    const [key, value] = mismatchedField;
+    throw new Error(`automation/status ${key} is ${String(actual[key])}, expected ${String(value)}.`);
+  }
+
+  return actual;
+}
+
+async function verifySortingStrategySaved(strategy) {
+  const snapshot = await getDocFromServer(SYSTEM_SETTINGS_REF);
+  if (!snapshot.exists() || snapshot.data().sortingMode !== strategy) {
+    throw new Error('Sorting strategy was not saved before automation start.');
+  }
 }
 
 function getDateValue(value) {
@@ -185,6 +217,7 @@ function AdminControlPanel() {
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const commandRequestInFlight = useRef(false);
+  const sortingModeRef = useRef(DEFAULT_SETTINGS.sortingMode);
 
   useEffect(() => {
     const unsubscribe = onSnapshot(
@@ -195,7 +228,9 @@ function AdminControlPanel() {
           ...(snapshot.exists() ? snapshot.data() : {}),
         };
         setSettings(nextSettings);
-        setSortingMode(nextSettings.sortingMode || DEFAULT_SETTINGS.sortingMode);
+        const nextSortingMode = nextSettings.sortingMode || DEFAULT_SETTINGS.sortingMode;
+        setSortingMode(nextSortingMode);
+        sortingModeRef.current = nextSortingMode;
         setFirebaseOnline(true);
         setError('');
       },
@@ -372,40 +407,70 @@ function AdminControlPanel() {
 
     const actionLabel = enabled ? 'Start Automation' : 'Stop Automation';
     const command = enabled ? 'START_AUTOMATION' : 'STOP_AUTOMATION';
+    const strategy = sortingModeRef.current.trim();
+
+    if (enabled && !VALID_SORTING_STRATEGIES.has(strategy)) {
+      setError('Choose a sorting strategy before starting automation.');
+      return;
+    }
+
+    console.log(enabled ? 'START_AUTOMATION_CLICKED' : 'STOP_AUTOMATION_CLICKED');
     commandRequestInFlight.current = true;
     setSaving(actionLabel);
     setError('');
     setNotice('');
 
     try {
-      const commandId = await createAutomationCommand(command);
-      console.log(`${command} sent`);
+      const nextStatus = enabled ? {
+        automationStarted: true,
+        sortingStrategy: strategy,
+        currentState: 'WAIT_BOX_AT_CAMERA',
+        lastError: '',
+        beltBlocked: false,
+        cameraBusy: false,
+        lifterBusy: false,
+      } : {
+        automationStarted: false,
+        sortingStrategy: strategy,
+        currentState: 'STOPPED',
+        lastError: 'Stopped by operator',
+        beltBlocked: true,
+        cameraBusy: false,
+        lifterBusy: false,
+      };
 
       await Promise.all([
         setDoc(SYSTEM_SETTINGS_REF, {
           automationEnabled: enabled,
-          sortingMode,
+          sortingMode: strategy,
           lastControlAction: command,
           controlRequestedAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         }, { merge: true }),
         setDoc(AUTOMATION_STATUS_REF, {
-          automationStarted: enabled,
-          sortingStrategy: sortingMode,
-          currentState: enabled ? 'WAIT_BOX_AT_CAMERA' : 'STOPPED',
-          cameraBusy: false,
+          ...nextStatus,
           beltRunning: false,
-          beltBlocked: !enabled,
-          lifterBusy: false,
           currentOperation: '',
-          lastError: enabled ? null : 'Stopped by operator',
           updatedAt: serverTimestamp(),
         }, { merge: true }),
-        logWebsiteActivity(
-          enabled ? 'AUTOMATION_STARTED' : 'AUTOMATION_STOPPED',
-          enabled ? `Automation started with ${sortingMode || 'no sorting strategy selected'}.` : 'Automation stopped by operator.',
-        ),
       ]);
+      console.log('AUTOMATION_STATUS_UPDATED');
+
+      if (enabled) {
+        await verifySortingStrategySaved(strategy);
+        console.log('SORTING_STRATEGY_SAVED');
+      }
+
+      await verifyAutomationStatus(nextStatus);
+
+      const commandId = await createAutomationCommand(command);
+      console.log(enabled ? 'START_COMMAND_CREATED' : 'STOP_COMMAND_CREATED');
+      console.log(`${command} sent`);
+
+      await logWebsiteActivity(
+        enabled ? 'AUTOMATION_STARTED' : 'AUTOMATION_STOPPED',
+        enabled ? `Automation started with ${strategy}.` : 'Automation stopped by operator.',
+      );
 
       setNotice(`${actionLabel} command sent. Command ID: ${commandId}`);
     } catch (requestError) {
@@ -416,29 +481,42 @@ function AdminControlPanel() {
     }
   };
 
-  const handleSortingSave = () => {
-    if (!sortingMode) {
+  const handleSortingSave = async () => {
+    const strategy = sortingModeRef.current.trim();
+    if (!VALID_SORTING_STRATEGIES.has(strategy)) {
       setError('Choose a sorting strategy first.');
       return;
     }
     setSaving('Sorting Strategy');
     setError('');
     setNotice('');
-    Promise.all([
-      setDoc(SYSTEM_SETTINGS_REF, {
-        sortingMode,
-        updatedAt: serverTimestamp(),
-      }, { merge: true }),
-      setDoc(AUTOMATION_STATUS_REF, {
-        sortingStrategy: sortingMode,
-        currentState: automationStatus.automationStarted ? 'WAIT_BOX_AT_CAMERA' : 'WAIT_FOR_AUTOMATION',
-        lastError: null,
-        updatedAt: serverTimestamp(),
-      }, { merge: true }),
-    ])
-      .then(() => setNotice('Sorting Strategy saved.'))
-      .catch(() => setError('Unable to save Sorting Strategy.'))
-      .finally(() => setSaving(''));
+    try {
+      await Promise.all([
+        setDoc(SYSTEM_SETTINGS_REF, {
+          sortingMode: strategy,
+          updatedAt: serverTimestamp(),
+        }, { merge: true }),
+        setDoc(AUTOMATION_STATUS_REF, {
+          sortingStrategy: strategy,
+          currentState: automationStatus.automationStarted ? 'WAIT_BOX_AT_CAMERA' : 'WAIT_FOR_AUTOMATION',
+          lastError: '',
+          updatedAt: serverTimestamp(),
+        }, { merge: true }),
+      ]);
+      await verifySortingStrategySaved(strategy);
+      console.log('SORTING_STRATEGY_SAVED');
+      setNotice('Sorting Strategy saved.');
+    } catch {
+      setError('Unable to save Sorting Strategy.');
+    } finally {
+      setSaving('');
+    }
+  };
+
+  const handleSortingModeChange = (event) => {
+    const nextSortingMode = event.target.value;
+    sortingModeRef.current = nextSortingMode;
+    setSortingMode(nextSortingMode);
   };
 
   const handleOptionChange = (key, checked) => {
@@ -471,7 +549,7 @@ function AdminControlPanel() {
         cameraBusy: false,
         lifterBusy: false,
         currentOperation: '',
-        lastError: null,
+        lastError: '',
         updatedAt: serverTimestamp(),
       }, { merge: true });
       setNotice('Automation error cleared.');
@@ -688,7 +766,7 @@ function AdminControlPanel() {
           </div>
           <label className="control-field" htmlFor="sorting-mode">
             <span>Mode</span>
-            <select id="sorting-mode" value={sortingMode} onChange={(event) => setSortingMode(event.target.value)}>
+            <select id="sorting-mode" value={sortingMode} onChange={handleSortingModeChange}>
               {SORTING_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>{option.label}</option>
               ))}
