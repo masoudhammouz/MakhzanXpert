@@ -18,16 +18,7 @@ bool motionAlarm = false;
 int lastMotionState = LOW;
 
 unsigned long lastSensorSend = 0;
-#define SENSOR_INTERVAL 250
-#define DHT_INTERVAL 2000
-#define DROP_TO_LIFTER_DELAY_MS 3000
-#define ULTRASONIC_READY_MAX_CM 12.0
-float lastUltrasonicCm = -1;
-bool lastUltrasonicReady = false;
-unsigned long lastDhtRead = 0;
-float cachedTemp = -1;
-float cachedHumidity = -1;
-bool cachedDhtOk = false;
+#define SENSOR_INTERVAL 3000
 
 // ================= BELT RELAY =================
 #define RELAY_PIN 13
@@ -38,7 +29,6 @@ bool cachedDhtOk = false;
 
 bool beltRunning = false;
 bool autoMode = false;
-bool motionBusy = false;
 
 // ================= LOCATION IR MUX =================
 #define LOC_MUX_OUT 41
@@ -84,16 +74,12 @@ bool motionBusy = false;
 #define MAX_Y_STEPS 2700
 #define MAX_Z_STEPS 2500
 
-#define MAX_HOME_X_STEPS 5000
-#define MAX_HOME_Y_STEPS 5000
-#define MAX_HOME_Z_STEPS 5000
-
 long currentX = 0;
 long currentY = 0;
 long currentZ = 0;
 
 int currentPositionIndex = 0;
-String lastMotionError = "";
+String input = "";
 
 struct Position {
   long x;
@@ -160,21 +146,18 @@ void setup() {
 
   enableDrivers();
 
-  logBoth("System starting...");
-  logBoth("Wait 60 sec for PIR warmup...");
+  Serial.println("System Starting...");
   delay(6000);
 
   lastMotionState = digitalRead(PIR_PIN);
 
-  logBoth("START HOMING...");
-  if (homeAll()) {
-    logBoth("GO STARTING POINT...");
-    goStartingPoint();
-  } else {
-    logBoth(lastMotionError);
-  }
+  Serial.println("START HOMING...");
+  homeAll();
 
-  logBoth("READY");
+  Serial.println("GO STARTING POINT...");
+  goStartingPoint();
+
+  Serial.println("READY");
   printHelp();
 }
 
@@ -192,14 +175,126 @@ void loop() {
 // ================= READ COMMAND =================
 
 void readCommandFrom(Stream &port) {
-  if (!port.available()) return;
+  if (port.available()) {
+    input = port.readStringUntil('\n');
+    input.trim();
+    input.toUpperCase();
 
-  String input = port.readStringUntil('\n');
-  input.trim();
-  input.toUpperCase();
+    if (input.length() > 0) {
+      handleCommand(input);
+    }
+  }
+}
 
-  if (input.length() > 0) {
-    handleCommand(input, port);
+// ================= COMMANDS =================
+
+void handleCommand(String cmd) {
+  if (cmd == "HELP") {
+    printHelp();
+  }
+
+  else if (cmd == "AUTO") {
+    autoMode = true;
+    Serial.println("OK AUTO STARTED");
+  }
+
+  else if (cmd == "STOP") {
+    autoMode = false;
+    Serial.println("OK AUTO STOPPED");
+  }
+
+  else if (cmd == "HOME" || cmd == "H") {
+    autoMode = false;
+    homeAll();
+    Serial.println("OK HOME");
+  }
+
+  else if (cmd == "START" || cmd == "S") {
+    goStartingPoint();
+    Serial.println("OK STARTING POINT");
+  }
+
+  else if (cmd == "BELT_START" || cmd == "BON") {
+    beltToggle();
+    Serial.println("OK BELT_START TOGGLE");
+  }
+
+  else if (cmd == "BELT_STOP" || cmd == "BOFF") {
+    beltToggle();
+    Serial.println("OK BELT_STOP TOGGLE");
+  }
+
+  else if (cmd == "BELT" || cmd == "B") {
+    beltToggle();
+    Serial.println("OK BELT TOGGLE");
+  }
+
+  else if (cmd == "DISPENSE" || cmd == "D") {
+    dispenseOne();
+    Serial.println("OK DISPENSE");
+  }
+
+  else if (cmd == "SCAN" || cmd == "CAMERA") {
+    sendCameraScan();
+    Serial.println("OK CAMERA SCAN");
+  }
+
+  else if (cmd == "STATUS") {
+    printStatus();
+  }
+
+  else if (cmd == "TESTIR") {
+    testIRs();
+  }
+
+  else if (cmd == "TESTLIM") {
+    testLimits();
+  }
+
+  else if (cmd == "ULTRA") {
+    Serial.print("ULTRA = ");
+    Serial.print(readAverageDistanceCM());
+    Serial.println(" cm");
+  }
+
+  else if (cmd.startsWith("GO ")) {
+    int n = cmd.substring(3).toInt();
+
+    if (n >= 1 && n <= 18) {
+      goPosition(n);
+      Serial.print("OK GO ");
+      Serial.println(n);
+    } else {
+      Serial.println("ERROR BAD POSITION");
+    }
+  }
+
+  else if (cmd.startsWith("SITE ")) {
+    int site = cmd.substring(5).toInt();
+
+    if (site >= 1 && site <= 9) {
+      int inPos = site * 2 - 1;
+      int outPos = site * 2;
+
+      goPosition(inPos);
+      goPosition(outPos);
+      goStartingPoint();
+
+      Serial.print("OK SITE ");
+      Serial.println(site);
+    } else {
+      Serial.println("ERROR BAD SITE");
+    }
+  }
+
+  else {
+    int n = cmd.toInt();
+
+    if (n >= 1 && n <= 18) {
+      goPosition(n);
+    } else {
+      Serial.println("ERROR UNKNOWN COMMAND");
+    }
   }
 }
 
@@ -216,7 +311,7 @@ void updateSensors() {
     motionAlarm = true;
 
     if (lastMotionState == LOW) {
-      logBoth("Motion Detected!");
+      Serial.println("Motion Detected!");
     }
 
     lastMotionState = HIGH;
@@ -224,7 +319,7 @@ void updateSensors() {
 
   if (millis() - lastMotionTime > MOTION_ALARM_HOLD) {
     if (lastMotionState == HIGH) {
-      logBoth("No Motion");
+      Serial.println("No Motion");
     }
 
     motionAlarm = false;
@@ -237,19 +332,14 @@ void updateSensors() {
   int mq3Value = analogRead(MQ3_PIN);
   int mq135Value = analogRead(MQ135_PIN);
 
-  if (millis() - lastDhtRead >= DHT_INTERVAL) {
-    lastDhtRead = millis();
-    float temp = dht.readTemperature();
-    float humidity = dht.readHumidity();
+  float temp = dht.readTemperature();
+  float humidity = dht.readHumidity();
 
-    cachedDhtOk = !(isnan(temp) || isnan(humidity));
-    if (cachedDhtOk) {
-      cachedTemp = temp;
-      cachedHumidity = humidity;
-    } else {
-      cachedTemp = -1;
-      cachedHumidity = -1;
-    }
+  bool dhtOk = !(isnan(temp) || isnan(humidity));
+
+  if (!dhtOk) {
+    temp = -1;
+    humidity = -1;
   }
 
   String data = "{";
@@ -258,167 +348,26 @@ void updateSensors() {
   data += "\"waterDetected\":" + String(waterValue > waterThreshold ? "true" : "false") + ",";
   data += "\"mq3\":" + String(mq3Value) + ",";
   data += "\"mq135\":" + String(mq135Value) + ",";
-  data += "\"temperature\":" + String(cachedTemp, 2) + ",";
-  data += "\"humidity\":" + String(cachedHumidity, 2) + ",";
-  data += "\"dhtOk\":" + String(cachedDhtOk ? "true" : "false") + ",";
+  data += "\"temperature\":" + String(temp, 2) + ",";
+  data += "\"humidity\":" + String(humidity, 2) + ",";
+  data += "\"dhtOk\":" + String(dhtOk ? "true" : "false") + ",";
   data += "\"belt\":" + String(beltRunning ? 1 : 0) + ",";
-  data += "\"beltRunning\":" + String(beltRunning ? "true" : "false") + ",";
   data += "\"x\":" + String(currentX) + ",";
   data += "\"y\":" + String(currentY) + ",";
-  data += "\"z\":" + String(currentZ) + ",";
-  data += "\"irCamera\":" + String(irStartDetected() ? "true" : "false") + ",";
-  data += "\"irLifter\":" + String(irEndDetected() ? "true" : "false") + ",";
-  data += "\"loc8Detected\":" + String(locationDetected(8) ? "true" : "false") + ",";
-  data += "\"loc9Detected\":" + String(locationDetected(9) ? "true" : "false") + ",";
-  data += "\"atStartingPoint\":" + String(atStartingPoint() ? "true" : "false") + ",";
-  data += "\"busy\":" + String(motionBusy ? "true" : "false") + ",";
-  data += "\"lifterBusy\":" + String(motionBusy ? "true" : "false");
+  data += "\"z\":" + String(currentZ);
   data += "}";
 
   Serial.println(data);
   Serial1.println(data);
 }
 
-// ================= COMMANDS =================
-
-void handleCommand(String cmd, Stream &replyPort) {
-  if (cmd == "HELP") {
-    printHelp();
-  }
-
-  else if (cmd == "AUTO") {
-    autoMode = true;
-    reply(replyPort, "OK AUTO STARTED");
-  }
-
-  else if (cmd == "STOP") {
-    autoMode = false;
-    beltStop();
-    reply(replyPort, "OK AUTO STOPPED");
-  }
-
-  else if (cmd == "HOME" || cmd == "H") {
-    autoMode = false;
-    if (homeAll()) {
-      reply(replyPort, "DONE:HOME");
-    } else {
-      reply(replyPort, lastMotionError);
-    }
-  }
-
-  else if (cmd == "START" || cmd == "S") {
-    beltStop();
-    if (goStartingPoint()) {
-      reply(replyPort, "DONE:START");
-    } else {
-      reply(replyPort, lastMotionError);
-    }
-  }
-
-  else if (cmd == "BELT") {
-    beltToggle();
-    reply(replyPort, "DONE:BELT");
-  }
-
-  else if (cmd == "BELT_START") {
-    logBoth("[BELT_START]");
-    beltStart();
-    reply(replyPort, "DONE:BELT_START");
-  }
-
-  else if (cmd == "BELT_STOP") {
-    logBoth("[BELT_STOP]");
-    beltStop();
-    reply(replyPort, "DONE:BELT_STOP");
-  }
-
-  else if (cmd.startsWith("BELT_RUN_MS ")) {
-    unsigned long durationMs = cmd.substring(12).toInt();
-    if (durationMs <= 0 || durationMs > 10000) {
-      reply(replyPort, "ERROR BAD BELT_RUN_MS");
-    } else {
-      beltRunMs(durationMs);
-      reply(replyPort, "DONE:BELT_RUN_MS");
-    }
-  }
-
-  else if (cmd == "DROP_TO_LIFTER") {
-    beltRunMs(DROP_TO_LIFTER_DELAY_MS);
-    reply(replyPort, "DONE:DROP_TO_LIFTER");
-  }
-
-  else if (cmd == "DISPENSE" || cmd == "D") {
-    dispenseOne();
-    reply(replyPort, "DONE:DISPENSE");
-  }
-
-  else if (cmd == "SCAN" || cmd == "CAMERA" || cmd == "CAMERA_SCAN") {
-    sendCameraScan();
-    reply(replyPort, "DONE:SCAN");
-  }
-
-  else if (cmd == "STATUS") {
-    sendStatusJson(replyPort);
-    reply(replyPort, "DONE:STATUS");
-  }
-
-  else if (cmd == "TESTIR") {
-    testIRs();
-    reply(replyPort, "DONE:TESTIR");
-  }
-
-  else if (cmd == "TESTLIM") {
-    testLimits();
-    reply(replyPort, "DONE:TESTLIM");
-  }
-
-  else if (cmd == "ULTRA") {
-    sendUltraJson(replyPort);
-    reply(replyPort, "DONE:ULTRA");
-  }
-
-  else if (cmd.startsWith("VERIFY_LOCATION ")) {
-    int locationId = cmd.substring(16).toInt();
-    if (locationId == 8 || locationId == 9) {
-      logBoth("[VERIFY] LOCATION " + String(locationId));
-      sendVerifyLocationJson(replyPort, locationId);
-      reply(replyPort, "DONE:VERIFY_LOCATION");
-    } else {
-      logBoth("[ERROR] BAD VERIFY_LOCATION");
-      reply(replyPort, "ERROR BAD VERIFY_LOCATION");
-    }
-  }
-
-  else if (cmd.startsWith("GO ")) {
-    int n = cmd.substring(3).toInt();
-
-    if (n >= 1 && n <= 18) {
-      logBoth("[GO] " + String(n));
-      if (goPosition(n)) {
-        logBoth("[DONE] " + String(n));
-        reply(replyPort, "DONE:" + String(n));
-      } else {
-        logBoth("[ERROR] " + lastMotionError);
-        reply(replyPort, lastMotionError);
-      }
-    } else {
-      logBoth("[ERROR] BAD POSITION");
-      reply(replyPort, "ERROR BAD POSITION");
-    }
-  }
-
-  else {
-    reply(replyPort, "ERROR UNKNOWN COMMAND");
-  }
-}
-
 // ================= AUTO SEQUENCE =================
 
 void runAutoCycle() {
-  logBoth("AUTO: DISPENSE");
+  Serial.println("AUTO: DISPENSE");
   dispenseOne();
 
-  logBoth("AUTO: BELT TOGGLE ON");
+  Serial.println("AUTO: BELT TOGGLE ON");
   beltToggle();
 
   while (!irStartDetected()) {
@@ -428,7 +377,7 @@ void runAutoCycle() {
     if (!autoMode) return;
   }
 
-  logBoth("AUTO: START IR DETECTED");
+  Serial.println("AUTO: START IR DETECTED");
 
   while (!irEndDetected()) {
     updateSensors();
@@ -437,15 +386,15 @@ void runAutoCycle() {
     if (!autoMode) return;
   }
 
-  logBoth("AUTO: END IR DETECTED");
+  Serial.println("AUTO: END IR DETECTED");
 
-  logBoth("AUTO: BELT TOGGLE OFF");
+  Serial.println("AUTO: BELT TOGGLE OFF");
   beltToggle();
 
   sendCameraScan();
 
-  logBoth("AUTO: WAITING RPI RESULT");
-  logBoth("RPI SEND: GO 1 TO GO 18");
+  Serial.println("AUTO: WAITING RPI RESULT");
+  Serial.println("RPI SEND: SITE 1 TO SITE 9");
 
   autoMode = false;
 }
@@ -461,31 +410,7 @@ void relayPulse() {
 void beltToggle() {
   relayPulse();
   beltRunning = !beltRunning;
-  logBoth(beltRunning ? "BELT STATE = ON" : "BELT STATE = OFF");
-}
-
-void beltStart() {
-  if (!beltRunning) {
-    beltToggle();
-  }
-}
-
-void beltStop() {
-  if (beltRunning) {
-    beltToggle();
-  }
-}
-
-void beltRunMs(unsigned long durationMs) {
-  beltStart();
-  unsigned long startedAt = millis();
-  while (millis() - startedAt < durationMs) {
-    updateSensors();
-    readCommandFrom(Serial);
-    readCommandFrom(Serial1);
-    delay(5);
-  }
-  beltStop();
+  Serial.println(beltRunning ? "BELT STATE = ON" : "BELT STATE = OFF");
 }
 
 bool irStartDetected() {
@@ -510,7 +435,7 @@ void dispenseOne() {
 // ================= CAMERA =================
 
 void sendCameraScan() {
-  logBoth("CAMERA_SCAN");
+  Serial.println("CAMERA_SCAN");
 }
 
 // ================= LOCATION IR MUX =================
@@ -524,12 +449,6 @@ bool readLocationIR(byte channel) {
   delayMicroseconds(50);
 
   return digitalRead(LOC_MUX_OUT) == IR_DETECTED_STATE;
-}
-
-bool locationDetected(int locationId) {
-  if (locationId == 8) return readLocationIR(0);
-  if (locationId == 9) return readLocationIR(1);
-  return false;
 }
 
 void printLocationIRs() {
@@ -548,33 +467,25 @@ void printLocationIRs() {
 
 // ================= POSITIONS =================
 
-bool goStartingPoint() {
-  lastMotionError = "";
-  motionBusy = true;
-  logBoth("GO STARTING POINT");
+void goStartingPoint() {
+  Serial.println("GO STARTING POINT");
 
-  if (!moveToXYZ(
+  moveToXYZ(
     STARTING_POINT.x,
     STARTING_POINT.y,
     STARTING_POINT.z
-  )) {
-    motionBusy = false;
-    return false;
-  }
+  );
 
   currentPositionIndex = -1;
-  logBoth("DONE STARTING POINT");
-  motionBusy = false;
-  return true;
+  Serial.println("DONE STARTING POINT");
 }
 
-bool goPosition(int n) {
-  lastMotionError = "";
-  motionBusy = true;
-  logBoth("GO POSITION " + String(n));
+void goPosition(int n) {
+  Serial.print("GO POSITION ");
+  Serial.println(n);
 
   if (isSamePairInOut(currentPositionIndex, n)) {
-    logBoth("SAME PAIR IN/OUT - NO Z HOME");
+    Serial.println("SAME SITE IN/OUT - NO Z HOME");
 
     moveDirectXYThenZ(
       positions[n - 1].x,
@@ -582,21 +493,17 @@ bool goPosition(int n) {
       positions[n - 1].z
     );
   } else {
-    if (!moveToXYZ(
+    moveToXYZ(
       positions[n - 1].x,
       positions[n - 1].y,
       positions[n - 1].z
-    )) {
-      motionBusy = false;
-      return false;
-    }
+    );
   }
 
   currentPositionIndex = n;
 
-  logBoth("DONE POSITION " + String(n));
-  motionBusy = false;
-  return true;
+  Serial.print("DONE POSITION ");
+  Serial.println(n);
 }
 
 bool isSamePairInOut(int currentPos, int targetPos) {
@@ -611,21 +518,18 @@ bool isSamePairInOut(int currentPos, int targetPos) {
 
 // ================= MOVE LOGIC =================
 
-bool moveToXYZ(long targetX, long targetY, long targetZ) {
+void moveToXYZ(long targetX, long targetY, long targetZ) {
   targetX = constrain(targetX, 0, MAX_X_STEPS);
   targetY = constrain(targetY, 0, MAX_Y_STEPS);
   targetZ = constrain(targetZ, 0, MAX_Z_STEPS);
 
-  if (!moveZToSafeHome()) {
-    return false;
-  }
+  moveZToSafeHome();
 
   moveAxisTo('X', targetX);
   moveAxisTo('Y', targetY);
   moveAxisTo('Z', targetZ);
 
   printCurrent();
-  return true;
 }
 
 void moveDirectXYThenZ(long targetX, long targetY, long targetZ) {
@@ -640,27 +544,18 @@ void moveDirectXYThenZ(long targetX, long targetY, long targetZ) {
   printCurrent();
 }
 
-bool moveZToSafeHome() {
-  logBoth("Z SAFE HOME D26...");
+void moveZToSafeHome() {
+  Serial.println("Z SAFE HOME D26...");
 
   digitalWrite(Z_DIR, HIGH);
 
-  long steps = 0;
   while (!zSafeLimitPressed()) {
     updateSensors();
     pulse(Z_PUL, Z_DELAY);
-    steps++;
-
-    if (steps > MAX_HOME_Z_STEPS) {
-      lastMotionError = "ERROR_HOME_Z";
-      logBoth(lastMotionError);
-      return false;
-    }
   }
 
   currentZ = 0;
-  logBoth("Z SAFE DONE");
-  return true;
+  Serial.println("Z SAFE DONE");
 }
 
 void moveAxisTo(char axis, long target) {
@@ -723,84 +618,53 @@ void moveAxisTo(char axis, long target) {
 
 // ================= HOMING =================
 
-bool homeAll() {
-  lastMotionError = "";
-
-  if (!homeZ()) return false;
-  if (!homeX()) return false;
-  if (!homeY()) return false;
-
+void homeAll() {
+  homeZ();
+  homeX();
+  homeY();
   printCurrent();
-  return true;
 }
 
-bool homeZ() {
-  logBoth("HOMING Z D26...");
+void homeZ() {
+  Serial.println("HOMING Z D26...");
 
   digitalWrite(Z_DIR, HIGH);
 
-  long steps = 0;
   while (!zSafeLimitPressed()) {
     updateSensors();
     pulse(Z_PUL, Z_DELAY);
-    steps++;
-
-    if (steps > MAX_HOME_Z_STEPS) {
-      lastMotionError = "ERROR_HOME_Z";
-      logBoth(lastMotionError);
-      return false;
-    }
   }
 
   currentZ = 0;
-  logBoth("Z HOME DONE");
-  return true;
+  Serial.println("Z HOME DONE");
 }
 
-bool homeX() {
-  logBoth("HOMING X...");
+void homeX() {
+  Serial.println("HOMING X...");
 
   digitalWrite(X_DIR, HIGH);
 
-  long steps = 0;
   while (!xLimitPressed()) {
     updateSensors();
     pulse(X_PUL, X_DELAY);
-    steps++;
-
-    if (steps > MAX_HOME_X_STEPS) {
-      lastMotionError = "ERROR_HOME_X";
-      logBoth(lastMotionError);
-      return false;
-    }
   }
 
   currentX = 0;
-  logBoth("X HOME DONE");
-  return true;
+  Serial.println("X HOME DONE");
 }
 
-bool homeY() {
-  logBoth("HOMING Y...");
+void homeY() {
+  Serial.println("HOMING Y...");
 
   digitalWrite(Y_DIR, HIGH);
 
-  long steps = 0;
   while (!yLimitPressed()) {
     updateSensors();
     pulse(Y_PUL, Y_DELAY);
-    steps++;
-
-    if (steps > MAX_HOME_Y_STEPS) {
-      lastMotionError = "ERROR_HOME_Y";
-      logBoth(lastMotionError);
-      return false;
-    }
   }
 
   currentY = 0;
-  logBoth("Y HOME DONE");
-  return true;
+  Serial.println("Y HOME DONE");
 }
 
 // ================= LIMITS =================
@@ -897,58 +761,6 @@ void printStatus() {
   printCurrent();
 }
 
-bool atStartingPoint() {
-  return currentX == STARTING_POINT.x && currentY == STARTING_POINT.y && currentZ == STARTING_POINT.z;
-}
-
-bool ultrasonicReady(float cm) {
-  return cm > 0 && cm <= ULTRASONIC_READY_MAX_CM;
-}
-
-String statusJson() {
-  String data = "{";
-  data += "\"belt\":" + String(beltRunning ? 1 : 0) + ",";
-  data += "\"beltRunning\":" + String(beltRunning ? "true" : "false") + ",";
-  data += "\"irCamera\":" + String(irStartDetected() ? "true" : "false") + ",";
-  data += "\"irLifter\":" + String(irEndDetected() ? "true" : "false") + ",";
-  data += "\"ultrasonicCm\":" + String(lastUltrasonicCm, 2) + ",";
-  data += "\"ultrasonicReady\":" + String(lastUltrasonicReady ? "true" : "false") + ",";
-  data += "\"loc8Detected\":" + String(locationDetected(8) ? "true" : "false") + ",";
-  data += "\"loc9Detected\":" + String(locationDetected(9) ? "true" : "false") + ",";
-  data += "\"x\":" + String(currentX) + ",";
-  data += "\"y\":" + String(currentY) + ",";
-  data += "\"z\":" + String(currentZ) + ",";
-  data += "\"atStartingPoint\":" + String(atStartingPoint() ? "true" : "false") + ",";
-  data += "\"busy\":" + String(motionBusy ? "true" : "false") + ",";
-  data += "\"lifterBusy\":" + String(motionBusy ? "true" : "false");
-  data += "}";
-  return data;
-}
-
-void sendStatusJson(Stream &replyPort) {
-  reply(replyPort, statusJson());
-}
-
-void sendUltraJson(Stream &replyPort) {
-  float cm = readAverageDistanceCM();
-  lastUltrasonicCm = cm;
-  lastUltrasonicReady = ultrasonicReady(cm);
-  String data = "{";
-  data += "\"ultrasonicCm\":" + String(cm, 2) + ",";
-  data += "\"ultrasonicReady\":" + String(lastUltrasonicReady ? "true" : "false");
-  data += "}";
-  reply(replyPort, data);
-}
-
-void sendVerifyLocationJson(Stream &replyPort, int locationId) {
-  bool detected = locationDetected(locationId);
-  String data = "{";
-  data += "\"locationId\":" + String(locationId) + ",";
-  data += "\"detected\":" + String(detected ? "true" : "false");
-  data += "}";
-  reply(replyPort, data);
-}
-
 void testIRs() {
   Serial.print("IR START D40 = ");
   Serial.println(digitalRead(IR_START_PIN));
@@ -982,36 +794,15 @@ void printHelp() {
   Serial.println("STOP");
   Serial.println("HOME / H");
   Serial.println("START / S");
-  Serial.println("BELT");
-  Serial.println("BELT_START");
-  Serial.println("BELT_STOP");
-  Serial.println("BELT_RUN_MS 1200");
-  Serial.println("DROP_TO_LIFTER");
+  Serial.println("BELT_START / BON = TOGGLE");
+  Serial.println("BELT_STOP / BOFF = TOGGLE");
+  Serial.println("BELT / B = TOGGLE");
   Serial.println("DISPENSE / D");
   Serial.println("CAMERA / SCAN");
+  Serial.println("SITE 1 to SITE 9");
   Serial.println("GO 1 to GO 18");
   Serial.println("STATUS");
-  Serial.println("VERIFY_LOCATION 8/9");
   Serial.println("TESTIR");
   Serial.println("TESTLIM");
   Serial.println("ULTRA");
-}
-
-void logBoth(String message) {
-  Serial.println(message);
-  Serial1.println(message);
-}
-
-void reply(Stream &port, String message) {
-  Stream *target = &port;
-
-  port.println(message);
-
-  if (target != (Stream *)&Serial) {
-    Serial.println(message);
-  }
-
-  if (target != (Stream *)&Serial1) {
-    Serial1.println(message);
-  }
 }

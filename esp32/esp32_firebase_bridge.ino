@@ -12,8 +12,8 @@
 // =====================================================
 
 // ===================== WIFI =====================
-const char* ssid = "T";
-const char* password = "0598101446";
+const char* ssid = "GP";
+const char* password = "123456789";
 
 // ===================== FIRESTORE REST =====================
 const char* FIREBASE_API_KEY = "AIzaSyBVgBcp5ouNM_ycz0A5dxHlySN_IuZ2CJo";
