@@ -1,6 +1,9 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
 
 // =====================================================
 // MakhzanXpert - ESP32 HTTP Bridge
@@ -11,6 +14,15 @@
 // ===================== WIFI =====================
 const char* ssid = "T";
 const char* password = "0598101446";
+
+// ===================== FIRESTORE REST =====================
+const char* FIREBASE_API_KEY = "AIzaSyBVgBcp5ouNM_ycz0A5dxHlySN_IuZ2CJo";
+const char* FIREBASE_PROJECT_ID = "makhzanxpert";
+const char* DEVICE_ID = "esp-main-01";
+
+#define FIRESTORE_DEVICE_INTERVAL_MS 5000
+#define FIRESTORE_SENSOR_SNAPSHOT_INTERVAL_MS 30000
+#define FIRESTORE_ACTIVITY_MIN_INTERVAL_MS 1500
 
 // ===================== SERIAL TO ARDUINO MEGA =====================
 // ESP32 RXD2 receives from Arduino TX
@@ -31,6 +43,9 @@ String lastErrorLine = "";
 
 unsigned long lastArduinoSeenAt = 0;
 unsigned long commandCounter = 0;
+unsigned long lastFirestoreDeviceAt = 0;
+unsigned long lastFirestoreSnapshotAt = 0;
+unsigned long lastFirestoreActivityAt = 0;
 
 StaticJsonDocument<1024> latestStatus;
 
@@ -56,6 +71,29 @@ void connectWiFi() {
   Serial.println(WiFi.localIP());
 }
 
+String getTimestamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 1000)) {
+    return "1970-01-01T00:00:00Z";
+  }
+
+  char buffer[25];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+  return String(buffer);
+}
+
+bool waitForTimeSync(unsigned long timeoutMs = 8000) {
+  unsigned long start = millis();
+  struct tm timeinfo;
+  while (millis() - start < timeoutMs) {
+    if (getLocalTime(&timeinfo, 1000) && timeinfo.tm_year >= 120) {
+      return true;
+    }
+    delay(250);
+  }
+  return false;
+}
+
 void addCors() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -73,6 +111,206 @@ String jsonEscape(String s) {
   s.replace("\n", "\\n");
   s.replace("\r", "");
   return s;
+}
+
+String firestoreUrl(String path) {
+  return "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) +
+    "/databases/(default)/documents/" + path + "?key=" + String(FIREBASE_API_KEY);
+}
+
+String firestoreStringValue(String value) {
+  return "{\"stringValue\":\"" + jsonEscape(value) + "\"}";
+}
+
+String firestoreTimestampValue(String value) {
+  return "{\"timestampValue\":\"" + value + "\"}";
+}
+
+String firestoreBoolValue(bool value) {
+  return String("{\"booleanValue\":") + (value ? "true" : "false") + "}";
+}
+
+String firestoreIntValue(long value) {
+  return "{\"integerValue\":\"" + String(value) + "\"}";
+}
+
+String firestoreDoubleValue(double value) {
+  return "{\"doubleValue\":" + String(value, 3) + "}";
+}
+
+String firestoreJsonValue(JsonVariant value) {
+  if (value.is<bool>()) return firestoreBoolValue(value.as<bool>());
+  if (value.is<int>()) return firestoreIntValue(value.as<int>());
+  if (value.is<long>()) return firestoreIntValue(value.as<long>());
+  if (value.is<float>()) return firestoreDoubleValue(value.as<float>());
+  if (value.is<double>()) return firestoreDoubleValue(value.as<double>());
+  return firestoreStringValue(value.as<String>());
+}
+
+void appendFirestoreField(String& fields, bool& first, String name, String encodedValue) {
+  if (!first) fields += ",";
+  first = false;
+  fields += "\"" + name + "\":" + encodedValue;
+}
+
+bool firestoreSend(String method, String url, String body, int* statusCode = nullptr) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  int code = -1;
+  if (method == "PATCH") {
+    code = http.PATCH(body);
+  } else if (method == "POST") {
+    code = http.POST(body);
+  } else {
+    code = http.GET();
+  }
+
+  if (statusCode) *statusCode = code;
+  if (code < 200 || code >= 300) {
+    Serial.print("[FIRESTORE_UPDATE] FAILED ");
+    Serial.print(code);
+    Serial.print(" ");
+    Serial.println(http.getString());
+    http.end();
+    return false;
+  }
+
+  http.end();
+  return true;
+}
+
+String fireStatusFromLatest() {
+  int mq3 = latestStatus["mq3"] | 0;
+  int mq135 = latestStatus["mq135"] | 0;
+  float temperature = latestStatus["temperature"] | -1.0;
+  bool gasWarning = mq3 >= 1500 || mq135 >= 1500;
+  bool gasAlert = mq3 >= 2500 || mq135 >= 2500;
+  bool highTemperature = temperature >= 45.0;
+
+  if (gasAlert || (gasWarning && highTemperature)) return "Fire Alert";
+  if (gasWarning || highTemperature) return "Warning";
+  return "Normal";
+}
+
+String fireRiskFromStatus(String fireStatus) {
+  if (fireStatus == "Fire Alert") return "High";
+  if (fireStatus == "Warning") return "Medium";
+  return "Low";
+}
+
+String buildHardwareFields(String timestampValue, bool includeCreatedAt) {
+  String fields = "";
+  bool first = true;
+
+  appendFirestoreField(fields, first, "deviceId", firestoreStringValue(DEVICE_ID));
+  appendFirestoreField(fields, first, "source", firestoreStringValue("esp32"));
+  appendFirestoreField(fields, first, "sourceDevice", firestoreStringValue("esp32"));
+  appendFirestoreField(fields, first, "espIp", firestoreStringValue(WiFi.localIP().toString()));
+  appendFirestoreField(fields, first, "wifiRssi", firestoreIntValue(WiFi.RSSI()));
+  appendFirestoreField(fields, first, "arduinoOnline", firestoreBoolValue((millis() - lastArduinoSeenAt) < 5000));
+  appendFirestoreField(fields, first, "arduinoSeenMsAgo", firestoreIntValue(millis() - lastArduinoSeenAt));
+  appendFirestoreField(fields, first, "lastArduinoLine", firestoreStringValue(lastArduinoLine));
+  appendFirestoreField(fields, first, "lastDoneLine", firestoreStringValue(lastDoneLine));
+  appendFirestoreField(fields, first, "lastErrorLine", firestoreStringValue(lastErrorLine));
+
+  if (latestStatusValid) {
+    for (JsonPair kv : latestStatus.as<JsonObject>()) {
+      appendFirestoreField(fields, first, String(kv.key().c_str()), firestoreJsonValue(kv.value()));
+    }
+  }
+
+  if (!latestStatus.containsKey("beltRunning") && latestStatus.containsKey("belt")) {
+    appendFirestoreField(fields, first, "beltRunning", firestoreBoolValue((int)(latestStatus["belt"] | 0) == 1));
+  }
+  if (!latestStatus.containsKey("lifterBusy") && latestStatus.containsKey("busy")) {
+    appendFirestoreField(fields, first, "lifterBusy", firestoreBoolValue((bool)(latestStatus["busy"] | false)));
+  }
+
+  String fireStatus = fireStatusFromLatest();
+  appendFirestoreField(fields, first, "fireStatus", firestoreStringValue(fireStatus));
+  appendFirestoreField(fields, first, "fireRisk", firestoreStringValue(fireRiskFromStatus(fireStatus)));
+  appendFirestoreField(fields, first, "gasStatus", firestoreStringValue(fireStatus));
+  appendFirestoreField(fields, first, "environmentStatus", firestoreStringValue("Online"));
+  appendFirestoreField(fields, first, "status", firestoreStringValue("online"));
+  appendFirestoreField(fields, first, "lastSeen", firestoreTimestampValue(timestampValue));
+  appendFirestoreField(fields, first, "updatedAt", firestoreTimestampValue(timestampValue));
+  if (includeCreatedAt) {
+    appendFirestoreField(fields, first, "createdAt", firestoreTimestampValue(timestampValue));
+  }
+
+  return fields;
+}
+
+void publishSystemActivity(String activityType, String message, bool throttle = true) {
+  if (throttle && millis() - lastFirestoreActivityAt < FIRESTORE_ACTIVITY_MIN_INTERVAL_MS) {
+    return;
+  }
+  lastFirestoreActivityAt = millis();
+
+  String ts = getTimestamp();
+  String fields = "";
+  bool first = true;
+  appendFirestoreField(fields, first, "type", firestoreStringValue(activityType));
+  appendFirestoreField(fields, first, "activityType", firestoreStringValue(activityType));
+  appendFirestoreField(fields, first, "message", firestoreStringValue(message));
+  appendFirestoreField(fields, first, "source", firestoreStringValue("esp32"));
+  appendFirestoreField(fields, first, "sourceDevice", firestoreStringValue("esp32"));
+  appendFirestoreField(fields, first, "deviceId", firestoreStringValue(DEVICE_ID));
+  appendFirestoreField(fields, first, "status", firestoreStringValue("info"));
+  appendFirestoreField(fields, first, "createdAt", firestoreTimestampValue(ts));
+
+  String body = "{\"fields\":{" + fields + "}}";
+  if (firestoreSend("POST", firestoreUrl("systemActivity"), body)) {
+    Serial.println("[FIRESTORE_UPDATE] systemActivity");
+  }
+}
+
+void publishHardwareStatus(bool forceDevice = false, bool forceSnapshot = false) {
+  bool deviceDue = forceDevice || millis() - lastFirestoreDeviceAt >= FIRESTORE_DEVICE_INTERVAL_MS;
+  bool snapshotDue = forceSnapshot || millis() - lastFirestoreSnapshotAt >= FIRESTORE_SENSOR_SNAPSHOT_INTERVAL_MS;
+
+  if (!deviceDue && !snapshotDue) {
+    return;
+  }
+
+  String ts = getTimestamp();
+  bool sensorOk = false;
+  bool latestOk = false;
+  bool deviceOk = false;
+
+  if (snapshotDue) {
+    lastFirestoreSnapshotAt = millis();
+    String snapshotFields = buildHardwareFields(ts, true);
+    String sensorBody = "{\"fields\":{" + snapshotFields + "}}";
+    sensorOk = firestoreSend("POST", firestoreUrl("sensorReadings"), sensorBody);
+  }
+
+  if (deviceDue) {
+    lastFirestoreDeviceAt = millis();
+    String latestFields = buildHardwareFields(ts, true);
+    String deviceFields = buildHardwareFields(ts, false);
+    String latestBody = "{\"fields\":{" + latestFields + "}}";
+    String deviceBody = "{\"fields\":{" + deviceFields + "}}";
+
+    latestOk = firestoreSend("PATCH", firestoreUrl("sensorReadings/latest"), latestBody);
+    deviceOk = firestoreSend("PATCH", firestoreUrl("devices/" + String(DEVICE_ID)), deviceBody);
+  }
+
+  if (sensorOk || latestOk || deviceOk) {
+    Serial.print("[FIRESTORE_UPDATE] ");
+    Serial.print(deviceDue ? "devices/latest" : "");
+    Serial.println(snapshotDue ? " sensorReadings" : "");
+  }
 }
 
 String makeBasicResponse(bool ok, String message = "") {
@@ -107,6 +345,7 @@ void updateLatestStatusFromJson(String line) {
   }
   latestStatusValid = true;
   lastJsonLine = line;
+  publishHardwareStatus(false);
 }
 
 void readArduinoSerial() {
@@ -128,10 +367,14 @@ void readArduinoSerial() {
       Serial.print("[ARDUINO_RESPONSE] ");
       Serial.println(line);
       lastDoneLine = line;
+      publishSystemActivity("ARDUINO_RESPONSE", line, false);
+      publishHardwareStatus(true);
     } else if (line.startsWith("ERROR:")) {
       Serial.print("[ARDUINO_RESPONSE] ");
       Serial.println(line);
       lastErrorLine = line;
+      publishSystemActivity("ARDUINO_RESPONSE", line, false);
+      publishHardwareStatus(true);
     }
   }
 }
@@ -140,6 +383,7 @@ void sendToArduino(String command) {
   command.trim();
   Serial.print("[COMMAND_FORWARDED] ");
   Serial.println(command);
+  publishSystemActivity("COMMAND_FORWARDED", command, false);
   Serial.print("Sending to Arduino: ");
   Serial.println(command);
 
@@ -578,9 +822,15 @@ void setup() {
   Serial2.begin(ARDUINO_BAUD, SERIAL_8N1, RXD2, TXD2);
 
   connectWiFi();
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  if (!waitForTimeSync()) {
+    Serial.println("[FIRESTORE_UPDATE] Time sync failed; timestamps will use fallback until NTP syncs.");
+  }
 
   setupRoutes();
   server.begin();
+  publishSystemActivity("ESP32_BOOT", "ESP32 bridge online.", false);
+  publishHardwareStatus(true, true);
 
   Serial.println("ESP32 Bridge Ready");
   Serial.println("Routes:");
@@ -599,6 +849,7 @@ void setup() {
 void loop() {
   server.handleClient();
   readArduinoSerial();
+  publishHardwareStatus(false);
 
   // Reconnect WiFi if disconnected
   static unsigned long lastWifiCheck = 0;
@@ -609,6 +860,8 @@ void loop() {
       Serial.println("WiFi disconnected. Reconnecting...");
       WiFi.disconnect();
       WiFi.begin(ssid, password);
+    } else {
+      publishHardwareStatus(false);
     }
   }
 }
