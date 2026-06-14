@@ -21,10 +21,13 @@ export const VALID_SORTING_STRATEGIES = new Set([
   'brand_size',
   'color_size',
   'model_size',
+  'sku_exact',
+  'smart_auto',
 ]);
 
 const ESP_DEVICE_ID = 'esp-main-01';
 const TOTAL_LOCATIONS = 9;
+const SORT_PATH = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 const BELT_MOVE_COMMAND = 'BELT_RUN_UNTIL_IR_LAST';
 const PROCESSABLE_STATUS = 'CONFIRMED';
 const PROCESSED_STATUSES = new Set(['ASSIGNED', 'COMMAND_CREATED', 'PROCESSING', 'STORED', 'DONE', 'ERROR']);
@@ -39,16 +42,6 @@ const NEIGHBORS = {
   7: [4, 8],
   8: [5, 7, 9],
   9: [6, 8],
-};
-
-const STRATEGY_WEIGHTS = {
-  brand: { brand: 10 },
-  model: { model: 10 },
-  color: { color: 10 },
-  size: { size: 10 },
-  brand_size: { brand: 10, size: 7 },
-  color_size: { color: 10, size: 7 },
-  model_size: { model: 10, size: 7 },
 };
 
 function normalize(value) {
@@ -96,20 +89,291 @@ function isEmptyLocation(location, fallbackId) {
   const status = String(location.status || '').trim().toLowerCase();
   if (!Number.isInteger(id) || id < 1 || id > TOTAL_LOCATIONS) return false;
   if (status === 'reserved' || status === 'full') return false;
-  return (status === '' || status === 'empty') && !isRejectedByOccupiedFlag(location);
+  return (status === '' || status === 'empty') && !isRejectedByOccupiedFlag(location) && location?.reserved !== true;
 }
 
-function scoreNeighbor(scan, neighbor, sortingMode) {
-  const weights = STRATEGY_WEIGHTS[sortingMode] || {};
-  return Object.entries(weights).reduce((score, [field, weight]) => {
-    return normalize(scan[field]) && normalize(scan[field]) === normalize(neighbor[field]) ? score + weight : score;
-  }, 0);
+function isFullLocation(location) {
+  return (
+    String(location?.status || '').trim().toLowerCase() === 'full' &&
+    (location?.occupied === true || location?.isOccupied === true)
+  );
 }
 
-function scoreLocation(scan, locationsById, locationId, sortingMode) {
-  return (NEIGHBORS[locationId] || []).reduce((score, neighborId) => {
-    return score + scoreNeighbor(scan, locationsById.get(neighborId) || {}, sortingMode);
-  }, 0);
+function getSortPath() {
+  return SORT_PATH;
+}
+
+function getLocationIndex(locationNumber) {
+  return getSortPath().indexOf(Number(locationNumber));
+}
+
+function getEmptyCandidateLocations(locations) {
+  return getSortPath().filter((locationId) => isEmptyLocation(locations.get(locationId), locationId));
+}
+
+function getFullLocations(locations) {
+  return getSortPath()
+    .map((locationId) => ({ locationId, ...(locations.get(locationId) || {}) }))
+    .filter(isFullLocation);
+}
+
+function getAdjacentLocations(locationNumber) {
+  const path = getSortPath();
+  const index = getLocationIndex(locationNumber);
+  const logicalNeighbors = [
+    index > 0 ? path[index - 1] : null,
+    index >= 0 && index < path.length - 1 ? path[index + 1] : null,
+  ].filter(Boolean);
+  return Array.from(new Set([...(NEIGHBORS[locationNumber] || []), ...logicalNeighbors]));
+}
+
+function getNearestFullBefore(candidate, fullLocations) {
+  const candidateIndex = getLocationIndex(candidate);
+  return fullLocations
+    .filter((location) => getLocationIndex(location.locationId) < candidateIndex)
+    .sort((left, right) => getLocationIndex(right.locationId) - getLocationIndex(left.locationId))[0] || null;
+}
+
+function getNearestFullAfter(candidate, fullLocations) {
+  const candidateIndex = getLocationIndex(candidate);
+  return fullLocations
+    .filter((location) => getLocationIndex(location.locationId) > candidateIndex)
+    .sort((left, right) => getLocationIndex(left.locationId) - getLocationIndex(right.locationId))[0] || null;
+}
+
+function sizeNumber(value) {
+  const parsed = Number.parseFloat(String(value || '').replace(',', '.'));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function fieldMatches(product, location, field) {
+  if (field === 'normalizedSku' || field === 'sku') {
+    return normalize(product.normalizedSku || product.sku) && normalize(product.normalizedSku || product.sku) === normalize(location.normalizedSku || location.sku);
+  }
+  return normalize(product[field]) && normalize(product[field]) === normalize(location[field]);
+}
+
+function distanceInSortPath(left, right) {
+  return Math.abs(getLocationIndex(left) - getLocationIndex(right));
+}
+
+function nearestDistanceToLocations(candidate, locations) {
+  if (locations.length === 0) return TOTAL_LOCATIONS;
+  return Math.min(...locations.map((location) => distanceInSortPath(candidate, location.locationId)));
+}
+
+function centerDistance(locationId) {
+  return Math.abs(getLocationIndex(locationId) - getLocationIndex(5));
+}
+
+function scoreSizeOrder(candidate, product, locations) {
+  const fullLocations = Array.isArray(locations) ? locations : getFullLocations(locations);
+  const newSize = sizeNumber(product.size);
+  const details = {
+    candidate,
+    newSize,
+    previousFull: null,
+    nextFull: null,
+    sameSizeDistance: null,
+    orderPenalty: 0,
+    score: 0,
+  };
+
+  if (newSize === null) {
+    details.orderPenalty = -20;
+    details.score = -20;
+    return { score: details.score, details };
+  }
+
+  const previous = getNearestFullBefore(candidate, fullLocations);
+  const next = getNearestFullAfter(candidate, fullLocations);
+  const previousSize = previous ? sizeNumber(previous.size) : null;
+  const nextSize = next ? sizeNumber(next.size) : null;
+  let score = 0;
+
+  details.previousFull = previous ? { locationId: previous.locationId, size: previousSize } : null;
+  details.nextFull = next ? { locationId: next.locationId, size: nextSize } : null;
+
+  if (previousSize === null) score += 18;
+  else if (previousSize <= newSize) score += 40 - Math.min(16, Math.abs(newSize - previousSize) * 2);
+  else {
+    const penalty = 90 + Math.min(60, Math.abs(previousSize - newSize) * 5);
+    details.orderPenalty += penalty;
+    score -= penalty;
+  }
+
+  if (nextSize === null) score += 18;
+  else if (nextSize >= newSize) score += 40 - Math.min(16, Math.abs(nextSize - newSize) * 2);
+  else {
+    const penalty = 90 + Math.min(60, Math.abs(newSize - nextSize) * 5);
+    details.orderPenalty += penalty;
+    score -= penalty;
+  }
+
+  const sameSizeLocations = fullLocations.filter((location) => sizeNumber(location.size) === newSize);
+  if (sameSizeLocations.length > 0) {
+    const distance = nearestDistanceToLocations(candidate, sameSizeLocations);
+    const adjacentSameSize = getAdjacentLocations(candidate).some((locationId) => sameSizeLocations.some((location) => location.locationId === locationId));
+    details.sameSizeDistance = distance;
+    score += Math.max(0, 120 - distance * 18);
+    if (adjacentSameSize) score += 130;
+  }
+
+  details.score = score;
+  return { score, details };
+}
+
+function scoreCluster(candidate, product, locations, field) {
+  const fullLocations = Array.isArray(locations) ? locations : getFullLocations(locations);
+  const matchingLocations = fullLocations.filter((location) => fieldMatches(product, location, field));
+  const details = {
+    candidate,
+    field,
+    matchingLocations: matchingLocations.map((location) => location.locationId),
+    adjacentMatches: [],
+    nearestDistance: null,
+    score: 0,
+  };
+
+  if (matchingLocations.length === 0) return { score: 0, details };
+
+  const adjacentMatches = getAdjacentLocations(candidate).filter((locationId) => matchingLocations.some((location) => location.locationId === locationId));
+  const nearestDistance = nearestDistanceToLocations(candidate, matchingLocations);
+  let score = Math.max(0, 90 - nearestDistance * 14);
+
+  if (adjacentMatches.length > 0) score += 130 + adjacentMatches.length * 20;
+
+  details.adjacentMatches = adjacentMatches;
+  details.nearestDistance = nearestDistance;
+  details.score = score;
+  return { score, details };
+}
+
+function resolveSortingStrategy(product, fullLocations, strategy) {
+  if (strategy !== 'smart_auto') return strategy;
+  if (fullLocations.some((location) => fieldMatches(product, location, 'normalizedSku'))) return 'sku_exact';
+  if (fullLocations.some((location) => fieldMatches(product, location, 'model'))) return 'model_size';
+  if (fullLocations.some((location) => fieldMatches(product, location, 'brand'))) return 'brand_size';
+  if (fullLocations.some((location) => fieldMatches(product, location, 'color'))) return 'color_size';
+  return 'size';
+}
+
+function balancedEmptyScore(candidate, emptyCandidates) {
+  const centerScore = Math.max(0, 20 - centerDistance(candidate) * 4);
+  const spacingScore = emptyCandidates.length > 1 ? Math.max(0, 8 - Math.abs(getLocationIndex(candidate) - ((TOTAL_LOCATIONS - 1) / 2))) : 0;
+  return centerScore + spacingScore;
+}
+
+function scoreCandidate(candidate, product, locations, strategy, resolvedStrategy, emptyCandidates) {
+  const fullLocations = getFullLocations(locations);
+  const sizeScore = scoreSizeOrder(candidate, product, fullLocations);
+  const brandScore = scoreCluster(candidate, product, fullLocations, 'brand');
+  const modelScore = scoreCluster(candidate, product, fullLocations, 'model');
+  const colorScore = scoreCluster(candidate, product, fullLocations, 'color');
+  const skuScore = scoreCluster(candidate, product, fullLocations, 'normalizedSku');
+  let score = balancedEmptyScore(candidate, emptyCandidates);
+  const details = {
+    candidate,
+    requestedStrategy: strategy,
+    resolvedStrategy,
+    balancedScore: score,
+    size: sizeScore.details,
+    brand: brandScore.details,
+    model: modelScore.details,
+    color: colorScore.details,
+    sku: skuScore.details,
+    matchingClusterAdjacency: 0,
+  };
+
+  if (resolvedStrategy === 'size') {
+    score += sizeScore.score;
+    details.matchingClusterAdjacency = sizeScore.details.sameSizeDistance === 1 ? 1 : 0;
+  } else if (resolvedStrategy === 'brand') {
+    score += brandScore.score * 1.2;
+    details.matchingClusterAdjacency = brandScore.details.adjacentMatches.length;
+  } else if (resolvedStrategy === 'model') {
+    score += modelScore.score * 1.45 + brandScore.score * 0.25;
+    details.matchingClusterAdjacency = modelScore.details.adjacentMatches.length;
+  } else if (resolvedStrategy === 'color') {
+    score += colorScore.score * 1.25 + (fieldMatches(product, fullLocations.find((location) => colorScore.details.adjacentMatches.includes(location.locationId)) || {}, 'brand') ? 20 : 0);
+    details.matchingClusterAdjacency = colorScore.details.adjacentMatches.length;
+  } else if (resolvedStrategy === 'brand_size') {
+    const sameBrandLocations = fullLocations.filter((location) => fieldMatches(product, location, 'brand'));
+    const scopedSizeScore = scoreSizeOrder(candidate, product, sameBrandLocations.length ? sameBrandLocations : fullLocations);
+    score += brandScore.score * 1.35 + scopedSizeScore.score * 0.85;
+    if (sameBrandLocations.length > 0 && brandScore.score === 0) score -= 70;
+    if (sameBrandLocations.some((location) => sizeNumber(location.size) === sizeNumber(product.size)) && getAdjacentLocations(candidate).some((locationId) => sameBrandLocations.some((location) => location.locationId === locationId && sizeNumber(location.size) === sizeNumber(product.size)))) {
+      score += 120;
+    }
+    details.size = scopedSizeScore.details;
+    details.matchingClusterAdjacency = brandScore.details.adjacentMatches.length;
+  } else if (resolvedStrategy === 'color_size') {
+    const sameColorLocations = fullLocations.filter((location) => fieldMatches(product, location, 'color'));
+    const scopedSizeScore = scoreSizeOrder(candidate, product, sameColorLocations.length ? sameColorLocations : fullLocations);
+    score += colorScore.score * 1.35 + scopedSizeScore.score * 0.85;
+    if (sameColorLocations.length > 0 && colorScore.score === 0) score -= 70;
+    if (sameColorLocations.some((location) => sizeNumber(location.size) === sizeNumber(product.size)) && getAdjacentLocations(candidate).some((locationId) => sameColorLocations.some((location) => location.locationId === locationId && sizeNumber(location.size) === sizeNumber(product.size)))) {
+      score += 120;
+    }
+    details.size = scopedSizeScore.details;
+    details.matchingClusterAdjacency = colorScore.details.adjacentMatches.length;
+  } else if (resolvedStrategy === 'model_size') {
+    const sameModelLocations = fullLocations.filter((location) => fieldMatches(product, location, 'model'));
+    const scopedSizeScore = scoreSizeOrder(candidate, product, sameModelLocations.length ? sameModelLocations : fullLocations);
+    score += modelScore.score * 1.55 + brandScore.score * 0.3 + scopedSizeScore.score * 0.9;
+    if (sameModelLocations.length > 0 && modelScore.score === 0) score -= 80;
+    if (sameModelLocations.some((location) => sizeNumber(location.size) === sizeNumber(product.size)) && getAdjacentLocations(candidate).some((locationId) => sameModelLocations.some((location) => location.locationId === locationId && sizeNumber(location.size) === sizeNumber(product.size)))) {
+      score += 150;
+    }
+    details.size = scopedSizeScore.details;
+    details.matchingClusterAdjacency = modelScore.details.adjacentMatches.length;
+  } else if (resolvedStrategy === 'sku_exact') {
+    const sameSkuLocations = fullLocations.filter((location) => fieldMatches(product, location, 'normalizedSku'));
+    if (sameSkuLocations.length > 0) {
+      score += skuScore.score * 2.2;
+      if (skuScore.details.adjacentMatches.length > 0) score += 180;
+      details.matchingClusterAdjacency = skuScore.details.adjacentMatches.length;
+    } else {
+      const fallback = scoreCandidate(candidate, product, locations, strategy, 'model_size', emptyCandidates);
+      score += fallback.score;
+      details.fallback = fallback.details;
+      details.matchingClusterAdjacency = fallback.details.matchingClusterAdjacency;
+    }
+  }
+
+  details.finalScore = score;
+  return { locationId: candidate, score, details };
+}
+
+function chooseBestLocation(product, locations, strategy) {
+  const emptyCandidates = getEmptyCandidateLocations(locations);
+  const fullLocations = getFullLocations(locations);
+  const resolvedStrategy = resolveSortingStrategy(product, fullLocations, strategy);
+  const rejectedLocations = getSortPath()
+    .filter((locationId) => !emptyCandidates.includes(locationId) && !isFullLocation(locations.get(locationId)));
+  const scores = emptyCandidates
+    .map((candidate) => scoreCandidate(candidate, product, locations, strategy, resolvedStrategy, emptyCandidates));
+
+  const sortedScores = [...scores].sort((left, right) => {
+    if (right.score !== left.score) return right.score - left.score;
+    if ((right.details.matchingClusterAdjacency || 0) !== (left.details.matchingClusterAdjacency || 0)) {
+      return (right.details.matchingClusterAdjacency || 0) - (left.details.matchingClusterAdjacency || 0);
+    }
+    if (centerDistance(left.locationId) !== centerDistance(right.locationId)) return centerDistance(left.locationId) - centerDistance(right.locationId);
+    if (getLocationIndex(left.locationId) !== getLocationIndex(right.locationId)) return getLocationIndex(left.locationId) - getLocationIndex(right.locationId);
+    return left.locationId - right.locationId;
+  });
+
+  const tieBreakUsed = sortedScores.length > 1 && sortedScores[0]?.score === sortedScores[1]?.score;
+  return {
+    emptyLocations: emptyCandidates,
+    scores: sortedScores,
+    selectedLocation: sortedScores[0]?.locationId || null,
+    requestedStrategy: strategy,
+    resolvedStrategy,
+    rejectedLocations,
+    tieBreakUsed,
+  };
 }
 
 function buildLocationContext(locationSnapshots) {
@@ -133,16 +397,8 @@ function buildLocationContext(locationSnapshots) {
 }
 
 function chooseStorageLocation(scan, locationSnapshots, sortingMode) {
-  const { locationsById, emptyLocations } = buildLocationContext(locationSnapshots);
-  const scores = emptyLocations
-    .map((locationId) => ({
-      locationId,
-      score: scoreLocation(scan, locationsById, locationId, sortingMode),
-    }))
-    .sort((left, right) => right.score - left.score || left.locationId - right.locationId);
-
-  const selectedLocation = scores.length === 0 ? null : scores[0].score > 0 ? scores[0].locationId : emptyLocations[0];
-  return { emptyLocations, scores, selectedLocation };
+  const { locationsById } = buildLocationContext(locationSnapshots);
+  return chooseBestLocation(scan, locationsById, sortingMode);
 }
 
 function locationPositions(locationId) {
@@ -393,12 +649,31 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         details: { locationsRead: locationSnapshots.length },
       }));
 
-      const { emptyLocations, scores, selectedLocation } = chooseStorageLocation(identity, locationSnapshots, sortingMode);
+      const {
+        emptyLocations,
+        scores,
+        selectedLocation,
+        resolvedStrategy,
+        rejectedLocations,
+        tieBreakUsed,
+      } = chooseStorageLocation(identity, locationSnapshots, sortingMode);
+      logs.push(makeLog('SORT_STRATEGY_SELECTED', `SORT_STRATEGY_SELECTED ${sortingMode} -> ${resolvedStrategy}`, {
+        ...identity,
+        sortingMode,
+        details: { requestedStrategy: sortingMode, resolvedStrategy },
+      }));
       logs.push(makeLog('EMPTY_LOCATIONS_FOUND', `EMPTY_LOCATIONS_FOUND ${emptyLocations.length}`, {
         ...identity,
         sortingMode,
         details: { emptyLocations },
       }));
+      if (rejectedLocations.length > 0) {
+        logs.push(makeLog('SORT_REJECTED_NON_EMPTY', `SORT_REJECTED_NON_EMPTY ${rejectedLocations.join(', ')}`, {
+          ...identity,
+          sortingMode,
+          details: { rejectedLocations },
+        }));
+      }
       const occupiedFlagRejectedLocations = locationSnapshots
         .map((snapshot, index) => ({
           locationId: index + 1,
@@ -419,8 +694,41 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
       logs.push(makeLog('LOCATION_SCORING_STARTED', `LOCATION_SCORING_STARTED ${sortingMode}`, {
         ...identity,
         sortingMode,
-        details: { strategyWeights: STRATEGY_WEIGHTS[sortingMode] },
+        details: { requestedStrategy: sortingMode, resolvedStrategy, sortPath: getSortPath() },
       }));
+      scores.forEach((scoreItem) => {
+        logs.push(makeLog('SORT_SIZE_ORDER_SCORE', `SORT_SIZE_ORDER_SCORE ${scoreItem.locationId}:${scoreItem.details.size?.score ?? 0}`, {
+          ...identity,
+          sortingMode,
+          selectedLocation: scoreItem.locationId,
+          details: scoreItem.details.size || {},
+        }));
+        ['brand', 'model', 'color', 'sku'].forEach((field) => {
+          logs.push(makeLog('SORT_CLUSTER_SCORE', `SORT_CLUSTER_SCORE ${field} ${scoreItem.locationId}:${scoreItem.details[field]?.score ?? 0}`, {
+            ...identity,
+            sortingMode,
+            selectedLocation: scoreItem.locationId,
+            details: scoreItem.details[field] || { field },
+          }));
+        });
+        logs.push(makeLog('SORT_CANDIDATE_SCORE', `SORT_CANDIDATE_SCORE ${scoreItem.locationId}:${scoreItem.score}`, {
+          ...identity,
+          sortingMode,
+          selectedLocation: scoreItem.locationId,
+          details: scoreItem.details,
+        }));
+      });
+      if (tieBreakUsed) {
+        logs.push(makeLog('SORT_TIE_BREAK_USED', `SORT_TIE_BREAK_USED ${scores[0]?.locationId || 'none'}`, {
+          ...identity,
+          sortingMode,
+          selectedLocation: scores[0]?.locationId || null,
+          details: {
+            topCandidates: scores.filter((item) => item.score === scores[0]?.score).map((item) => item.locationId),
+            tieBreakOrder: ['matchingClusterAdjacency', 'centerDistance', 'movementCost', 'locationNumber'],
+          },
+        }));
+      }
       logs.push(makeLog('LOCATION_SCORE_RESULT', `LOCATION_SCORE_RESULT ${scores.map((item) => `${item.locationId}:${item.score}`).join(', ') || 'none'}`, {
         ...identity,
         sortingMode,
@@ -466,6 +774,12 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         sortingMode,
         selectedLocation,
         details: { inPosition, outPosition },
+      }));
+      logs.push(makeLog('SORT_SELECTED_LOCATION', `SORT_SELECTED_LOCATION ${selectedLocation}`, {
+        ...identity,
+        sortingMode,
+        selectedLocation,
+        details: { requestedStrategy: sortingMode, resolvedStrategy, inPosition, outPosition },
       }));
 
       traceWrite(`locations/${selectedLocation} reserve`, () => markLocationReserved(

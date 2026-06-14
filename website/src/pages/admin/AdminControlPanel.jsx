@@ -18,17 +18,21 @@ const VALID_SORTING_STRATEGIES = new Set([
   'brand_size',
   'color_size',
   'model_size',
+  'sku_exact',
+  'smart_auto',
 ]);
 
 const SORTING_OPTIONS = [
-  { value: '', label: 'Select strategy' },
-  { value: 'brand', label: 'Brand' },
-  { value: 'model', label: 'Model' },
-  { value: 'size', label: 'Size' },
-  { value: 'color', label: 'Color' },
-  { value: 'brand_size', label: 'Brand + Size' },
-  { value: 'model_size', label: 'Model + Size' },
-  { value: 'color_size', label: 'Color + Size' },
+  { value: '', label: 'Select strategy', description: 'Choose how new scanned products are assigned to empty locations.' },
+  { value: 'brand', label: 'Brand', description: 'Cluster matching brands together.' },
+  { value: 'size', label: 'Size Ordered', description: 'Keep smaller sizes before larger sizes and cluster equal sizes.' },
+  { value: 'color', label: 'Color', description: 'Cluster matching colors together.' },
+  { value: 'model', label: 'Model', description: 'Cluster matching models together with brand fallback.' },
+  { value: 'brand_size', label: 'Brand + Size', description: 'Prefer the same brand area, then keep sizes ordered inside it.' },
+  { value: 'color_size', label: 'Color + Size', description: 'Prefer the same color area, then keep sizes ordered inside it.' },
+  { value: 'model_size', label: 'Model + Size', description: 'Prefer the same model area, then keep sizes ordered inside it.' },
+  { value: 'sku_exact', label: 'Exact SKU Cluster', description: 'Place exact matching SKUs beside each other, with model-size fallback.' },
+  { value: 'smart_auto', label: 'Smart Auto', description: 'Automatically choose SKU, model, brand, color, or size ordering from existing stock.' },
 ];
 
 const DEFAULT_SETTINGS = {
@@ -930,6 +934,7 @@ function AdminControlPanel() {
                 <option key={option.value} value={option.value}>{option.label}</option>
               ))}
             </select>
+            <small>{SORTING_OPTIONS.find((option) => option.value === sortingMode)?.description || SORTING_OPTIONS[0].description}</small>
           </label>
           <button
             className="button button-primary"
