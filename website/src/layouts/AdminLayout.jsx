@@ -1,6 +1,5 @@
 import { Link, NavLink, Outlet } from 'react-router-dom';
 import LanguageToggle from '../components/LanguageToggle.jsx';
-import ScanAssignmentWorker from '../components/ScanAssignmentWorker.jsx';
 import ThemeToggle from '../components/ThemeToggle.jsx';
 
 const adminLinks = [
@@ -18,7 +17,6 @@ const adminLinks = [
 function AdminLayout() {
   return (
     <div className="app-shell admin-shell">
-      <ScanAssignmentWorker />
       <aside className="admin-sidebar">
         <div className="admin-sidebar-brand">
           <span className="auth-branding-mark">MX</span>

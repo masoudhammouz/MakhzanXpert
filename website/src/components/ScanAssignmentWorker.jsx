@@ -35,46 +35,98 @@ function ScanAssignmentWorker() {
   useEffect(() => {
     if (loading || !currentUser) return undefined;
 
+    console.log('SCAN_ASSIGNMENT_WORKER_MOUNTED');
+
+    const processConfirmedScanDoc = (sourceCollection, scanDoc) => {
+      const data = scanDoc.data();
+      if (data?.status !== 'CONFIRMED') return;
+
+      console.log('CONFIRMED_SCAN_FOUND', {
+        sourceCollection,
+        scanDocId: scanDoc.id,
+        scanId: data.scanId,
+        productKey: data.productKey,
+      });
+
+      const processingKey = `${sourceCollection}/${scanDoc.id}`;
+      if (processingScanIds.current.has(processingKey)) return;
+
+      processingScanIds.current.add(processingKey);
+      assignConfirmedScan(sourceCollection, scanDoc.id)
+        .then((result) => {
+          if (result.skipped) {
+            console.info('[SCAN_ASSIGNMENT_SKIPPED]', processingKey, result.reason);
+            return;
+          }
+          console.info('[SCAN_ASSIGNED]', result);
+          logScanProcessorActivity(
+            'SCAN_ASSIGNED',
+            `Scan ${result.scanId} assigned to location ${result.locationId}; GO ${result.inPosition} command ${result.commandId} created.`,
+            'success',
+          );
+        })
+        .catch((error) => {
+          console.error('[SCAN_ASSIGNMENT_FAILED]', processingKey, error);
+          logScanProcessorActivity(
+            'SCAN_ASSIGNMENT_FAILED',
+            `Scan ${processingKey} assignment failed: ${error.message || error}`,
+            'error',
+          );
+        })
+        .finally(() => {
+          processingScanIds.current.delete(processingKey);
+        });
+    };
+
+    const attachFallbackListener = (sourceCollection) => {
+      console.log('SCAN_QUEUE_LISTENER_ATTACHED', {
+        sourceCollection,
+        mode: 'fallback-full-collection',
+      });
+
+      return onSnapshot(
+        collection(db, sourceCollection),
+        (snapshot) => {
+          console.log('SCAN_QUEUE_SNAPSHOT_RECEIVED', {
+            sourceCollection,
+            mode: 'fallback-full-collection',
+            size: snapshot.size,
+          });
+          snapshot.docs.forEach((scanDoc) => processConfirmedScanDoc(sourceCollection, scanDoc));
+        },
+        (error) => {
+          console.error('[SCAN_ASSIGNMENT_FALLBACK_LISTENER_FAILED]', sourceCollection, error);
+          logScanProcessorActivity(
+            'SCAN_ASSIGNMENT_LISTENER_FAILED',
+            `${sourceCollection} fallback scan listener failed: ${error.message || error}`,
+            'error',
+          );
+        },
+      );
+    };
+
     const listenForConfirmedScans = (sourceCollection) => {
+      let fallbackUnsubscribe = null;
       const confirmedScansQuery = query(
         collection(db, sourceCollection),
         where('status', '==', 'CONFIRMED'),
         limit(10),
       );
 
-      return onSnapshot(
+      console.log('SCAN_QUEUE_LISTENER_ATTACHED', {
+        sourceCollection,
+        mode: 'where-status-CONFIRMED',
+      });
+
+      const unsubscribe = onSnapshot(
         confirmedScansQuery,
         (snapshot) => {
-          snapshot.docs.forEach((scanDoc) => {
-            const processingKey = `${sourceCollection}/${scanDoc.id}`;
-            if (processingScanIds.current.has(processingKey)) return;
-
-            processingScanIds.current.add(processingKey);
-            assignConfirmedScan(sourceCollection, scanDoc.id)
-              .then((result) => {
-                if (result.skipped) {
-                  console.info('[SCAN_ASSIGNMENT_SKIPPED]', processingKey, result.reason);
-                  return;
-                }
-                console.info('[SCAN_ASSIGNED]', result);
-                logScanProcessorActivity(
-                  'SCAN_ASSIGNED',
-                  `Scan ${result.scanId} assigned to location ${result.locationId}; GO ${result.inPosition} command ${result.commandId} created.`,
-                  'success',
-                );
-              })
-              .catch((error) => {
-                console.error('[SCAN_ASSIGNMENT_FAILED]', processingKey, error);
-                logScanProcessorActivity(
-                  'SCAN_ASSIGNMENT_FAILED',
-                  `Scan ${processingKey} assignment failed: ${error.message || error}`,
-                  'error',
-                );
-              })
-              .finally(() => {
-                processingScanIds.current.delete(processingKey);
-              });
+          console.log('SCAN_QUEUE_SNAPSHOT_RECEIVED', {
+            sourceCollection,
+            mode: 'where-status-CONFIRMED',
+            size: snapshot.size,
           });
+          snapshot.docs.forEach((scanDoc) => processConfirmedScanDoc(sourceCollection, scanDoc));
         },
         (error) => {
           console.error('[SCAN_ASSIGNMENT_LISTENER_FAILED]', sourceCollection, error);
@@ -83,8 +135,16 @@ function ScanAssignmentWorker() {
             `${sourceCollection} scan assignment listener failed: ${error.message || error}`,
             'error',
           );
+          if (!fallbackUnsubscribe) {
+            fallbackUnsubscribe = attachFallbackListener(sourceCollection);
+          }
         },
       );
+
+      return () => {
+        unsubscribe();
+        if (fallbackUnsubscribe) fallbackUnsubscribe();
+      };
     };
 
     const unsubscribeScanQueue = listenForConfirmedScans('scanQueue');

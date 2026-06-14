@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { addDoc, collection, doc, getDocFromServer, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
+import ScanAssignmentWorker from '../../components/ScanAssignmentWorker.jsx';
 import { db } from '../../firebase/firebase.js';
 
 const SYSTEM_SETTINGS_REF = doc(db, 'settings', 'system');
@@ -717,6 +718,7 @@ function AdminControlPanel() {
 
   return (
     <div className="admin-control-page">
+      <ScanAssignmentWorker />
       <section className="admin-page-heading control-hero">
         <div>
           <p className="section-eyebrow">Automation console</p>
