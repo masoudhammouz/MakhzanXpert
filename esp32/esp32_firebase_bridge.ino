@@ -26,11 +26,8 @@ const char* DEVICE_ID = "esp-main-01";
 #define FIRESTORE_COMMAND_POLL_INTERVAL_MS 2000
 
 // ===================== SERIAL TO ARDUINO MEGA =====================
-// ESP32 RXD2 receives from Arduino TX
-// ESP32 TXD2 sends to Arduino RX
 #define RXD2 4
 #define TXD2 17
-
 #define ARDUINO_BAUD 9600
 
 // ===================== SERVER =====================
@@ -51,7 +48,6 @@ unsigned long lastFirestoreCommandPollAt = 0;
 bool firestoreCommandBusy = false;
 
 StaticJsonDocument<1024> latestStatus;
-
 bool latestStatusValid = false;
 
 // =====================================================
@@ -76,10 +72,7 @@ void connectWiFi() {
 
 String getTimestamp() {
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo, 1000)) {
-    return "1970-01-01T00:00:00Z";
-  }
-
+  if (!getLocalTime(&timeinfo, 1000)) return "1970-01-01T00:00:00Z";
   char buffer[25];
   strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
   return String(buffer);
@@ -89,9 +82,7 @@ bool waitForTimeSync(unsigned long timeoutMs = 8000) {
   unsigned long start = millis();
   struct tm timeinfo;
   while (millis() - start < timeoutMs) {
-    if (getLocalTime(&timeinfo, 1000) && timeinfo.tm_year >= 120) {
-      return true;
-    }
+    if (getLocalTime(&timeinfo, 1000) && timeinfo.tm_year >= 120) return true;
     delay(250);
   }
   return false;
@@ -121,25 +112,11 @@ String firestoreUrl(String path) {
     "/databases/(default)/documents/" + path + "?key=" + String(FIREBASE_API_KEY);
 }
 
-String firestoreStringValue(String value) {
-  return "{\"stringValue\":\"" + jsonEscape(value) + "\"}";
-}
-
-String firestoreTimestampValue(String value) {
-  return "{\"timestampValue\":\"" + value + "\"}";
-}
-
-String firestoreBoolValue(bool value) {
-  return String("{\"booleanValue\":") + (value ? "true" : "false") + "}";
-}
-
-String firestoreIntValue(long value) {
-  return "{\"integerValue\":\"" + String(value) + "\"}";
-}
-
-String firestoreDoubleValue(double value) {
-  return "{\"doubleValue\":" + String(value, 3) + "}";
-}
+String firestoreStringValue(String value) { return "{\"stringValue\":\"" + jsonEscape(value) + "\"}"; }
+String firestoreTimestampValue(String value) { return "{\"timestampValue\":\"" + value + "\"}"; }
+String firestoreBoolValue(bool value) { return String("{\"booleanValue\":") + (value ? "true" : "false") + "}"; }
+String firestoreIntValue(long value) { return "{\"integerValue\":\"" + String(value) + "\"}"; }
+String firestoreDoubleValue(double value) { return "{\"doubleValue\":" + String(value, 3) + "}"; }
 
 String firestoreJsonValue(JsonVariant value) {
   if (value.is<bool>()) return firestoreBoolValue(value.as<bool>());
@@ -163,20 +140,13 @@ bool firestoreSend(String method, String url, String body, int* statusCode = nul
   client.setInsecure();
 
   HTTPClient http;
-  if (!http.begin(client, url)) {
-    return false;
-  }
-
+  if (!http.begin(client, url)) return false;
   http.addHeader("Content-Type", "application/json");
 
   int code = -1;
-  if (method == "PATCH") {
-    code = http.PATCH(body);
-  } else if (method == "POST") {
-    code = http.POST(body);
-  } else {
-    code = http.GET();
-  }
+  if (method == "PATCH") code = http.PATCH(body);
+  else if (method == "POST") code = http.POST(body);
+  else code = http.GET();
 
   if (statusCode) *statusCode = code;
   if (code < 200 || code >= 300) {
@@ -211,6 +181,9 @@ String fireRiskFromStatus(String fireStatus) {
   return "Low";
 }
 
+void publishSystemActivity(String activityType, String message, bool throttle = true);
+void publishHardwareStatus(bool forceDevice = false, bool forceSnapshot = false);
+
 String buildHardwareFields(String timestampValue, bool includeCreatedAt) {
   String fields = "";
   bool first = true;
@@ -238,6 +211,9 @@ String buildHardwareFields(String timestampValue, bool includeCreatedAt) {
   if (!latestStatus.containsKey("lifterBusy") && latestStatus.containsKey("busy")) {
     appendFirestoreField(fields, first, "lifterBusy", firestoreBoolValue((bool)(latestStatus["busy"] | false)));
   }
+  if (!latestStatus.containsKey("loc7Detected")) appendFirestoreField(fields, first, "loc7Detected", firestoreBoolValue(false));
+  if (!latestStatus.containsKey("loc8Detected")) appendFirestoreField(fields, first, "loc8Detected", firestoreBoolValue(false));
+  if (!latestStatus.containsKey("loc9Detected")) appendFirestoreField(fields, first, "loc9Detected", firestoreBoolValue(false));
 
   String fireStatus = fireStatusFromLatest();
   appendFirestoreField(fields, first, "fireStatus", firestoreStringValue(fireStatus));
@@ -247,17 +223,13 @@ String buildHardwareFields(String timestampValue, bool includeCreatedAt) {
   appendFirestoreField(fields, first, "status", firestoreStringValue("online"));
   appendFirestoreField(fields, first, "lastSeen", firestoreTimestampValue(timestampValue));
   appendFirestoreField(fields, first, "updatedAt", firestoreTimestampValue(timestampValue));
-  if (includeCreatedAt) {
-    appendFirestoreField(fields, first, "createdAt", firestoreTimestampValue(timestampValue));
-  }
+  if (includeCreatedAt) appendFirestoreField(fields, first, "createdAt", firestoreTimestampValue(timestampValue));
 
   return fields;
 }
 
-void publishSystemActivity(String activityType, String message, bool throttle = true) {
-  if (throttle && millis() - lastFirestoreActivityAt < FIRESTORE_ACTIVITY_MIN_INTERVAL_MS) {
-    return;
-  }
+void publishSystemActivity(String activityType, String message, bool throttle) {
+  if (throttle && millis() - lastFirestoreActivityAt < FIRESTORE_ACTIVITY_MIN_INTERVAL_MS) return;
   lastFirestoreActivityAt = millis();
 
   String ts = getTimestamp();
@@ -278,13 +250,43 @@ void publishSystemActivity(String activityType, String message, bool throttle = 
   }
 }
 
-void publishHardwareStatus(bool forceDevice = false, bool forceSnapshot = false) {
+void publishAutomationStatus(bool started) {
+  String ts = getTimestamp();
+  String url = firestoreUrl("automation/status") +
+    "&updateMask.fieldPaths=automationStarted" +
+    "&updateMask.fieldPaths=currentState" +
+    "&updateMask.fieldPaths=cameraBusy" +
+    "&updateMask.fieldPaths=beltRunning" +
+    "&updateMask.fieldPaths=beltBlocked" +
+    "&updateMask.fieldPaths=lifterBusy" +
+    "&updateMask.fieldPaths=currentOperation" +
+    "&updateMask.fieldPaths=source" +
+    "&updateMask.fieldPaths=sourceDevice" +
+    "&updateMask.fieldPaths=updatedAt";
+
+  String fields = "";
+  bool first = true;
+  appendFirestoreField(fields, first, "automationStarted", firestoreBoolValue(started));
+  appendFirestoreField(fields, first, "currentState", firestoreStringValue(started ? "WAIT_BOX_AT_CAMERA" : "STOPPED"));
+  appendFirestoreField(fields, first, "cameraBusy", firestoreBoolValue(false));
+  appendFirestoreField(fields, first, "beltRunning", firestoreBoolValue(started));
+  appendFirestoreField(fields, first, "beltBlocked", firestoreBoolValue(!started));
+  appendFirestoreField(fields, first, "lifterBusy", firestoreBoolValue(false));
+  appendFirestoreField(fields, first, "currentOperation", firestoreStringValue(""));
+  appendFirestoreField(fields, first, "source", firestoreStringValue("esp32"));
+  appendFirestoreField(fields, first, "sourceDevice", firestoreStringValue("esp32"));
+  appendFirestoreField(fields, first, "updatedAt", firestoreTimestampValue(ts));
+
+  String body = "{\"fields\":{" + fields + "}}";
+  if (firestoreSend("PATCH", url, body)) {
+    Serial.println(started ? "[FIRESTORE_UPDATE] automation started" : "[FIRESTORE_UPDATE] automation stopped");
+  }
+}
+
+void publishHardwareStatus(bool forceDevice, bool forceSnapshot) {
   bool deviceDue = forceDevice || millis() - lastFirestoreDeviceAt >= FIRESTORE_DEVICE_INTERVAL_MS;
   bool snapshotDue = forceSnapshot || millis() - lastFirestoreSnapshotAt >= FIRESTORE_SENSOR_SNAPSHOT_INTERVAL_MS;
-
-  if (!deviceDue && !snapshotDue) {
-    return;
-  }
+  if (!deviceDue && !snapshotDue) return;
 
   String ts = getTimestamp();
   bool sensorOk = false;
@@ -304,7 +306,6 @@ void publishHardwareStatus(bool forceDevice = false, bool forceSnapshot = false)
     String deviceFields = buildHardwareFields(ts, false);
     String latestBody = "{\"fields\":{" + latestFields + "}}";
     String deviceBody = "{\"fields\":{" + deviceFields + "}}";
-
     latestOk = firestoreSend("PATCH", firestoreUrl("sensorReadings/latest"), latestBody);
     deviceOk = firestoreSend("PATCH", firestoreUrl("devices/" + String(DEVICE_ID)), deviceBody);
   }
@@ -316,23 +317,7 @@ void publishHardwareStatus(bool forceDevice = false, bool forceSnapshot = false)
   }
 }
 
-String makeBasicResponse(bool ok, String message = "") {
-  StaticJsonDocument<512> doc;
-  doc["ok"] = ok;
-  doc["message"] = message;
-  doc["lastArduinoLine"] = lastArduinoLine;
-  doc["lastDoneLine"] = lastDoneLine;
-  doc["lastErrorLine"] = lastErrorLine;
-  doc["arduinoSeenMsAgo"] = millis() - lastArduinoSeenAt;
-
-  String out;
-  serializeJson(doc, out);
-  return out;
-}
-
-bool isJsonLine(const String& line) {
-  return line.startsWith("{") && line.endsWith("}");
-}
+bool isJsonLine(const String& line) { return line.startsWith("{") && line.endsWith("}"); }
 
 void updateLatestStatusFromJson(String line) {
   StaticJsonDocument<512> incoming;
@@ -355,7 +340,6 @@ void readArduinoSerial() {
   while (Serial2.available()) {
     String line = Serial2.readStringUntil('\n');
     line.trim();
-
     if (line.length() == 0) continue;
 
     lastArduinoLine = line;
@@ -389,7 +373,6 @@ void sendToArduino(String command) {
   publishSystemActivity("COMMAND_FORWARDED", command, false);
   Serial.print("Sending to Arduino: ");
   Serial.println(command);
-
   Serial2.print(command);
   Serial2.print('\n');
 }
@@ -400,28 +383,20 @@ bool waitForDone(String expectedDone, unsigned long timeoutMs, String& matchedLi
 
   while (millis() - start < timeoutMs) {
     readArduinoSerial();
-
-    if (lastErrorLine.length() > 0 && millis() - lastArduinoSeenAt < 2000) {
-      // Keep waiting; some errors may be old, but response will include it.
-    }
-
     if (lastDoneLine.length() > 0) {
       if (expectedDone.length() == 0 || lastDoneLine == expectedDone || lastDoneLine.startsWith(expectedDone)) {
         matchedLine = lastDoneLine;
         return true;
       }
     }
-
     delay(10);
   }
-
   return false;
 }
 
 bool sendCommandAndWait(String command, String expectedDone, unsigned long timeoutMs, String& doneLine) {
   lastDoneLine = "";
   lastErrorLine = "";
-
   sendToArduino(command);
   return waitForDone(expectedDone, timeoutMs, doneLine);
 }
@@ -438,38 +413,31 @@ String statusJsonResponse() {
   doc["lastErrorLine"] = lastErrorLine;
 
   JsonObject status = doc.createNestedObject("status");
-
   if (latestStatusValid) {
-    for (JsonPair kv : latestStatus.as<JsonObject>()) {
-      status[kv.key()] = kv.value();
-    }
+    for (JsonPair kv : latestStatus.as<JsonObject>()) status[kv.key()] = kv.value();
   }
 
-  if (!status.containsKey("beltRunning") && status.containsKey("belt")) {
-    status["beltRunning"] = (int)(status["belt"] | 0) == 1;
-  }
-  if (!status.containsKey("lifterBusy") && status.containsKey("busy")) {
-    status["lifterBusy"] = (bool)(status["busy"] | false);
-  }
-
-  // Defaults if Arduino JSON not received yet
+  if (!status.containsKey("beltRunning") && status.containsKey("belt")) status["beltRunning"] = (int)(status["belt"] | 0) == 1;
+  if (!status.containsKey("lifterBusy") && status.containsKey("busy")) status["lifterBusy"] = (bool)(status["busy"] | false);
   if (!status.containsKey("irCamera")) status["irCamera"] = false;
   if (!status.containsKey("irLifter")) status["irLifter"] = false;
+  if (!status.containsKey("irFirst")) status["irFirst"] = false;
+  if (!status.containsKey("irLast")) status["irLast"] = false;
   if (!status.containsKey("beltRunning")) status["beltRunning"] = false;
   if (!status.containsKey("lifterBusy")) status["lifterBusy"] = false;
   if (!status.containsKey("atStartingPoint")) status["atStartingPoint"] = false;
   if (!status.containsKey("ultrasonicReady")) status["ultrasonicReady"] = false;
+  if (!status.containsKey("loc7Detected")) status["loc7Detected"] = false;
+  if (!status.containsKey("loc8Detected")) status["loc8Detected"] = false;
+  if (!status.containsKey("loc9Detected")) status["loc9Detected"] = false;
 
   String out;
   serializeJson(doc, out);
   return out;
 }
 
-
 // =====================================================
-// FIRESTORE COMMAND POLLER - NO WAIT MODE
-// Same logic as the older working code: send command then mark it sent.
-// This prevents the ESP32 from blocking until Arduino returns DONE.
+// FIRESTORE COMMAND POLLER
 // =====================================================
 
 bool firestoreRequest(String method, String url, String body, String& response, int* statusCode = nullptr) {
@@ -478,26 +446,19 @@ bool firestoreRequest(String method, String url, String body, String& response, 
 
   WiFiClientSecure client;
   client.setInsecure();
-
   HTTPClient http;
   if (!http.begin(client, url)) return false;
-
   http.setTimeout(15000);
   http.addHeader("Content-Type", "application/json");
 
   int code = -1;
-  if (method == "PATCH") {
-    code = http.PATCH(body);
-  } else if (method == "POST") {
-    code = http.POST(body);
-  } else {
-    code = http.GET();
-  }
+  if (method == "PATCH") code = http.PATCH(body);
+  else if (method == "POST") code = http.POST(body);
+  else code = http.GET();
 
   response = http.getString();
   if (statusCode) *statusCode = code;
   http.end();
-
   return code >= 200 && code < 300;
 }
 
@@ -519,23 +480,23 @@ String normalizeFirestoreCommand(String raw) {
     if (n.length() > 0) return "GO " + n;
   }
 
-  // ===== AUTOMATION =====
-  // Website Start Automation must reach Arduino as START_AUTOMATION.
   if (raw == "START_AUTOMATION") return "START_AUTOMATION";
   if (raw == "AUTO") return "START_AUTOMATION";
   if (raw == "AUTOMATION_START") return "START_AUTOMATION";
-
   if (raw == "STOP_AUTOMATION") return "STOP_AUTOMATION";
   if (raw == "AUTOMATION_STOP") return "STOP_AUTOMATION";
 
-  // ===== BELT =====
-  // STOP from the website means stop the belt only.
+  if (raw == "HOME_LIFTER") return "HOME";
+  if (raw == "RESET_SYSTEM") return "HOME";
+
   if (raw == "STOP") return "BELT_STOP";
   if (raw == "BELT") return "BELT_START";
   if (raw == "BELT_START") return "BELT_START";
   if (raw == "BELT_STOP") return "BELT_STOP";
+  if (raw == "BELT_RUN_UNTIL_IR_LAST") return "BELT_RUN_UNTIL_IR_LAST";
+  if (raw == "BELT_UNTIL_IR_LAST") return "BELT_RUN_UNTIL_IR_LAST";
+  if (raw == "MOVE_TO_IR_LAST") return "BELT_RUN_UNTIL_IR_LAST";
 
-  // ===== CAMERA / DISPENSER =====
   if (raw == "CAMERA" || raw == "CAMERA_SCAN") return "SCAN";
   if (raw == "D") return "DISPENSE";
 
@@ -544,7 +505,6 @@ String normalizeFirestoreCommand(String raw) {
 
 bool patchFirestoreCommand(String docName, String status, String sentCommand, String response) {
   String ts = getTimestamp();
-
   String url = "https://firestore.googleapis.com/v1/" + docName +
     "?key=" + String(FIREBASE_API_KEY) +
     "&updateMask.fieldPaths=status" +
@@ -571,33 +531,70 @@ bool patchFirestoreCommand(String docName, String status, String sentCommand, St
   return ok;
 }
 
+String expectedDoneForFirestoreCommand(String arduinoCommand) {
+  if (arduinoCommand.startsWith("GO ")) {
+    String n = arduinoCommand.substring(3);
+    n.trim();
+    return "DONE:" + n;
+  }
+  if (arduinoCommand == "HOME") return "DONE:HOME";
+  if (arduinoCommand == "BELT_RUN_UNTIL_IR_LAST") return "DONE:BELT_RUN_UNTIL_IR_LAST";
+  return "";
+}
+
+bool shouldWaitForFirestoreCommand(String rawCommand, String arduinoCommand) {
+  rawCommand.trim();
+  rawCommand.toUpperCase();
+  return arduinoCommand.startsWith("GO ") ||
+    arduinoCommand == "HOME" ||
+    arduinoCommand == "BELT_RUN_UNTIL_IR_LAST" ||
+    rawCommand == "HOME_LIFTER" ||
+    rawCommand == "RESET_SYSTEM";
+}
+
+bool waitForFirestoreCommandResult(String expectedDone, unsigned long timeoutMs, String& responseLine, bool& arduinoError) {
+  unsigned long start = millis();
+  responseLine = "";
+  arduinoError = false;
+
+  while (millis() - start < timeoutMs) {
+    readArduinoSerial();
+    if (lastErrorLine.length() > 0) {
+      responseLine = lastErrorLine;
+      arduinoError = true;
+      return false;
+    }
+    if (lastDoneLine.length() > 0) {
+      if (expectedDone.length() == 0 || lastDoneLine == expectedDone || lastDoneLine.startsWith(expectedDone)) {
+        responseLine = lastDoneLine;
+        return true;
+      }
+    }
+    delay(10);
+  }
+  responseLine = "Timeout waiting for " + expectedDone;
+  return false;
+}
+
 void pollFirestoreCommands() {
   if (firestoreCommandBusy) return;
   if (millis() - lastFirestoreCommandPollAt < FIRESTORE_COMMAND_POLL_INTERVAL_MS) return;
   lastFirestoreCommandPollAt = millis();
-
   if (WiFi.status() != WL_CONNECTED) return;
 
   String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) +
     "/databases/(default)/documents:runQuery?key=" + String(FIREBASE_API_KEY);
 
   String body =
-    "{"
-      "\"structuredQuery\":{"
-        "\"from\":[{\"collectionId\":\"commands\"}],"
-        "\"where\":{"
-          "\"compositeFilter\":{"
-            "\"op\":\"AND\","
-            "\"filters\":["
-              "{\"fieldFilter\":{\"field\":{\"fieldPath\":\"deviceId\"},\"op\":\"EQUAL\",\"value\":{\"stringValue\":\"" + String(DEVICE_ID) + "\"}}},"
-              "{\"fieldFilter\":{\"field\":{\"fieldPath\":\"status\"},\"op\":\"EQUAL\",\"value\":{\"stringValue\":\"pending\"}}}"
-            "]"
-          "}"
-        "},"
-        "\"orderBy\":[{\"field\":{\"fieldPath\":\"createdAt\"},\"direction\":\"ASCENDING\"}],"
-        "\"limit\":1"
-      "}"
-    "}";
+    "{\"structuredQuery\":{" 
+      "\"from\":[{\"collectionId\":\"commands\"}],"
+      "\"where\":{\"compositeFilter\":{\"op\":\"AND\",\"filters\":["
+        "{\"fieldFilter\":{\"field\":{\"fieldPath\":\"deviceId\"},\"op\":\"EQUAL\",\"value\":{\"stringValue\":\"" + String(DEVICE_ID) + "\"}}},"
+        "{\"fieldFilter\":{\"field\":{\"fieldPath\":\"status\"},\"op\":\"EQUAL\",\"value\":{\"stringValue\":\"pending\"}}}"
+      "]}},"
+      "\"orderBy\":[{\"field\":{\"fieldPath\":\"createdAt\"},\"direction\":\"ASCENDING\"}],"
+      "\"limit\":1"
+    "}}";
 
   String res;
   int code = -1;
@@ -605,7 +602,6 @@ void pollFirestoreCommands() {
 
   Serial.print("COMMAND CHECK CODE: ");
   Serial.println(code);
-
   if (!ok) {
     Serial.println("COMMAND QUERY FAILED");
     Serial.println(res);
@@ -635,18 +631,31 @@ void pollFirestoreCommands() {
     if (arduinoCommand.length() == 0) continue;
 
     firestoreCommandBusy = true;
-
     Serial.print("COMMAND FOUND ");
     Serial.println(rawCommand);
 
+    lastDoneLine = "";
+    lastErrorLine = "";
     sendToArduino(arduinoCommand);
-
     Serial.print("COMMAND SENT ");
     Serial.println(arduinoCommand);
+
+    if (arduinoCommand == "START_AUTOMATION") publishAutomationStatus(true);
+    else if (arduinoCommand == "STOP_AUTOMATION") publishAutomationStatus(false);
 
     patchFirestoreCommand(docName, "sent_to_arduino", arduinoCommand, "Command sent to Arduino");
     publishSystemActivity("COMMAND_FORWARDED", arduinoCommand, false);
     publishHardwareStatus(true);
+
+    if (shouldWaitForFirestoreCommand(rawCommand, arduinoCommand)) {
+      String expectedDone = expectedDoneForFirestoreCommand(arduinoCommand);
+      unsigned long timeoutMs = (arduinoCommand == "BELT_RUN_UNTIL_IR_LAST") ? 60000UL : 140000UL;
+      String responseLine;
+      bool arduinoError = false;
+      bool done = waitForFirestoreCommandResult(expectedDone, timeoutMs, responseLine, arduinoError);
+      patchFirestoreCommand(docName, done ? "done" : "error", arduinoCommand, responseLine.length() > 0 ? responseLine : String("Command failed"));
+      publishHardwareStatus(true);
+    }
 
     firestoreCommandBusy = false;
     break;
@@ -657,43 +666,21 @@ void pollFirestoreCommands() {
 // ROUTES
 // =====================================================
 
-void handleOptions() {
-  addCors();
-  server.send(204);
-}
-
-void handleRoot() {
-  sendJson(200, "{\"ok\":true,\"device\":\"MakhzanXpert ESP32 Bridge\"}");
-}
-
-void handleStatus() {
-  readArduinoSerial();
-  sendJson(200, statusJsonResponse());
-}
+void handleOptions() { addCors(); server.send(204); }
+void handleRoot() { sendJson(200, "{\"ok\":true,\"device\":\"MakhzanXpert ESP32 Bridge\"}"); }
+void handleStatus() { readArduinoSerial(); sendJson(200, statusJsonResponse()); }
 
 void handleGo() {
-  if (!server.hasArg("position")) {
-    sendJson(400, "{\"ok\":false,\"error\":\"Missing position\"}");
-    return;
-  }
-
+  if (!server.hasArg("position")) { sendJson(400, "{\"ok\":false,\"error\":\"Missing position\"}"); return; }
   int position = server.arg("position").toInt();
-  if (position < 1 || position > 18) {
-    sendJson(400, "{\"ok\":false,\"error\":\"Invalid position. Use 1..18\"}");
-    return;
-  }
+  if (position < 1 || position > 18) { sendJson(400, "{\"ok\":false,\"error\":\"Invalid position. Use 1..18\"}"); return; }
 
   commandCounter++;
-
   String command = "GO " + String(position);
-  Serial.print("[COMMAND_RECEIVED] ");
-  Serial.println(command);
+  Serial.print("[COMMAND_RECEIVED] "); Serial.println(command);
   String expected = "DONE:" + String(position);
   String doneLine;
-
   bool ok = sendCommandAndWait(command, expected, 140000, doneLine);
-  Serial.print("[FIRESTORE_UPDATE] ");
-  Serial.println(ok ? "Command response ready for Raspberry/Firestore" : "Command timeout ready for Raspberry/Firestore");
 
   StaticJsonDocument<512> doc;
   doc["ok"] = ok;
@@ -705,23 +692,15 @@ void handleGo() {
   doc["lastErrorLine"] = lastErrorLine;
   doc["source"] = server.arg("source");
   doc["queueId"] = server.arg("queueId");
-
-  if (!ok) {
-    doc["error"] = "Timeout waiting for " + expected;
-  }
-
-  String out;
-  serializeJson(doc, out);
-  sendJson(ok ? 200 : 504, out);
+  if (!ok) doc["error"] = "Timeout waiting for " + expected;
+  String out; serializeJson(doc, out); sendJson(ok ? 200 : 504, out);
 }
 
 void handleStart() {
   commandCounter++;
-
   Serial.println("[COMMAND_RECEIVED] START");
   String doneLine;
   bool ok = sendCommandAndWait("START", "DONE:START", 140000, doneLine);
-
   StaticJsonDocument<512> doc;
   doc["ok"] = ok;
   doc["commandId"] = commandCounter;
@@ -731,65 +710,44 @@ void handleStart() {
   doc["lastErrorLine"] = lastErrorLine;
   doc["source"] = server.arg("source");
   doc["queueId"] = server.arg("queueId");
-
-  if (!ok) {
-    doc["error"] = "Timeout waiting for DONE:START";
-  }
-
-  String out;
-  serializeJson(doc, out);
-  sendJson(ok ? 200 : 504, out);
+  if (!ok) doc["error"] = "Timeout waiting for DONE:START";
+  String out; serializeJson(doc, out); sendJson(ok ? 200 : 504, out);
 }
 
 void handleBeltStart() {
   Serial.println("[COMMAND_RECEIVED] BELT_START");
   String doneLine;
   bool ok = sendCommandAndWait("BELT_START", "DONE:BELT_START", 20000, doneLine);
-
   StaticJsonDocument<384> doc;
   doc["ok"] = ok;
   doc["command"] = "BELT_START";
   doc["doneLine"] = doneLine;
   doc["lastErrorLine"] = lastErrorLine;
   if (!ok) doc["error"] = "Timeout waiting for DONE:BELT_START";
-
-  String out;
-  serializeJson(doc, out);
-  sendJson(ok ? 200 : 504, out);
+  String out; serializeJson(doc, out); sendJson(ok ? 200 : 504, out);
 }
 
 void handleBeltStop() {
   Serial.println("[COMMAND_RECEIVED] BELT_STOP");
   String doneLine;
   bool ok = sendCommandAndWait("BELT_STOP", "DONE:BELT_STOP", 20000, doneLine);
-
   StaticJsonDocument<384> doc;
   doc["ok"] = ok;
   doc["command"] = "BELT_STOP";
   doc["doneLine"] = doneLine;
   doc["lastErrorLine"] = lastErrorLine;
   if (!ok) doc["error"] = "Timeout waiting for DONE:BELT_STOP";
-
-  String out;
-  serializeJson(doc, out);
-  sendJson(ok ? 200 : 504, out);
+  String out; serializeJson(doc, out); sendJson(ok ? 200 : 504, out);
 }
 
 void handleBeltRun() {
-  unsigned long ms = 3000;
-  if (server.hasArg("ms")) {
-    ms = server.arg("ms").toInt();
-  }
-
+  unsigned long ms = server.hasArg("ms") ? server.arg("ms").toInt() : 3000;
   if (ms < 100) ms = 100;
   if (ms > 15000) ms = 15000;
-
   String command = "BELT_RUN_MS " + String(ms);
-  Serial.print("[COMMAND_RECEIVED] ");
-  Serial.println(command);
+  Serial.print("[COMMAND_RECEIVED] "); Serial.println(command);
   String doneLine;
   bool ok = sendCommandAndWait(command, "DONE:BELT_RUN_MS", ms + 15000, doneLine);
-
   StaticJsonDocument<384> doc;
   doc["ok"] = ok;
   doc["command"] = command;
@@ -797,48 +755,46 @@ void handleBeltRun() {
   doc["doneLine"] = doneLine;
   doc["lastErrorLine"] = lastErrorLine;
   if (!ok) doc["error"] = "Timeout waiting for DONE:BELT_RUN_MS";
+  String out; serializeJson(doc, out); sendJson(ok ? 200 : 504, out);
+}
 
-  String out;
-  serializeJson(doc, out);
-  sendJson(ok ? 200 : 504, out);
+void handleBeltUntilIrLast() {
+  Serial.println("[COMMAND_RECEIVED] BELT_RUN_UNTIL_IR_LAST");
+  String doneLine;
+  bool ok = sendCommandAndWait("BELT_RUN_UNTIL_IR_LAST", "DONE:BELT_RUN_UNTIL_IR_LAST", 60000, doneLine);
+  StaticJsonDocument<384> doc;
+  doc["ok"] = ok;
+  doc["command"] = "BELT_RUN_UNTIL_IR_LAST";
+  doc["doneLine"] = doneLine;
+  doc["lastArduinoLine"] = lastArduinoLine;
+  doc["lastErrorLine"] = lastErrorLine;
+  if (!ok) doc["error"] = "Timeout waiting for DONE:BELT_RUN_UNTIL_IR_LAST";
+  String out; serializeJson(doc, out); sendJson(ok ? 200 : 504, out);
 }
 
 void handleDrop() {
   Serial.println("[COMMAND_RECEIVED] DROP_TO_LIFTER");
   String doneLine;
   bool ok = sendCommandAndWait("DROP_TO_LIFTER", "DONE:DROP_TO_LIFTER", 30000, doneLine);
-
   StaticJsonDocument<384> doc;
   doc["ok"] = ok;
   doc["command"] = "DROP_TO_LIFTER";
   doc["doneLine"] = doneLine;
   doc["lastErrorLine"] = lastErrorLine;
   if (!ok) doc["error"] = "Timeout waiting for DONE:DROP_TO_LIFTER";
-
-  String out;
-  serializeJson(doc, out);
-  sendJson(ok ? 200 : 504, out);
+  String out; serializeJson(doc, out); sendJson(ok ? 200 : 504, out);
 }
 
 void handleCommand() {
-  if (!server.hasArg("command")) {
-    sendJson(400, "{\"ok\":false,\"error\":\"Missing command\"}");
-    return;
-  }
-
+  if (!server.hasArg("command")) { sendJson(400, "{\"ok\":false,\"error\":\"Missing command\"}"); return; }
   String raw = server.arg("command");
-  raw.trim();
-  raw.toUpperCase();
-  Serial.print("[COMMAND_RECEIVED] ");
-  Serial.println(raw);
-
+  raw.trim(); raw.toUpperCase();
+  Serial.print("[COMMAND_RECEIVED] "); Serial.println(raw);
   String arduinoCommand = normalizeFirestoreCommand(raw);
 
-  // Automation commands are no-wait commands because the Arduino prints OK/AUTO logs,
-  // not DONE lines, and START_AUTOMATION stays running until IRFIRST detects a carton.
   if (arduinoCommand == "START_AUTOMATION" || arduinoCommand == "STOP_AUTOMATION") {
     sendToArduino(arduinoCommand);
-
+    publishAutomationStatus(arduinoCommand == "START_AUTOMATION");
     StaticJsonDocument<512> doc;
     doc["ok"] = true;
     doc["command"] = arduinoCommand;
@@ -848,38 +804,23 @@ void handleCommand() {
     doc["lastErrorLine"] = lastErrorLine;
     doc["source"] = server.arg("source");
     doc["queueId"] = server.arg("queueId");
-
-    String out;
-    serializeJson(doc, out);
-    sendJson(200, out);
-    return;
+    String out; serializeJson(doc, out); sendJson(200, out); return;
   }
 
-  String expectedDone = "";
-
-  if (arduinoCommand == "BELT_START") {
-    expectedDone = "DONE:BELT_START";
-  } else if (arduinoCommand == "BELT_STOP") {
-    expectedDone = "DONE:BELT_STOP";
-  } else if (arduinoCommand == "HOME") {
-    expectedDone = "DONE:HOME";
-  } else if (arduinoCommand == "START") {
-    expectedDone = "DONE:START";
-  } else if (arduinoCommand == "ULTRA") {
-    expectedDone = "DONE:ULTRA";
-  } else if (arduinoCommand == "TESTIR") {
-    expectedDone = "DONE:TESTIR";
-  } else if (arduinoCommand == "SCAN") {
-    expectedDone = "DONE:SCAN";
-  } else if (arduinoCommand == "DISPENSE") {
-    expectedDone = "DONE:DISPENSE";
-  } else {
-    expectedDone = "DONE:";
-  }
+  String expectedDone = "DONE:";
+  unsigned long timeoutMs = 140000;
+  if (arduinoCommand == "BELT_START") expectedDone = "DONE:BELT_START";
+  else if (arduinoCommand == "BELT_STOP") expectedDone = "DONE:BELT_STOP";
+  else if (arduinoCommand == "BELT_RUN_UNTIL_IR_LAST") { expectedDone = "DONE:BELT_RUN_UNTIL_IR_LAST"; timeoutMs = 60000; }
+  else if (arduinoCommand == "HOME") expectedDone = "DONE:HOME";
+  else if (arduinoCommand == "START") expectedDone = "DONE:START";
+  else if (arduinoCommand == "ULTRA") expectedDone = "DONE:ULTRA";
+  else if (arduinoCommand == "TESTIR") expectedDone = "DONE:TESTIR";
+  else if (arduinoCommand == "SCAN") expectedDone = "DONE:SCAN";
+  else if (arduinoCommand == "DISPENSE") expectedDone = "DONE:DISPENSE";
 
   String doneLine;
-  bool ok = sendCommandAndWait(arduinoCommand, expectedDone, 140000, doneLine);
-
+  bool ok = sendCommandAndWait(arduinoCommand, expectedDone, timeoutMs, doneLine);
   StaticJsonDocument<512> doc;
   doc["ok"] = ok;
   doc["command"] = arduinoCommand;
@@ -889,56 +830,32 @@ void handleCommand() {
   doc["lastErrorLine"] = lastErrorLine;
   doc["source"] = server.arg("source");
   doc["queueId"] = server.arg("queueId");
-
-  if (!ok) {
-    doc["error"] = "Timeout waiting for response";
-  }
-
-  String out;
-  serializeJson(doc, out);
-  sendJson(ok ? 200 : 504, out);
+  if (!ok) doc["error"] = "Timeout waiting for response";
+  String out; serializeJson(doc, out); sendJson(ok ? 200 : 504, out);
 }
 
 void handleUltra() {
   String doneLine;
   bool ok = sendCommandAndWait("ULTRA", "DONE:ULTRA", 20000, doneLine);
-
   StaticJsonDocument<512> doc;
   doc["ok"] = ok;
   doc["line"] = doneLine;
   doc["lastArduinoLine"] = lastArduinoLine;
   doc["lastErrorLine"] = lastErrorLine;
-
   JsonObject ultra = doc.createNestedObject("ultra");
-
-  // Prefer latest status JSON if available
   if (latestStatusValid) {
     ultra["ultrasonicCm"] = latestStatus["ultrasonicCm"] | -1.0;
     ultra["ultrasonicReady"] = latestStatus["ultrasonicReady"] | false;
   }
-
-  if (!ok) {
-    doc["error"] = "Timeout waiting for ULTRA";
-  }
-
-  String out;
-  serializeJson(doc, out);
-  sendJson(ok ? 200 : 504, out);
+  if (!ok) doc["error"] = "Timeout waiting for ULTRA";
+  String out; serializeJson(doc, out); sendJson(ok ? 200 : 504, out);
 }
 
 void handleVerifyLocation() {
-  if (!server.hasArg("id")) {
-    sendJson(400, "{\"ok\":false,\"error\":\"Missing location id\"}");
-    return;
-  }
-
+  if (!server.hasArg("id")) { sendJson(400, "{\"ok\":false,\"error\":\"Missing location id\"}"); return; }
   int id = server.arg("id").toInt();
-  if (id < 1 || id > 9) {
-    sendJson(400, "{\"ok\":false,\"error\":\"Invalid location id. Use 1..9\"}");
-    return;
-  }
-
-  if (id != 8 && id != 9) {
+  if (id < 1 || id > 9) { sendJson(400, "{\"ok\":false,\"error\":\"Invalid location id. Use 1..9\"}"); return; }
+  if (id != 7 && id != 8 && id != 9) {
     StaticJsonDocument<256> doc;
     doc["ok"] = true;
     JsonObject verification = doc.createNestedObject("verification");
@@ -946,27 +863,20 @@ void handleVerifyLocation() {
     verification["detected"] = true;
     verification["line"] = "PROTOTYPE_BYPASS";
     verification["prototypeBypass"] = true;
-
-    String out;
-    serializeJson(doc, out);
-    sendJson(200, out);
-    return;
+    String out; serializeJson(doc, out); sendJson(200, out); return;
   }
 
   String command = "VERIFY_LOCATION " + String(id);
-  Serial.print("[COMMAND_RECEIVED] ");
-  Serial.println(command);
+  Serial.print("[COMMAND_RECEIVED] "); Serial.println(command);
   String doneLine;
   bool ok = sendCommandAndWait(command, "DONE:VERIFY_LOCATION", 20000, doneLine);
-
   bool detected = true;
-
-  // For prototype: only locations 8 and 9 are real verification.
-  if (latestStatusValid && latestStatus.containsKey("detected")) {
-    detected = latestStatus["detected"] | false;
-  } else {
-    detected = doneLine.indexOf("DETECTED") >= 0;
-  }
+  if (latestStatusValid && latestStatus.containsKey("detected")) detected = latestStatus["detected"] | false;
+  else detected = doneLine.indexOf("DETECTED") >= 0;
+  String locKey = "loc" + String(id) + "Detected";
+  latestStatus[locKey] = detected;
+  latestStatusValid = true;
+  publishHardwareStatus(true);
 
   StaticJsonDocument<512> doc;
   doc["ok"] = ok;
@@ -975,97 +885,68 @@ void handleVerifyLocation() {
   verification["detected"] = detected;
   verification["line"] = doneLine;
   verification["prototypeBypass"] = false;
-
-  if (!ok) {
-    doc["error"] = "Timeout waiting for VERIFY_LOCATION";
-  }
-
-  String out;
-  serializeJson(doc, out);
-  sendJson(ok ? 200 : 504, out);
+  if (!ok) doc["error"] = "Timeout waiting for VERIFY_LOCATION";
+  String out; serializeJson(doc, out); sendJson(ok ? 200 : 504, out);
 }
 
 void handleAutomationStart() {
   Serial.println("[COMMAND_RECEIVED] START_AUTOMATION");
   sendToArduino("START_AUTOMATION");
-
+  publishAutomationStatus(true);
   StaticJsonDocument<384> doc;
   doc["ok"] = true;
   doc["command"] = "START_AUTOMATION";
   doc["message"] = "Automation start sent to Arduino";
   doc["lastArduinoLine"] = lastArduinoLine;
   doc["lastErrorLine"] = lastErrorLine;
-
-  String out;
-  serializeJson(doc, out);
-  sendJson(200, out);
+  String out; serializeJson(doc, out); sendJson(200, out);
 }
 
 void handleAutomationStop() {
   Serial.println("[COMMAND_RECEIVED] STOP_AUTOMATION");
   sendToArduino("STOP_AUTOMATION");
-
+  publishAutomationStatus(false);
   StaticJsonDocument<384> doc;
   doc["ok"] = true;
   doc["command"] = "STOP_AUTOMATION";
   doc["message"] = "Automation stop sent to Arduino";
   doc["lastArduinoLine"] = lastArduinoLine;
   doc["lastErrorLine"] = lastErrorLine;
-
-  String out;
-  serializeJson(doc, out);
-  sendJson(200, out);
+  String out; serializeJson(doc, out); sendJson(200, out);
 }
 
 void setupRoutes() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
-
   server.on("/go", HTTP_GET, handleGo);
   server.on("/start", HTTP_GET, handleStart);
-
   server.on("/automation/start", HTTP_GET, handleAutomationStart);
   server.on("/automation/stop", HTTP_GET, handleAutomationStop);
-
   server.on("/belt/start", HTTP_GET, handleBeltStart);
   server.on("/belt/stop", HTTP_GET, handleBeltStop);
   server.on("/belt/run", HTTP_GET, handleBeltRun);
-
+  server.on("/belt/until-ir-last", HTTP_GET, handleBeltUntilIrLast);
   server.on("/drop", HTTP_GET, handleDrop);
   server.on("/command", HTTP_GET, handleCommand);
   server.on("/ultra", HTTP_GET, handleUltra);
   server.on("/verify-location", HTTP_GET, handleVerifyLocation);
 
   server.onNotFound([]() {
-    if (server.method() == HTTP_OPTIONS) {
-      handleOptions();
-      return;
-    }
-
+    if (server.method() == HTTP_OPTIONS) { handleOptions(); return; }
     StaticJsonDocument<256> doc;
     doc["ok"] = false;
     doc["error"] = "Route not found";
     doc["uri"] = server.uri();
-
-    String out;
-    serializeJson(doc, out);
-    sendJson(404, out);
+    String out; serializeJson(doc, out); sendJson(404, out);
   });
 }
-
-// =====================================================
-// SETUP / LOOP
-// =====================================================
 
 void setup() {
   Serial.begin(115200);
   Serial2.begin(ARDUINO_BAUD, SERIAL_8N1, RXD2, TXD2);
-
   connectWiFi();
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  if (!waitForTimeSync()) {
-    Serial.println("[FIRESTORE_UPDATE] Time sync failed; timestamps will use fallback until NTP syncs.");
-  }
+  if (!waitForTimeSync()) Serial.println("[FIRESTORE_UPDATE] Time sync failed; timestamps will use fallback until NTP syncs.");
 
   setupRoutes();
   server.begin();
@@ -1082,6 +963,7 @@ void setup() {
   Serial.println("GET /belt/start");
   Serial.println("GET /belt/stop");
   Serial.println("GET /belt/run?ms=3000");
+  Serial.println("GET /belt/until-ir-last");
   Serial.println("GET /drop");
   Serial.println("GET /command?command=STATUS");
   Serial.println("GET /ultra");
@@ -1094,11 +976,9 @@ void loop() {
   pollFirestoreCommands();
   publishHardwareStatus(false);
 
-  // Reconnect WiFi if disconnected
   static unsigned long lastWifiCheck = 0;
   if (millis() - lastWifiCheck > 5000) {
     lastWifiCheck = millis();
-
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("WiFi disconnected. Reconnecting...");
       WiFi.disconnect();

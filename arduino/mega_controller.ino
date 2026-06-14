@@ -1,3 +1,4 @@
+//arduino
 #include <DHT.h>
 
 // ================= SENSORS =================
@@ -29,6 +30,8 @@ unsigned long lastSensorSend = 0;
 
 bool beltRunning = false;
 bool autoMode = false;
+bool waitingForWebsiteDecision = false;
+bool movingToIRLast = false;
 
 // ================= LOCATION IR MUX =================
 #define LOC_MUX_OUT 41
@@ -103,6 +106,13 @@ Position positions[18] = {
   {2402, 2525, 1846}, {2402, 2257, 1846}
 };
 
+// ================= REPLY TO PC + ESP =================
+
+void reply(String msg) {
+  Serial.println(msg);
+  Serial1.println(msg);
+}
+
 void setup() {
   Serial.begin(115200);
   Serial1.begin(9600);
@@ -158,7 +168,7 @@ void setup() {
   Serial.println("GO STARTING POINT...");
   goStartingPoint();
 
-  Serial.println("READY");
+  reply("READY");
   printHelp();
 }
 
@@ -192,84 +202,152 @@ void readCommandFrom(Stream &port) {
 void handleCommand(String cmd) {
   if (cmd == "HELP") {
     printHelp();
+    reply("DONE:HELP");
   }
 
   else if (cmd == "AUTO" || cmd == "START_AUTOMATION") {
+    // STEP 1:
+    // Start conveyor and stop exactly at IRFIRST.
+    // Raspberry reads OCR while the box is stopped at camera.
     autoMode = true;
+    waitingForWebsiteDecision = false;
+    movingToIRLast = false;
 
     if (!beltRunning) {
       beltToggle();
     }
 
-    Serial.println("OK AUTO STARTED - BELT ON UNTIL IRFIRST");
+    reply("OK AUTO STARTED - BELT ON UNTIL IRFIRST");
   }
 
   else if (cmd == "STOP" || cmd == "STOP_AUTOMATION") {
     autoMode = false;
+    waitingForWebsiteDecision = false;
+    movingToIRLast = false;
 
     if (beltRunning) {
       beltToggle();
     }
 
-    Serial.println("OK AUTO STOPPED - BELT OFF");
+    reply("OK AUTO STOPPED - BELT OFF");
   }
 
   else if (cmd == "HOME" || cmd == "H") {
     autoMode = false;
     homeAll();
-    Serial.println("OK HOME");
+    reply("DONE:HOME");
   }
 
   else if (cmd == "START" || cmd == "S") {
     goStartingPoint();
-    Serial.println("OK STARTING POINT");
+    reply("DONE:START");
   }
 
   else if (cmd == "BELT_START" || cmd == "BON") {
     if (!beltRunning) {
       beltToggle();
     }
-    Serial.println("OK BELT START");
+    reply("DONE:BELT_START");
   }
 
   else if (cmd == "BELT_STOP" || cmd == "BOFF") {
     if (beltRunning) {
       beltToggle();
     }
-    Serial.println("OK BELT STOP");
+    reply("DONE:BELT_STOP");
+  }
+
+  else if (
+    cmd == "BELT_RUN_UNTIL_IR_LAST" ||
+    cmd == "BELT_RUN_UNTIL_IRLAST" ||
+    cmd == "BELT_RUN_UNTIL_LAST" ||
+    cmd == "MOVE_TO_IRLAST" ||
+    cmd == "MOVE_TO_IR_LAST" ||
+    cmd == "BELT_RUN_UNTIL_IR_LIFTER" ||
+    cmd == "BELT_RUN_UNTIL_IRLIFTER"
+  ) {
+    // STEP 2:
+    // Website sends this only after Raspberry confirms OCR and website decides/starts processing.
+    // Continue conveyor from IRFIRST area until IRLAST, then stop.
+    runBeltUntilIRLast(45000);
   }
 
   else if (cmd == "BELT" || cmd == "B") {
     beltToggle();
-    Serial.println("OK BELT TOGGLE");
+    reply("DONE:BELT");
+  }
+
+  else if (cmd.startsWith("BELT_RUN_MS")) {
+    int ms = cmd.substring(11).toInt();
+    if (ms <= 0) ms = 3000;
+
+    if (!beltRunning) beltToggle();
+    delay(ms);
+    if (beltRunning) beltToggle();
+
+    reply("DONE:BELT_RUN_MS");
+  }
+
+  else if (cmd == "DROP_TO_LIFTER") {
+    if (!beltRunning) beltToggle();
+    delay(3000);
+    if (beltRunning) beltToggle();
+
+    reply("DONE:DROP_TO_LIFTER");
   }
 
   else if (cmd == "DISPENSE" || cmd == "D") {
     dispenseOne();
-    Serial.println("OK DISPENSE");
+    reply("DONE:DISPENSE");
   }
 
   else if (cmd == "SCAN" || cmd == "CAMERA") {
     sendCameraScan();
-    Serial.println("OK CAMERA SCAN");
+    reply("DONE:SCAN");
   }
 
   else if (cmd == "STATUS") {
     printStatus();
+    reply("DONE:STATUS");
   }
 
   else if (cmd == "TESTIR") {
     testIRs();
+    reply("DONE:TESTIR");
   }
 
   else if (cmd == "TESTLIM") {
     testLimits();
+    reply("DONE:TESTLIM");
   }
 
   else if (cmd == "ULTRA") {
+    float d = readAverageDistanceCM();
     Serial.print("ULTRA = ");
-    Serial.print(readAverageDistanceCM());
+    Serial.print(d);
     Serial.println(" cm");
+
+    Serial1.print("ULTRA = ");
+    Serial1.print(d);
+    Serial1.println(" cm");
+
+    reply("DONE:ULTRA");
+  }
+
+  else if (cmd.startsWith("VERIFY_LOCATION ")) {
+    int id = cmd.substring(16).toInt();
+    bool detected = false;
+
+    if (id == 9) detected = readLocationIR(0);
+    else if (id == 8) detected = readLocationIR(1);
+    else if (id == 7) detected = readLocationIR(2);
+    else detected = true;
+
+    if (detected) {
+      reply("DONE:VERIFY_LOCATION DETECTED");
+    } else {
+      reply("DONE:VERIFY_LOCATION CLEAR");
+    }
   }
 
   else if (cmd.startsWith("GO ")) {
@@ -277,10 +355,9 @@ void handleCommand(String cmd) {
 
     if (n >= 1 && n <= 18) {
       goPosition(n);
-      Serial.print("OK GO ");
-      Serial.println(n);
+      reply("DONE:" + String(n));
     } else {
-      Serial.println("ERROR BAD POSITION");
+      reply("ERROR:BAD_POSITION");
     }
   }
 
@@ -295,10 +372,9 @@ void handleCommand(String cmd) {
       goPosition(outPos);
       goStartingPoint();
 
-      Serial.print("OK SITE ");
-      Serial.println(site);
+      reply("DONE:SITE " + String(site));
     } else {
-      Serial.println("ERROR BAD SITE");
+      reply("ERROR:BAD_SITE");
     }
   }
 
@@ -307,8 +383,9 @@ void handleCommand(String cmd) {
 
     if (n >= 1 && n <= 18) {
       goPosition(n);
+      reply("DONE:" + String(n));
     } else {
-      Serial.println("ERROR UNKNOWN COMMAND");
+      reply("ERROR:UNKNOWN_COMMAND");
     }
   }
 }
@@ -357,6 +434,9 @@ void updateSensors() {
     humidity = -1;
   }
 
+  float ultraCm = readAverageDistanceCM();
+  bool ultrasonicReady = ultraCm > 0 && ultraCm <= 18.0;
+
   String data = "{";
   data += "\"motion\":" + String(motionState == HIGH ? 1 : 0) + ",";
   data += "\"waterValue\":" + String(waterValue) + ",";
@@ -369,6 +449,14 @@ void updateSensors() {
   data += "\"belt\":" + String(beltRunning ? 1 : 0) + ",";
   data += "\"irFirst\":" + String(readIRFIRST()) + ",";
   data += "\"irLast\":" + String(readIRLAST()) + ",";
+  data += "\"irCamera\":" + String(readIRFIRST() ? "true" : "false") + ",";
+  data += "\"irLifter\":" + String(readIRLAST() ? "true" : "false") + ",";
+  data += "\"loc7Detected\":" + String(readLocationIR(2) ? "true" : "false") + ",";
+  data += "\"loc8Detected\":" + String(readLocationIR(1) ? "true" : "false") + ",";
+  data += "\"loc9Detected\":" + String(readLocationIR(0) ? "true" : "false") + ",";
+  data += "\"atStartingPoint\":" + String(currentPositionIndex == -1 ? "true" : "false") + ",";
+  data += "\"ultrasonicCm\":" + String(ultraCm, 2) + ",";
+  data += "\"ultrasonicReady\":" + String(ultrasonicReady ? "true" : "false") + ",";
   data += "\"x\":" + String(currentX) + ",";
   data += "\"y\":" + String(currentY) + ",";
   data += "\"z\":" + String(currentZ);
@@ -379,9 +467,6 @@ void updateSensors() {
 }
 
 // ================= IR READINGS =================
-// بدون جسم = HIGH
-// مع جسم = LOW
-// بالكود: بدون جسم = 0 / مع جسم = 1
 
 int readIRFIRST() {
   if (digitalRead(IRFIRST) == LOW) return 1;
@@ -400,6 +485,79 @@ bool irFirstDetected() {
 bool irLastDetected() {
   return readIRLAST() == 1;
 }
+
+
+// ================= BELT RUN UNTIL LAST IR =================
+
+bool readStopCommandDuringBeltWait(Stream &port) {
+  if (!port.available()) return false;
+
+  String tempCmd = port.readStringUntil('\n');
+  tempCmd.trim();
+  tempCmd.toUpperCase();
+
+  return (
+    tempCmd == "STOP" ||
+    tempCmd == "STOP_AUTOMATION" ||
+    tempCmd == "BELT_STOP" ||
+    tempCmd == "BOFF"
+  );
+}
+
+void runBeltUntilIRLast(unsigned long timeoutMs) {
+  autoMode = false;
+  waitingForWebsiteDecision = false;
+  movingToIRLast = true;
+
+  reply("BELT_RUN_UNTIL_IR_LAST_STARTED");
+
+  if (irLastDetected()) {
+    if (beltRunning) {
+      beltToggle();
+    }
+    movingToIRLast = false;
+    reply("DONE:BELT_RUN_UNTIL_IR_LAST");
+    return;
+  }
+
+  if (!beltRunning) {
+    beltToggle();
+  }
+
+  unsigned long startedAt = millis();
+
+  while (!irLastDetected()) {
+    updateSensors();
+
+    if (readStopCommandDuringBeltWait(Serial) || readStopCommandDuringBeltWait(Serial1)) {
+      if (beltRunning) {
+        beltToggle();
+      }
+      movingToIRLast = false;
+      reply("ERROR:BELT_RUN_UNTIL_IR_LAST_STOPPED");
+      return;
+    }
+
+    if (millis() - startedAt > timeoutMs) {
+      if (beltRunning) {
+        beltToggle();
+      }
+      movingToIRLast = false;
+      reply("ERROR:BELT_RUN_UNTIL_IR_LAST_TIMEOUT");
+      return;
+    }
+
+    delay(20);
+  }
+
+  if (beltRunning) {
+    beltToggle();
+  }
+
+  movingToIRLast = false;
+  reply("DONE:BELT_RUN_UNTIL_IR_LAST");
+}
+
 
 // ================= AUTO SEQUENCE =================
 
@@ -430,7 +588,11 @@ void runAutoCycle() {
   }
 
   autoMode = false;
-  Serial.println("OK AUTO STEP 1 DONE");
+  waitingForWebsiteDecision = true;
+  movingToIRLast = false;
+
+  // Now Raspberry should read OCR and website should send BELT_RUN_UNTIL_IR_LAST.
+  reply("OK AUTO STEP 1 DONE IRFIRST");
 }
 
 // ================= BELT =================
@@ -445,6 +607,7 @@ void beltToggle() {
   relayPulse();
   beltRunning = !beltRunning;
   Serial.println(beltRunning ? "BELT STATE = ON" : "BELT STATE = OFF");
+  Serial1.println(beltRunning ? "BELT STATE = ON" : "BELT STATE = OFF");
 }
 
 // ================= DISPENSER =================
@@ -461,7 +624,7 @@ void dispenseOne() {
 // ================= CAMERA =================
 
 void sendCameraScan() {
-  Serial.println("CAMERA_SCAN");
+  reply("CAMERA_SCAN");
 }
 
 // ================= LOCATION IR MUX =================
@@ -783,6 +946,12 @@ void printStatus() {
   Serial.print("BELT TRACKED STATE = ");
   Serial.println(beltRunning ? "ON" : "OFF");
 
+  Serial.print("WAITING WEBSITE DECISION = ");
+  Serial.println(waitingForWebsiteDecision ? "YES" : "NO");
+
+  Serial.print("MOVING TO IRLAST = ");
+  Serial.println(movingToIRLast ? "YES" : "NO");
+
   Serial.print("IRFIRST = ");
   Serial.println(readIRFIRST() == 1 ? "DETECTED" : "CLEAR");
 
@@ -822,13 +991,16 @@ void testLimits() {
 
 void printHelp() {
   Serial.println("Commands:");
-  Serial.println("AUTO / START_AUTOMATION");
+  Serial.println("AUTO / START_AUTOMATION = run belt until IRFIRST, then stop for OCR");
   Serial.println("STOP / STOP_AUTOMATION");
   Serial.println("HOME / H");
   Serial.println("START / S");
   Serial.println("BELT_START / BON");
   Serial.println("BELT_STOP / BOFF");
   Serial.println("BELT / B = TOGGLE");
+  Serial.println("BELT_RUN_MS 3000");
+  Serial.println("BELT_RUN_UNTIL_IR_LAST = continue belt from IRFIRST to IRLAST, then stop");
+  Serial.println("DROP_TO_LIFTER");
   Serial.println("DISPENSE / D");
   Serial.println("CAMERA / SCAN");
   Serial.println("SITE 1 to SITE 9");
@@ -837,4 +1009,5 @@ void printHelp() {
   Serial.println("TESTIR");
   Serial.println("TESTLIM");
   Serial.println("ULTRA");
+  Serial.println("VERIFY_LOCATION 7/8/9");
 }

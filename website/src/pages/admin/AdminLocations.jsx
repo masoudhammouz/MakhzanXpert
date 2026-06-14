@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { collection, doc, getDoc, getDocs, serverTimestamp, setDoc } from 'firebase/firestore';
+import { collection, deleteField, doc, getDoc, getDocs, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
@@ -66,6 +66,7 @@ function AdminLocations() {
   const [locations, setLocations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [resetting, setResetting] = useState(false);
   const [selectedLocation, setSelectedLocation] = useState(null);
 
   const initializeWarehouse = async () => {
@@ -120,6 +121,49 @@ function AdminLocations() {
   useEffect(() => {
     loadLocations();
   }, []);
+
+  const resetAllLocations = async () => {
+    if (!window.confirm('Reset all warehouse locations?')) return;
+
+    setResetting(true);
+    setError('');
+
+    try {
+      const batch = writeBatch(db);
+      for (let position = 1; position <= TOTAL_LOCATIONS; position += 1) {
+        batch.set(doc(db, 'locations', String(position)), {
+          status: 'empty',
+          occupied: false,
+          isOccupied: false,
+          position,
+          locationId: position,
+          productKey: deleteField(),
+          productId: deleteField(),
+          normalizedSku: deleteField(),
+          brand: deleteField(),
+          model: deleteField(),
+          color: deleteField(),
+          size: deleteField(),
+          scanId: deleteField(),
+          reservedAt: deleteField(),
+          reservedBy: deleteField(),
+          assignmentStatus: deleteField(),
+          selectedLocation: deleteField(),
+          inPosition: deleteField(),
+          outPosition: deleteField(),
+          commandId: deleteField(),
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+      }
+      await batch.commit();
+      setSelectedLocation(null);
+      await loadLocations();
+    } catch {
+      setError('Unable to reset warehouse locations.');
+    } finally {
+      setResetting(false);
+    }
+  };
 
   const locationsById = useMemo(() => {
     const map = new Map();
@@ -178,6 +222,9 @@ function AdminLocations() {
             <code>{'Location 1: IN GO 1 / OUT GO 2'}</code>
             <code>{'Location 9: IN GO 17 / OUT GO 18'}</code>
           </div>
+          <button className="button button-danger" type="button" onClick={resetAllLocations} disabled={loading || resetting}>
+            {resetting ? 'Resetting...' : 'Reset All Locations'}
+          </button>
         </div>
 
         {loading ? (
