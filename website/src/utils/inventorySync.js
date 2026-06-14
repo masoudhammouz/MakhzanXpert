@@ -87,6 +87,12 @@ function productSkuFromLocation(location) {
   );
 }
 
+function productKeyFromProduct(product) {
+  return product?.productKey || [product?.brand, product?.model, product?.color, product?.size]
+    .map((value) => String(value || '').trim().toUpperCase())
+    .join('|');
+}
+
 async function logInventoryActivity(type, message, details = {}) {
   const data = {
     type,
@@ -274,6 +280,7 @@ export async function markPickedLocationEmpty(locationId, context = {}) {
       isOccupied: false,
       reservedForOrder: null,
       reservedForOrderId: null,
+      reservedOrderItemKey: deleteField(),
       clearedAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
       productKey: deleteField(),
@@ -288,6 +295,7 @@ export async function markPickedLocationEmpty(locationId, context = {}) {
       commandId: deleteField(),
       reservedAt: deleteField(),
       filledAt: deleteField(),
+      filledBy: deleteField(),
       inPosition: deleteField(),
       outPosition: deleteField(),
       sortingMode: deleteField(),
@@ -308,6 +316,139 @@ export async function markPickedLocationEmpty(locationId, context = {}) {
   );
   await recomputeProductInventoryFromLocations(productIdOrSku);
   return pickedLocation;
+}
+
+export async function markLocationFullManual(locationId, product) {
+  const locationRef = doc(db, 'locations', String(locationId));
+  const sku = product?.normalizedSku || product?.sku || buildNormalizedSku(product);
+  const productId = product?.id || product?.productId || sku;
+  const productKey = productKeyFromProduct(product);
+
+  const filledLocation = await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(locationRef);
+    const current = snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : { id: String(locationId) };
+    const isEmpty = (
+      !snapshot.exists() ||
+      (
+        String(current.status || 'empty').toLowerCase() === 'empty' &&
+        current.reserved !== true &&
+        current.occupied !== true &&
+        current.isOccupied !== true
+      )
+    );
+
+    if (!isEmpty) {
+      throw new Error('Location is not empty.');
+    }
+
+    const data = {
+      status: 'full',
+      reserved: false,
+      occupied: true,
+      isOccupied: true,
+      reservedForOrder: null,
+      reservedForOrderId: null,
+      locationId: Number(locationId),
+      position: Number(locationId),
+      productId,
+      sku,
+      normalizedSku: sku,
+      productKey,
+      brand: product?.brand || '',
+      model: product?.model || product?.name || '',
+      color: product?.color || '',
+      size: product?.size || '',
+      filledAt: serverTimestamp(),
+      filledBy: 'manual',
+      updatedAt: serverTimestamp(),
+    };
+
+    transaction.set(locationRef, data, { merge: true });
+    return { ...current, ...data };
+  });
+
+  console.info('[MANUAL_LOCATION_FILLED]', { locationId, productId, sku, productKey });
+  await logInventoryActivity(
+    'MANUAL_LOCATION_FILLED',
+    `Location ${locationId} manually filled with ${productKey || sku}.`,
+    { locationId, productId, sku, productKey },
+  );
+
+  const result = await recomputeProductInventoryFromLocations(sku);
+  console.info('[INVENTORY_RECOMPUTED_FROM_MANUAL_LOCATION]', { locationId, productId, sku, result });
+  result.products?.forEach((item) => {
+    console.info('[PRODUCT_STOCK_UPDATED_AFTER_MANUAL_FILL]', { locationId, productId: item.id, ...item });
+  });
+  await logInventoryActivity(
+    'INVENTORY_RECOMPUTED_FROM_MANUAL_LOCATION',
+    `Inventory recomputed after manual fill at location ${locationId}.`,
+    { locationId, productId, sku, result },
+  );
+
+  return filledLocation;
+}
+
+export async function clearLocationManual(locationId) {
+  const locationRef = doc(db, 'locations', String(locationId));
+  const clearedLocation = await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(locationRef);
+    if (!snapshot.exists()) return null;
+
+    const current = { id: snapshot.id, ...snapshot.data() };
+    if (String(current.status || '').toLowerCase() !== 'full' || (current.occupied !== true && current.isOccupied !== true)) {
+      throw new Error('Location is not full.');
+    }
+
+    transaction.set(locationRef, {
+      status: 'empty',
+      reserved: false,
+      occupied: false,
+      isOccupied: false,
+      reservedForOrder: null,
+      reservedForOrderId: null,
+      reservedOrderItemKey: deleteField(),
+      clearedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      productKey: deleteField(),
+      productId: deleteField(),
+      sku: deleteField(),
+      normalizedSku: deleteField(),
+      brand: deleteField(),
+      model: deleteField(),
+      color: deleteField(),
+      size: deleteField(),
+      scanId: deleteField(),
+      commandId: deleteField(),
+      reservedAt: deleteField(),
+      filledAt: deleteField(),
+      filledBy: deleteField(),
+      inPosition: deleteField(),
+      outPosition: deleteField(),
+      sortingMode: deleteField(),
+      boxId: deleteField(),
+    }, { merge: true });
+
+    return current;
+  });
+
+  if (!clearedLocation) return null;
+
+  const productIdOrSku = productSkuFromLocation(clearedLocation);
+  console.info('[MANUAL_LOCATION_CLEAR]', { locationId, productIdOrSku });
+  await logInventoryActivity(
+    'MANUAL_LOCATION_CLEAR',
+    `Location ${locationId} manually cleared.`,
+    { locationId, productIdOrSku },
+  );
+
+  const result = await recomputeProductInventoryFromLocations(productIdOrSku);
+  console.info('[INVENTORY_RECOMPUTED_FROM_MANUAL_LOCATION]', { locationId, productIdOrSku, result });
+  await logInventoryActivity(
+    'INVENTORY_RECOMPUTED_FROM_MANUAL_LOCATION',
+    `Inventory recomputed after manual clear at location ${locationId}.`,
+    { locationId, productIdOrSku, result },
+  );
+  return clearedLocation;
 }
 
 export function markLocationFullAfterDelay(locationId, options = {}) {

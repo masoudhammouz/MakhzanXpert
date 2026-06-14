@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
-import { collection, deleteField, doc, getDoc, getDocs, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
-import EmptyState from '../../components/EmptyState.jsx';
+import { collection, deleteField, doc, getDoc, getDocs, orderBy, query, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
 import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
-import { syncAllProductInventoryFromLocations } from '../../utils/inventorySync.js';
+import { clearLocationManual, markLocationFullManual, syncAllProductInventoryFromLocations } from '../../utils/inventorySync.js';
+import { buildNormalizedSku } from '../../utils/productVisibility.js';
 
 const WAREHOUSE_GRID = [
   [9, 8, 7],
@@ -47,6 +47,25 @@ function getProductName(location) {
   return name || 'No product assigned';
 }
 
+function getProductTitle(product) {
+  return product.name || [product.brand, product.model, product.color, product.size ? `Size ${product.size}` : '']
+    .filter(Boolean)
+    .join(' ') || product.id;
+}
+
+function isEmptyLocation(location) {
+  return (
+    String(location?.status || 'empty').toLowerCase() === 'empty' &&
+    location?.reserved !== true &&
+    location?.occupied !== true &&
+    location?.isOccupied !== true
+  );
+}
+
+function isFullLocation(location) {
+  return String(location?.status || '').toLowerCase() === 'full' && (location?.occupied === true || location?.isOccupied === true);
+}
+
 function getTimestampValue(value) {
   if (value?.toMillis) return value.toMillis();
   if (value instanceof Date) return value.getTime();
@@ -67,8 +86,14 @@ function AdminLocations() {
   const [locations, setLocations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [resetting, setResetting] = useState(false);
   const [selectedLocation, setSelectedLocation] = useState(null);
+  const [products, setProducts] = useState([]);
+  const [manualLocation, setManualLocation] = useState(null);
+  const [selectedProductId, setSelectedProductId] = useState('');
+  const [manualError, setManualError] = useState('');
+  const [manualSaving, setManualSaving] = useState(false);
 
   const initializeWarehouse = async () => {
     await setDoc(doc(db, 'settings', 'system'), DEFAULT_SYSTEM_SETTINGS, { merge: true });
@@ -119,9 +144,73 @@ function AdminLocations() {
     }
   };
 
+  const loadProducts = async () => {
+    try {
+      const productsSnapshot = await getDocs(query(collection(db, 'products'), orderBy('createdAt', 'desc')));
+      setProducts(productsSnapshot.docs.map((productDoc) => ({ id: productDoc.id, ...productDoc.data() })));
+    } catch {
+      setError('Unable to load products for manual location fill.');
+    }
+  };
+
   useEffect(() => {
     loadLocations();
+    loadProducts();
   }, []);
+
+  const openManualFill = (location) => {
+    setManualLocation(location);
+    setSelectedProductId('');
+    setManualError('');
+    setNotice('');
+    console.info('[MANUAL_LOCATION_FILL_OPENED]', { locationId: location.position || location.id });
+  };
+
+  const handleManualFill = async (event) => {
+    event.preventDefault();
+    if (!manualLocation) return;
+
+    const product = products.find((item) => item.id === selectedProductId);
+    if (!product) {
+      setManualError('Select a product first.');
+      return;
+    }
+
+    setManualSaving(true);
+    setManualError('');
+    setNotice('');
+
+    try {
+      await markLocationFullManual(manualLocation.position || manualLocation.id, product);
+      setNotice(`Location ${manualLocation.position || manualLocation.id} filled manually.`);
+      setManualLocation(null);
+      setSelectedProductId('');
+      await loadLocations();
+    } catch (manualFillError) {
+      setManualError(manualFillError.message || 'Unable to fill this location manually.');
+    } finally {
+      setManualSaving(false);
+    }
+  };
+
+  const handleManualClear = async (location) => {
+    if (!window.confirm(`Clear location ${location.position || location.id}?`)) return;
+
+    setManualSaving(true);
+    setError('');
+    setNotice('');
+
+    try {
+      await clearLocationManual(location.position || location.id);
+      setNotice(`Location ${location.position || location.id} cleared.`);
+      setSelectedLocation(null);
+      await loadLocations();
+    } catch (clearError) {
+      setError(clearError.message || 'Unable to clear this location.');
+    } finally {
+      setManualSaving(false);
+    }
+  };
 
   const resetAllLocations = async () => {
     if (!window.confirm('Reset all warehouse locations?')) return;
@@ -150,6 +239,10 @@ function AdminLocations() {
           scanId: deleteField(),
           reservedAt: deleteField(),
           filledAt: deleteField(),
+          filledBy: deleteField(),
+          reservedForOrder: deleteField(),
+          reservedForOrderId: deleteField(),
+          reservedOrderItemKey: deleteField(),
           reservedBy: deleteField(),
           assignmentStatus: deleteField(),
           selectedLocation: deleteField(),
@@ -234,29 +327,52 @@ function AdminLocations() {
 
         {loading ? (
           <LoadingState message="Loading warehouse locations..." />
-        ) : error ? (
-          <EmptyState title="Locations unavailable" description={error} />
         ) : (
-          <div className="warehouse-grid" aria-label="Warehouse layout grid">
-            {WAREHOUSE_GRID.flat().map((position) => {
-              const location = locationsById.get(position);
-              const status = getLocationStatus(location);
+          <>
+            {error && <p className="admin-form-error">{error}</p>}
+            {notice && <p className="admin-form-success">{notice}</p>}
+            <div className="warehouse-grid" aria-label="Warehouse layout grid">
+              {WAREHOUSE_GRID.flat().map((position) => {
+                const location = locationsById.get(position);
+                const status = getLocationStatus(location);
+                const empty = isEmptyLocation(location);
+                const full = isFullLocation(location);
 
-              return (
-                <button
-                  key={position}
-                  className={`warehouse-location-card ${status.className}`}
-                  type="button"
-                  onClick={() => setSelectedLocation(location)}
-                >
-                  <span className="warehouse-location-number">Position {position}</span>
-                  <span className="status-badge">{status.label}</span>
-                  <strong>{getProductName(location)}</strong>
-                  <span>Status: {location.status || 'empty'}</span>
-                </button>
-              );
-            })}
-          </div>
+                return (
+                  <article
+                    key={position}
+                    className={`warehouse-location-card ${status.className}`}
+                  >
+                    <button
+                      className="warehouse-location-main"
+                      type="button"
+                      onClick={() => setSelectedLocation(location)}
+                    >
+                      <span className="warehouse-location-number">Position {position}</span>
+                      <span className="status-badge">{status.label}</span>
+                      <strong>{getProductName(location)}</strong>
+                      <span>Status: {location.status || 'empty'}</span>
+                      <span>SKU: {location.normalizedSku || location.sku || '-'}</span>
+                      <span>Filled by: {location.filledBy || (location.scanId || location.commandId ? 'automation' : '-')}</span>
+                    </button>
+
+                    <div className="warehouse-location-actions">
+                      {empty && (
+                        <button className="button button-secondary" type="button" onClick={() => openManualFill(location)}>
+                          Manual Fill
+                        </button>
+                      )}
+                      {full && (
+                        <button className="button button-danger" type="button" onClick={() => handleManualClear(location)} disabled={manualSaving}>
+                          Clear Location
+                        </button>
+                      )}
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          </>
         )}
       </section>
 
@@ -294,11 +410,90 @@ function AdminLocations() {
                 <p className="spec-label">Status</p>
                 <p className="spec-value">{selectedLocation.status || 'empty'}</p>
               </article>
+              <article>
+                <p className="spec-label">SKU</p>
+                <p className="spec-value">{selectedLocation.normalizedSku || selectedLocation.sku || '-'}</p>
+              </article>
+              <article>
+                <p className="spec-label">Filled By</p>
+                <p className="spec-value">{selectedLocation.filledBy || (selectedLocation.scanId || selectedLocation.commandId ? 'automation' : '-')}</p>
+              </article>
               <article className="location-detail-wide">
                 <p className="spec-label">Last Updated</p>
                 <p className="spec-value">{formatDate(selectedLocation.updatedAt || selectedLocation.lastUpdated)}</p>
               </article>
             </div>
+          </section>
+        </div>
+      )}
+
+      {manualLocation && (
+        <div className="order-modal-backdrop" onClick={() => setManualLocation(null)}>
+          <section className="order-details-modal location-details-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="order-modal-header">
+              <div>
+                <p className="section-eyebrow">Manual warehouse fill</p>
+                <h2>Manual Fill Position {manualLocation.position || manualLocation.id}</h2>
+              </div>
+              <button className="icon-button" type="button" onClick={() => setManualLocation(null)} aria-label="Close manual fill">
+                Close
+              </button>
+            </div>
+
+            <form className="manual-location-form" onSubmit={handleManualFill}>
+              {manualError && <p className="admin-form-error">{manualError}</p>}
+
+              <label>
+                Existing product
+                <select value={selectedProductId} onChange={(event) => setSelectedProductId(event.target.value)}>
+                  <option value="">Select a product</option>
+                  {products.map((product) => (
+                    <option key={product.id} value={product.id}>
+                      {getProductTitle(product)} / {product.normalizedSku || product.sku || buildNormalizedSku(product)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              {selectedProductId && (() => {
+                const product = products.find((item) => item.id === selectedProductId);
+                if (!product) return null;
+                const sku = product.normalizedSku || product.sku || buildNormalizedSku(product);
+                return (
+                  <div className="location-details-grid manual-product-preview">
+                    <article>
+                      <p className="spec-label">Brand</p>
+                      <p className="spec-value">{product.brand || '-'}</p>
+                    </article>
+                    <article>
+                      <p className="spec-label">Model</p>
+                      <p className="spec-value">{product.model || product.name || '-'}</p>
+                    </article>
+                    <article>
+                      <p className="spec-label">Color</p>
+                      <p className="spec-value">{product.color || '-'}</p>
+                    </article>
+                    <article>
+                      <p className="spec-label">Size</p>
+                      <p className="spec-value">{product.size || '-'}</p>
+                    </article>
+                    <article className="location-detail-wide">
+                      <p className="spec-label">SKU</p>
+                      <p className="spec-value">{sku}</p>
+                    </article>
+                  </div>
+                );
+              })()}
+
+              <div className="checkout-actions">
+                <button className="button button-secondary" type="button" onClick={() => setManualLocation(null)}>
+                  Cancel
+                </button>
+                <button className="button button-primary" type="submit" disabled={manualSaving || !selectedProductId}>
+                  {manualSaving ? 'Filling...' : 'Add Product Manually'}
+                </button>
+              </div>
+            </form>
           </section>
         </div>
       )}

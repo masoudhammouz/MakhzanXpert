@@ -3911,6 +3911,37 @@ button {
   transform: translateY(-2px);
 }
 
+.warehouse-location-main {
+  display: grid;
+  gap: 0.55rem;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.warehouse-location-main > span:not(.warehouse-location-number):not(.status-badge) {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.warehouse-location-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-self: end;
+}
+
+.warehouse-location-actions .button {
+  min-height: 38px;
+  padding: 0.55rem 0.75rem;
+  font-size: 0.82rem;
+}
+
 .warehouse-location-number {
   color: var(--text-secondary);
   font-size: 0.8rem;
@@ -3928,6 +3959,34 @@ button {
   color: var(--text-secondary);
   font-size: 0.9rem;
   font-weight: 700;
+}
+
+.manual-location-form {
+  display: grid;
+  gap: 1rem;
+}
+
+.manual-location-form label {
+  display: grid;
+  gap: 0.45rem;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.manual-location-form select {
+  min-height: 44px;
+  width: 100%;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-page);
+  color: var(--text-primary);
+}
+
+.manual-product-preview {
+  margin-top: 0;
 }
 
 .location-empty {
