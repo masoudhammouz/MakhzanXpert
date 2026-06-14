@@ -52,6 +52,13 @@ function Products() {
         const items = snapshot.docs
           .map((doc) => ({ id: doc.id, ...doc.data() }))
           .filter(isCustomerVisibleProduct);
+        items.forEach((product) => {
+          console.info('[CLIENT_PRODUCT_STOCK_VISIBLE]', {
+            productId: product.id,
+            stock: getSellableStock(product),
+            inStock: getSellableStock(product) > 0,
+          });
+        });
         setProducts(items);
         setLoading(false);
       },

@@ -11,6 +11,7 @@ import {
 import { db } from '../firebase/firebase.js';
 import { useAuth } from '../context/AuthContext.jsx';
 import { assignConfirmedScan } from '../utils/scanAssignmentProcessor.js';
+import { markLocationFullAfterDelay } from '../utils/inventorySync.js';
 
 function logScanProcessorActivity(activityType, message, status = 'info') {
   const data = {
@@ -31,6 +32,7 @@ function logScanProcessorActivity(activityType, message, status = 'info') {
 function ScanAssignmentWorker() {
   const { currentUser, loading } = useAuth();
   const processingScanIds = useRef(new Set());
+  const locationFillTimers = useRef(new Map());
 
   useEffect(() => {
     if (loading || !currentUser) return undefined;
@@ -149,10 +151,52 @@ function ScanAssignmentWorker() {
 
     const unsubscribeScanQueue = listenForConfirmedScans('scanQueue');
     const unsubscribeScans = listenForConfirmedScans('scans');
+    const reservedLocationsQuery = query(
+      collection(db, 'locations'),
+      where('status', '==', 'reserved'),
+    );
+    const unsubscribeReservedLocations = onSnapshot(
+      reservedLocationsQuery,
+      (snapshot) => {
+        const reservedIds = new Set(snapshot.docs.map((locationDoc) => locationDoc.id));
+
+        Array.from(locationFillTimers.current.keys()).forEach((locationId) => {
+          if (!reservedIds.has(locationId)) {
+            clearTimeout(locationFillTimers.current.get(locationId));
+            locationFillTimers.current.delete(locationId);
+          }
+        });
+
+        snapshot.docs.forEach((locationDoc) => {
+          if (locationFillTimers.current.has(locationDoc.id)) return;
+
+          const location = locationDoc.data();
+          const timerId = markLocationFullAfterDelay(locationDoc.id, {
+            reservedAt: location.reservedAt,
+            scanId: location.scanId,
+            commandId: location.commandId,
+            productIdOrSku: location.sku || location.normalizedSku || location.productId,
+            onComplete: () => locationFillTimers.current.delete(locationDoc.id),
+          });
+          locationFillTimers.current.set(locationDoc.id, timerId);
+        });
+      },
+      (error) => {
+        console.error('[LOCATION_FILL_DELAY_LISTENER_FAILED]', error);
+        logScanProcessorActivity(
+          'LOCATION_FILL_DELAY_LISTENER_FAILED',
+          `Reserved location listener failed: ${error.message || error}`,
+          'error',
+        );
+      },
+    );
 
     return () => {
       unsubscribeScanQueue();
       unsubscribeScans();
+      unsubscribeReservedLocations();
+      locationFillTimers.current.forEach((timerId) => clearTimeout(timerId));
+      locationFillTimers.current.clear();
     };
   }, [currentUser, loading]);
 

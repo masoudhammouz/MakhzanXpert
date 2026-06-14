@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom';
 import placeholderImage from '../assets/placeholder-shoe.svg';
 import { formatCurrency } from '../utils/formatCurrency.js';
-import { buildProductSlug, isCustomerPurchasableProduct } from '../utils/productVisibility.js';
+import { buildProductSlug, getSellableStock, isCustomerPurchasableProduct } from '../utils/productVisibility.js';
 
 function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
@@ -14,6 +14,7 @@ function isProductAvailable(product) {
 export default function ProductCard({ product }) {
   const title = getProductTitle(product);
   const available = isProductAvailable(product);
+  const stock = getSellableStock(product);
   const badgeClass = available ? 'status-badge status-available' : 'status-badge status-unavailable';
   const productUrl = `/products/${product.slug || buildProductSlug(product)}`;
 
@@ -55,6 +56,10 @@ export default function ProductCard({ product }) {
           <div>
             <p className="spec-label">Color</p>
             <p className="spec-value">{product.color || '-'}</p>
+          </div>
+          <div>
+            <p className="spec-label">Stock</p>
+            <p className="spec-value">{stock}</p>
           </div>
           <div>
             <p className="spec-label">Price</p>

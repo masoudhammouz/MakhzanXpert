@@ -173,26 +173,37 @@ void setup() {
 }
 
 void loop() {
-  updateSensors();
-
   readCommandFrom(Serial);
   readCommandFrom(Serial1);
 
   if (autoMode) {
     runAutoCycle();
   }
+
+  updateSensors();
 }
 
 // ================= READ COMMAND =================
 
 void readCommandFrom(Stream &port) {
-  if (port.available()) {
-    input = port.readStringUntil('\n');
-    input.trim();
-    input.toUpperCase();
+  while (port.available()) {
+    char c = port.read();
 
-    if (input.length() > 0) {
-      handleCommand(input);
+    if (c == '\n' || c == '\r') {
+      input.trim();
+      input.toUpperCase();
+
+      if (input.length() > 0) {
+        Serial.print("RAW CMD = [");
+        Serial.print(input);
+        Serial.println("]");
+
+        handleCommand(input);
+      }
+
+      input = "";
+    } else {
+      input += c;
     }
   }
 }
@@ -434,8 +445,9 @@ void updateSensors() {
     humidity = -1;
   }
 
-  float ultraCm = readAverageDistanceCM();
-  bool ultrasonicReady = ultraCm > 0 && ultraCm <= 18.0;
+  // TEMP FIX: disabled ultrasonic inside sensor loop because pulseIn/delays can block Serial commands
+  float ultraCm = -1;
+  bool ultrasonicReady = false;
 
   String data = "{";
   data += "\"motion\":" + String(motionState == HIGH ? 1 : 0) + ",";

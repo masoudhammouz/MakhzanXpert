@@ -3,6 +3,7 @@ import { collection, deleteField, doc, getDoc, getDocs, serverTimestamp, setDoc,
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
+import { syncAllProductInventoryFromLocations } from '../../utils/inventorySync.js';
 
 const WAREHOUSE_GRID = [
   [9, 8, 7],
@@ -133,12 +134,14 @@ function AdminLocations() {
       for (let position = 1; position <= TOTAL_LOCATIONS; position += 1) {
         batch.set(doc(db, 'locations', String(position)), {
           status: 'empty',
+          reserved: false,
           occupied: false,
           isOccupied: false,
           position,
           locationId: position,
           productKey: deleteField(),
           productId: deleteField(),
+          sku: deleteField(),
           normalizedSku: deleteField(),
           brand: deleteField(),
           model: deleteField(),
@@ -146,6 +149,7 @@ function AdminLocations() {
           size: deleteField(),
           scanId: deleteField(),
           reservedAt: deleteField(),
+          filledAt: deleteField(),
           reservedBy: deleteField(),
           assignmentStatus: deleteField(),
           selectedLocation: deleteField(),
@@ -156,6 +160,7 @@ function AdminLocations() {
         }, { merge: true });
       }
       await batch.commit();
+      await syncAllProductInventoryFromLocations();
       setSelectedLocation(null);
       await loadLocations();
     } catch {

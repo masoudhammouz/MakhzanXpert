@@ -47,6 +47,13 @@ export default function ProductDetails() {
         }
 
         const loadedProduct = { id: productSnap.id, ...productSnap.data() };
+        if (isCustomerVisibleProduct(loadedProduct)) {
+          console.info('[CLIENT_PRODUCT_STOCK_VISIBLE]', {
+            productId: loadedProduct.id,
+            stock: getSellableStock(loadedProduct),
+            inStock: getSellableStock(loadedProduct) > 0,
+          });
+        }
         setProduct(isCustomerVisibleProduct(loadedProduct) ? loadedProduct : null);
         setLoading(false);
       },

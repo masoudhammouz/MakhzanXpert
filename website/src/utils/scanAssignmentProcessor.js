@@ -11,6 +11,7 @@ import {
   where,
 } from 'firebase/firestore';
 import { db } from '../firebase/firebase.js';
+import { markLocationReserved, recomputeProductInventoryFromLocations } from './inventorySync.js';
 
 export const VALID_SORTING_STRATEGIES = new Set([
   'brand',
@@ -467,25 +468,33 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         details: { inPosition, outPosition },
       }));
 
-      traceWrite(`locations/${selectedLocation} reserve`, () => transaction.set(doc(db, 'locations', String(selectedLocation)), {
-        status: 'reserved',
-        locationId: selectedLocation,
-        position: selectedLocation,
-        productId: identity.normalizedSku,
-        normalizedSku: identity.normalizedSku,
-        productKey: identity.productKey,
-        brand: identity.brand,
-        model: identity.model,
-        color: identity.color,
-        size: identity.size,
-        scanId: identity.scanId,
-        updatedAt: serverTimestamp(),
-      }, { merge: true }));
+      traceWrite(`locations/${selectedLocation} reserve`, () => markLocationReserved(
+        transaction,
+        doc(db, 'locations', String(selectedLocation)),
+        {
+          locationId: selectedLocation,
+          identity,
+          commandId,
+          inPosition,
+          outPosition,
+          sortingMode,
+        },
+      ));
       logs.push(makeLog('LOCATION_RESERVED', `LOCATION_RESERVED ${selectedLocation}`, {
         ...identity,
         sortingMode,
         selectedLocation,
-        details: { locationId: selectedLocation },
+        commandId,
+        details: {
+          locationId: selectedLocation,
+          status: 'reserved',
+          reserved: true,
+          occupied: false,
+          isOccupied: false,
+          productId: identity.normalizedSku,
+          sku: identity.normalizedSku,
+          commandId,
+        },
       }));
 
       traceWrite(`commands/${commandId} GO ${inPosition}`, () => transaction.set(newCommandRef, {
@@ -542,12 +551,13 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         details: { inPosition, outPosition },
       }));
 
-      // Product stock is intentionally not incremented here.
+      // Product stock is recomputed from full locations after commit; reserved locations do not count.
       // Status plan: CONFIRMED -> ASSIGNED -> COMMAND_CREATED -> STORED/DONE after storage completion.
       return {
         skipped: false,
         scanId: identity.scanId,
         productKey: identity.productKey,
+        normalizedSku: identity.normalizedSku,
         commandId,
         locationId: selectedLocation,
         inPosition,
@@ -564,6 +574,9 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         txTrace,
       },
     })));
+    if (!result.skipped && result.normalizedSku) {
+      await recomputeProductInventoryFromLocations(result.normalizedSku);
+    }
     return result;
   } catch (error) {
     console.table(txTrace);

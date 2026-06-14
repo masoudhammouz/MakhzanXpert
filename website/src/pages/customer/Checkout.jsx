@@ -1,4 +1,4 @@
-import { collection, doc, increment, runTransaction, serverTimestamp } from 'firebase/firestore';
+import { collection, doc, runTransaction, serverTimestamp } from 'firebase/firestore';
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useCart } from '../../context/CartContext.jsx';
@@ -106,20 +106,6 @@ function Checkout() {
           status: 'pending',
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
-        });
-
-        productSnapshots.forEach((snapshot, index) => {
-          const cartItem = items[index];
-          const productData = { id: snapshot.id, ...snapshot.data() };
-          const currentQuantity = getSellableStock(productData);
-          const orderedQuantity = Number(cartItem.quantity || 0);
-          const nextQuantity = currentQuantity - orderedQuantity;
-          const stockField = productData.availableStock === undefined || productData.availableStock === null ? 'quantity' : 'availableStock';
-          transaction.update(productRefs[index], {
-            [stockField]: increment(-orderedQuantity),
-            isAvailable: nextQuantity > 0,
-            updatedAt: serverTimestamp(),
-          });
         });
       });
 
