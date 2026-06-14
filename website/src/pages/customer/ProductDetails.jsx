@@ -8,14 +8,16 @@ import placeholderImage from '../../assets/placeholder-shoe.svg';
 import { formatCurrency } from '../../utils/formatCurrency.js';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useCart } from '../../context/CartContext.jsx';
-import { getSellableStock, isCustomerPurchasableProduct, isCustomerVisibleProduct } from '../../utils/productVisibility.js';
+import {
+  getSellableStock,
+  isCustomerPurchasableProduct,
+  isCustomerVisibleProduct,
+  isProductAvailable,
+  isPublishedProduct,
+} from '../../utils/productVisibility.js';
 
 function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
-}
-
-function isProductAvailable(product) {
-  return isCustomerPurchasableProduct(product);
 }
 
 export default function ProductDetails() {
@@ -47,14 +49,23 @@ export default function ProductDetails() {
         }
 
         const loadedProduct = { id: productSnap.id, ...productSnap.data() };
+        if (isPublishedProduct(loadedProduct)) {
+          const visible = isCustomerVisibleProduct(loadedProduct);
+          console.info(visible ? '[PRODUCT_VISIBLE_IN_STOCK]' : '[PRODUCT_HIDDEN_OUT_OF_STOCK]', {
+            productId: loadedProduct.id,
+            stock: getSellableStock(loadedProduct),
+            inStock: loadedProduct.inStock === true,
+            available: isProductAvailable(loadedProduct),
+          });
+        }
         if (isCustomerVisibleProduct(loadedProduct)) {
           console.info('[CLIENT_PRODUCT_STOCK_VISIBLE]', {
             productId: loadedProduct.id,
             stock: getSellableStock(loadedProduct),
-            inStock: getSellableStock(loadedProduct) > 0,
+            inStock: loadedProduct.inStock === true,
           });
         }
-        setProduct(isCustomerVisibleProduct(loadedProduct) ? loadedProduct : null);
+        setProduct(isPublishedProduct(loadedProduct) ? loadedProduct : null);
         setLoading(false);
       },
       () => {
@@ -102,13 +113,15 @@ export default function ProductDetails() {
   if (!product) return <EmptyState title="Product not found" description="This product does not exist or is no longer available." />;
 
   const title = getProductTitle(product);
-  const available = isProductAvailable(product);
+  const available = isProductAvailable(product) && isCustomerPurchasableProduct(product);
 
   const handleAddToCart = () => {
+    if (!available) return;
     addToCart(product);
   };
 
   const handleBuyNow = () => {
+    if (!available) return;
     addToCart(product);
     navigate('/cart');
   };
@@ -140,6 +153,7 @@ export default function ProductDetails() {
               <p className="product-brand">{product.brand || 'Brand'}</p>
               <h1 className="product-title">{title}</h1>
               <p className="product-meta large">{[product.model, product.color].filter(Boolean).join(' / ')}</p>
+              {!available && <p className="admin-form-error">Product currently unavailable</p>}
             </div>
 
             <div className="product-price">{formatCurrency(product.price)}</div>

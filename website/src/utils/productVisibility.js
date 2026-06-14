@@ -37,17 +37,23 @@ export function isPublishedProduct(product) {
 }
 
 export function getSellableStock(product) {
-  return Number(product?.availableQuantity ?? product?.stock ?? product?.availableStock ?? 0);
+  return Number(product?.availableStock ?? product?.availableQuantity ?? product?.stock ?? 0);
 }
+
+export const isProductAvailable = (product) => (
+  (product?.inStock === true) &&
+  ((product?.availableStock ?? product?.availableQuantity ?? product?.stock ?? 0) > 0)
+);
 
 export function isCustomerVisibleProduct(product) {
   return (
     isPublishedProduct(product) &&
     product?.price !== null &&
-    product?.price !== undefined
+    product?.price !== undefined &&
+    isProductAvailable(product)
   );
 }
 
 export function isCustomerPurchasableProduct(product) {
-  return isCustomerVisibleProduct(product) && getSellableStock(product) > 0 && Number(product?.price || 0) > 0;
+  return isCustomerVisibleProduct(product) && Number(product?.price || 0) > 0;
 }

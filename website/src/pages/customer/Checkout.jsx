@@ -4,7 +4,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useCart } from '../../context/CartContext.jsx';
 import { db } from '../../firebase/firebase.js';
 import { formatCurrency } from '../../utils/formatCurrency.js';
-import { buildProductSlug, getSellableStock, isCustomerPurchasableProduct } from '../../utils/productVisibility.js';
+import { buildProductSlug, getSellableStock, isCustomerPurchasableProduct, isProductAvailable } from '../../utils/productVisibility.js';
 
 function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
@@ -82,14 +82,36 @@ function Checkout() {
           }
 
           const productData = { id: snapshot.id, ...snapshot.data() };
-          if (!isCustomerPurchasableProduct(productData)) {
+          const availableStock = Number(productData.availableStock ?? 0);
+          const availableQuantity = Number(productData.availableQuantity ?? 0);
+          const currentQuantity = getSellableStock(productData);
+          const orderedQuantity = Number(cartItem.quantity || 0);
+          const valid = isProductAvailable(productData) &&
+            isCustomerPurchasableProduct(productData) &&
+            availableStock > 0 &&
+            availableQuantity > 0 &&
+            currentQuantity >= orderedQuantity;
+
+          console.info('[CHECKOUT_STOCK_VALIDATION]', {
+            productId: productData.id,
+            valid,
+            availableStock,
+            availableQuantity,
+            sellableStock: currentQuantity,
+            cartQuantity: orderedQuantity,
+            surface: 'checkout',
+          });
+
+          if (!valid && (availableStock <= 0 || availableQuantity <= 0 || !isProductAvailable(productData))) {
             throw new Error(`${getProductTitle(cartItem)} is not available for checkout.`);
           }
 
-          const currentQuantity = getSellableStock(productData);
-          const orderedQuantity = Number(cartItem.quantity || 0);
           if (currentQuantity < orderedQuantity) {
             throw new Error(`Only ${currentQuantity} left for ${getProductTitle(cartItem)}.`);
+          }
+
+          if (!valid) {
+            throw new Error(`${getProductTitle(cartItem)} is not available for checkout.`);
           }
         });
 

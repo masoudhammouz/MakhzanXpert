@@ -1,7 +1,38 @@
+import { useEffect, useState } from 'react';
+import { collection, limit, onSnapshot, orderBy, query } from 'firebase/firestore';
 import { Link } from 'react-router-dom';
+import ProductCard from '../../components/ProductCard.jsx';
 import SectionHeader from '../../components/SectionHeader.jsx';
+import { db } from '../../firebase/firebase.js';
+import { getSellableStock, isCustomerVisibleProduct, isProductAvailable } from '../../utils/productVisibility.js';
 
 function Home() {
+  const [featuredProducts, setFeaturedProducts] = useState([]);
+
+  useEffect(() => {
+    const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'), limit(12));
+    const unsubscribe = onSnapshot(
+      productsQuery,
+      (snapshot) => {
+        const loadedProducts = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+        loadedProducts.forEach((product) => {
+          const visible = isCustomerVisibleProduct(product);
+          console.info(visible ? '[PRODUCT_VISIBLE_IN_STOCK]' : '[PRODUCT_HIDDEN_OUT_OF_STOCK]', {
+            productId: product.id,
+            stock: getSellableStock(product),
+            inStock: product.inStock === true,
+            available: isProductAvailable(product),
+            surface: 'home-featured',
+          });
+        });
+        setFeaturedProducts(loadedProducts.filter(isCustomerVisibleProduct).slice(0, 4));
+      },
+      () => setFeaturedProducts([]),
+    );
+
+    return unsubscribe;
+  }, []);
+
   return (
     <div className="home-page ecommerce">
       {/* Hero Section */}
@@ -29,8 +60,8 @@ function Home() {
           </div>
 
           <div className="floating-badge floating-badge-1 card">
-            <p className="badge-label">In Stock</p>
-            <p className="badge-value">2,840+</p>
+            <p className="badge-label">Featured</p>
+            <p className="badge-value">{featuredProducts.length}</p>
           </div>
           <div className="floating-badge floating-badge-2 card">
             <p className="badge-label">Fast Ship</p>
@@ -71,60 +102,26 @@ function Home() {
       </section>
 
       {/* Featured Products */}
-      <section className="featured-products-section">
-        <SectionHeader
-          eyebrow="Customer favorites"
-          title="Best sellers this season"
-        />
+      {featuredProducts.length > 0 && (
+        <section className="featured-products-section">
+          <SectionHeader
+            eyebrow="Customer favorites"
+            title="Best sellers this season"
+          />
 
-        <div className="featured-products-grid">
-          <article className="featured-product-card card">
-            <div className="product-image-placeholder">👟</div>
-            <h3>Premium Running Shoe</h3>
-            <p className="product-price">$129.99</p>
-            <p className="product-description">Engineered for performance and comfort on every run.</p>
-            <div className="product-status">
-              <span className="status-badge available">In Stock</span>
-            </div>
-          </article>
+          <div className="featured-products-grid">
+            {featuredProducts.map((product) => (
+              <ProductCard key={product.id} product={product} />
+            ))}
+          </div>
 
-          <article className="featured-product-card card">
-            <div className="product-image-placeholder">👟</div>
-            <h3>Classic Leather Sneaker</h3>
-            <p className="product-price">$99.99</p>
-            <p className="product-description">Timeless style meets modern comfort for daily wear.</p>
-            <div className="product-status">
-              <span className="status-badge available">In Stock</span>
-            </div>
-          </article>
-
-          <article className="featured-product-card card">
-            <div className="product-image-placeholder">👟</div>
-            <h3>Hiking Boot Plus</h3>
-            <p className="product-price">$159.99</p>
-            <p className="product-description">Built tough for trails and outdoor adventures.</p>
-            <div className="product-status">
-              <span className="status-badge available">In Stock</span>
-            </div>
-          </article>
-
-          <article className="featured-product-card card">
-            <div className="product-image-placeholder">👟</div>
-            <h3>Casual Slip-On Loafer</h3>
-            <p className="product-price">$89.99</p>
-            <p className="product-description">Effortless comfort for work or weekend relaxation.</p>
-            <div className="product-status">
-              <span className="status-badge available">In Stock</span>
-            </div>
-          </article>
-        </div>
-
-        <div className="view-all-products">
-          <Link to="/products" className="button button-secondary">
-            View All Products
-          </Link>
-        </div>
-      </section>
+          <div className="view-all-products">
+            <Link to="/products" className="button button-secondary">
+              View All Products
+            </Link>
+          </div>
+        </section>
+      )}
 
       {/* Customer Benefits */}
       <section className="benefits-section">

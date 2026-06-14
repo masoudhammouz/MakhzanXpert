@@ -7,7 +7,7 @@ import ProductCard from '../../components/ProductCard.jsx';
 import SearchBar from '../../components/SearchBar.jsx';
 import SectionHeader from '../../components/SectionHeader.jsx';
 import { db } from '../../firebase/firebase.js';
-import { getSellableStock, isCustomerVisibleProduct } from '../../utils/productVisibility.js';
+import { getSellableStock, isCustomerVisibleProduct, isProductAvailable } from '../../utils/productVisibility.js';
 
 const PRODUCT_CATEGORIES = ['Sneakers', 'Running', 'Casual', 'Boots', 'Sandals'];
 
@@ -15,10 +15,6 @@ function getCreatedAtValue(product) {
   if (product.createdAt?.toMillis) return product.createdAt.toMillis();
   if (typeof product.createdAt === 'number') return product.createdAt;
   return 0;
-}
-
-function isProductAvailable(product) {
-  return isCustomerVisibleProduct(product);
 }
 
 function getProductTitle(product) {
@@ -49,15 +45,23 @@ function Products() {
     const unsubscribe = onSnapshot(
       productsQuery,
       (snapshot) => {
-        const items = snapshot.docs
-          .map((doc) => ({ id: doc.id, ...doc.data() }))
-          .filter(isCustomerVisibleProduct);
-        items.forEach((product) => {
-          console.info('[CLIENT_PRODUCT_STOCK_VISIBLE]', {
+        const loadedProducts = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+        const items = loadedProducts.filter(isCustomerVisibleProduct);
+        loadedProducts.forEach((product) => {
+          const logName = isCustomerVisibleProduct(product) ? '[PRODUCT_VISIBLE_IN_STOCK]' : '[PRODUCT_HIDDEN_OUT_OF_STOCK]';
+          console.info(logName, {
             productId: product.id,
             stock: getSellableStock(product),
-            inStock: getSellableStock(product) > 0,
+            inStock: product.inStock === true,
+            available: isProductAvailable(product),
           });
+          if (isCustomerVisibleProduct(product)) {
+            console.info('[CLIENT_PRODUCT_STOCK_VISIBLE]', {
+              productId: product.id,
+              stock: getSellableStock(product),
+              inStock: product.inStock === true,
+            });
+          }
         });
         setProducts(items);
         setLoading(false);
@@ -98,7 +102,7 @@ function Products() {
     if (availabilityFilter === 'available') {
       result = result.filter(isProductAvailable);
     } else if (availabilityFilter === 'out-of-stock') {
-      result = result.filter((product) => getSellableStock(product) <= 0);
+      result = [];
     }
 
     if (sortBy === 'price-low') {

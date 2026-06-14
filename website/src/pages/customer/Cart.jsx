@@ -1,8 +1,11 @@
+import { doc, getDoc } from 'firebase/firestore';
+import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import placeholderImage from '../../assets/placeholder-shoe.svg';
 import { useCart } from '../../context/CartContext.jsx';
+import { db } from '../../firebase/firebase.js';
 import { formatCurrency } from '../../utils/formatCurrency.js';
-import { buildProductSlug } from '../../utils/productVisibility.js';
+import { buildProductSlug, getSellableStock, isProductAvailable } from '../../utils/productVisibility.js';
 
 function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
@@ -11,9 +14,59 @@ function getProductTitle(product) {
 export default function Cart() {
   const navigate = useNavigate();
   const { items, increaseQuantity, decreaseQuantity, removeFromCart, subtotal, clearCart } = useCart();
+  const [stockError, setStockError] = useState('');
+  const [validatingStock, setValidatingStock] = useState(false);
 
-  const handleCheckout = () => {
-    navigate('/checkout');
+  const handleCheckout = async () => {
+    setStockError('');
+    setValidatingStock(true);
+
+    try {
+      const productChecks = await Promise.all(items.map(async (item) => {
+        const snapshot = await getDoc(doc(db, 'products', item.id));
+        const product = snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : null;
+        const availableStock = Number(product?.availableStock ?? 0);
+        const availableQuantity = Number(product?.availableQuantity ?? 0);
+        const sellableStock = getSellableStock(product);
+        const valid = Boolean(product) &&
+          isProductAvailable(product) &&
+          availableStock > 0 &&
+          availableQuantity > 0 &&
+          sellableStock >= Number(item.quantity || 0);
+
+        console.info('[CHECKOUT_STOCK_VALIDATION]', {
+          productId: item.id,
+          valid,
+          availableStock,
+          availableQuantity,
+          sellableStock,
+          cartQuantity: Number(item.quantity || 0),
+          surface: 'cart',
+        });
+
+        return { item, product, valid, availableStock, availableQuantity, sellableStock };
+      }));
+
+      const invalidItems = productChecks.filter((check) => !check.product || !isProductAvailable(check.product) || check.availableStock <= 0 || check.availableQuantity <= 0);
+      invalidItems.forEach((check) => removeFromCart(check.item.id));
+
+      if (invalidItems.length > 0) {
+        setStockError('Some products are no longer available and were removed from your cart.');
+        return;
+      }
+
+      const insufficientItem = productChecks.find((check) => check.sellableStock < Number(check.item.quantity || 0));
+      if (insufficientItem) {
+        setStockError(`Only ${insufficientItem.sellableStock} left for ${getProductTitle(insufficientItem.item)}.`);
+        return;
+      }
+
+      navigate('/checkout');
+    } catch {
+      setStockError('Unable to validate stock. Please try again.');
+    } finally {
+      setValidatingStock(false);
+    }
   };
 
   if (items.length === 0) {
@@ -42,6 +95,8 @@ export default function Cart() {
             Clear Cart
           </button>
         </div>
+
+        {stockError && <p className="admin-form-error">{stockError}</p>}
 
         <div className="cart-items">
           {items.map((item) => {
@@ -118,8 +173,8 @@ export default function Cart() {
             <Link to="/products" className="button button-secondary">
               Continue Shopping
             </Link>
-            <button className="button button-primary" type="button" onClick={handleCheckout}>
-              Checkout
+            <button className="button button-primary" type="button" onClick={handleCheckout} disabled={validatingStock}>
+              {validatingStock ? 'Checking Stock...' : 'Checkout'}
             </button>
           </div>
         </div>

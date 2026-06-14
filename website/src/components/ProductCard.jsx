@@ -1,22 +1,23 @@
 import { Link } from 'react-router-dom';
 import placeholderImage from '../assets/placeholder-shoe.svg';
 import { formatCurrency } from '../utils/formatCurrency.js';
-import { buildProductSlug, getSellableStock, isCustomerPurchasableProduct } from '../utils/productVisibility.js';
+import { buildProductSlug, getSellableStock, isCustomerPurchasableProduct, isProductAvailable } from '../utils/productVisibility.js';
 
 function getProductTitle(product) {
   return product.name || [product.brand, product.model].filter(Boolean).join(' ') || 'Shoe product';
 }
 
-function isProductAvailable(product) {
-  return isCustomerPurchasableProduct(product);
+function isCardProductAvailable(product) {
+  return isProductAvailable(product) && isCustomerPurchasableProduct(product);
 }
 
 export default function ProductCard({ product }) {
   const title = getProductTitle(product);
-  const available = isProductAvailable(product);
+  const available = isCardProductAvailable(product);
   const stock = getSellableStock(product);
-  const badgeClass = available ? 'status-badge status-available' : 'status-badge status-unavailable';
   const productUrl = `/products/${product.slug || buildProductSlug(product)}`;
+
+  if (!available) return null;
 
   return (
     <article className="product-card">
@@ -36,7 +37,7 @@ export default function ProductCard({ product }) {
         <div className="product-card-badges">
           <span className="brand-badge">{product.brand || 'Brand'}</span>
           <span className="category-badge">{product.category || 'Uncategorized'}</span>
-          <span className={badgeClass}>{available ? 'Available' : 'Out of stock'}</span>
+          <span className="status-badge status-available">Available</span>
         </div>
 
         <div>
