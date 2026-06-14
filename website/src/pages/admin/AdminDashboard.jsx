@@ -240,7 +240,9 @@ function AdminDashboard() {
         </article>
         <article className="metric-card admin-metric-card">
           <p className="metric-label">Latest Command</p>
-          <p className="metric-value dashboard-activity-value">{latestCommand?.arduinoCommand || 'No Data'}</p>
+          <p className="metric-value dashboard-activity-value">
+            {latestCommand?.arduinoCommand || (latestCommand?.command === 'GO' && latestCommand?.position ? `GO ${latestCommand.position}` : latestCommand?.command) || 'No Data'}
+          </p>
           {latestCommand ? (
             <>
               <span className={`status-badge ${getCommandStatusClass(latestCommand.status)}`}>

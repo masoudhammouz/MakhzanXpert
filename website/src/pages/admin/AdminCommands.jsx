@@ -209,7 +209,7 @@ function AdminCommands() {
               <tbody>
                 {commands.map((item) => (
                   <tr key={item.id}>
-                    <td className="inventory-product-name">{item.arduinoCommand || '-'}</td>
+                    <td className="inventory-product-name">{item.arduinoCommand || (item.command === 'GO' && item.position ? `GO ${item.position}` : item.command) || '-'}</td>
                     <td>{item.position || '-'}</td>
                     <td>
                       <span className={`status-badge ${getCommandStatusClass(item.status)}`}>

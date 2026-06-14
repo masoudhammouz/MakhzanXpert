@@ -202,10 +202,10 @@ function AdminControlPanel() {
   const [sortingMode, setSortingMode] = useState(DEFAULT_SETTINGS.sortingMode);
   const [locations, setLocations] = useState([]);
   const [latestScan, setLatestScan] = useState(null);
-  const [storeQueue, setStoreQueue] = useState([]);
   const [pickQueue, setPickQueue] = useState([]);
   const [scanQueue, setScanQueue] = useState([]);
   const [orderQueue, setOrderQueue] = useState([]);
+  const [commands, setCommands] = useState([]);
   const [automationStatus, setAutomationStatus] = useState(DEFAULT_AUTOMATION_STATUS);
   const [espDevice, setEspDevice] = useState(null);
   const [products, setProducts] = useState([]);
@@ -286,13 +286,6 @@ function AdminControlPanel() {
       () => setLatestScan(null),
     );
 
-    const storeQueueQuery = query(collection(db, 'storeQueue'), orderBy('updatedAt', 'desc'), limit(25));
-    const unsubscribeStoreQueue = onSnapshot(
-      storeQueueQuery,
-      (snapshot) => setStoreQueue(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
-      () => setStoreQueue([]),
-    );
-
     const pickQueueQuery = query(collection(db, 'pickQueue'), orderBy('updatedAt', 'desc'), limit(25));
     const unsubscribePickQueue = onSnapshot(
       pickQueueQuery,
@@ -314,6 +307,13 @@ function AdminControlPanel() {
       () => setOrderQueue([]),
     );
 
+    const commandsQuery = query(collection(db, 'commands'), orderBy('updatedAt', 'desc'), limit(50));
+    const unsubscribeCommands = onSnapshot(
+      commandsQuery,
+      (snapshot) => setCommands(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+      () => setCommands([]),
+    );
+
     const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
     const unsubscribeProducts = onSnapshot(
       productsQuery,
@@ -324,10 +324,10 @@ function AdminControlPanel() {
     return () => {
       unsubscribeLocations();
       unsubscribeScans();
-      unsubscribeStoreQueue();
       unsubscribePickQueue();
       unsubscribeScanQueue();
       unsubscribeOrderQueue();
+      unsubscribeCommands();
       unsubscribeProducts();
     };
   }, []);
@@ -348,22 +348,44 @@ function AdminControlPanel() {
 
   const queueSummary = useMemo(() => {
     return {
-      store: queueCounts(storeQueue),
       pick: queueCounts(pickQueue),
+      scans: {
+        confirmed: scanQueue.filter((item) => item.status === 'CONFIRMED').length,
+        assigned: scanQueue.filter((item) => ['ASSIGNED', 'COMMAND_CREATED', 'PROCESSING'].includes(item.status) || item.assignmentStatus === 'COMMAND_CREATED').length,
+        done: scanQueue.filter((item) => ['STORED', 'DONE'].includes(item.status)).length,
+        error: scanQueue.filter((item) => item.status === 'ERROR').length,
+      },
     };
-  }, [pickQueue, storeQueue]);
+  }, [pickQueue, scanQueue]);
 
   const currentOperation = useMemo(() => {
     const runningPick = pickQueue.find((item) => item.status === 'running');
-    const runningStore = storeQueue.find((item) => item.status === 'running');
-    const active = runningPick || runningStore;
-    if (!active) return null;
+    if (!runningPick) return null;
     return {
-      type: runningPick ? 'GET' : 'PUT',
-      locationId: active.locationId,
-      movement: active.outPosition ? `GO ${active.outPosition}` : active.inPosition ? `GO ${active.inPosition}` : active.goPosition ? `GO ${active.goPosition}` : '--',
+      type: 'GET',
+      locationId: runningPick.locationId,
+      movement: runningPick.outPosition ? `GO ${runningPick.outPosition}` : runningPick.inPosition ? `GO ${runningPick.inPosition}` : runningPick.goPosition ? `GO ${runningPick.goPosition}` : '--',
     };
-  }, [pickQueue, storeQueue]);
+  }, [pickQueue]);
+
+  const commandsByScanId = useMemo(() => {
+    const map = new Map();
+    commands.forEach((command) => {
+      if (command.scanId) map.set(command.scanId, command);
+      if (command.payload?.scanId) map.set(command.payload.scanId, command);
+    });
+    return map;
+  }, [commands]);
+
+  const scanAssignmentItems = useMemo(() => {
+    return scanQueue
+      .filter((item) => ['CONFIRMED', 'ASSIGNED', 'COMMAND_CREATED', 'PROCESSING', 'STORED', 'DONE', 'ERROR'].includes(String(item.status || '').toUpperCase()))
+      .slice(0, 12)
+      .map((item) => ({
+        ...item,
+        command: commandsByScanId.get(item.scanId || item.id),
+      }));
+  }, [commandsByScanId, scanQueue]);
 
   const lifterStatus = automationStatus.lifterBusy || currentOperation ? 'Working' : automationStatus.lastError ? 'Error' : 'Idle';
   const selectedStrategy = automationStatus.sortingStrategy || sortingMode;
@@ -922,9 +944,25 @@ function AdminControlPanel() {
       <section className="control-dashboard-grid">
         <article className="control-card">
           <div className="control-card-heading compact">
-            <h2>Queue Monitor</h2>
+            <h2>Scan Assignment Monitor</h2>
           </div>
           <div className="control-detail-grid">
+            <div>
+              <span>Confirmed</span>
+              <strong>{queueSummary.scans.confirmed}</strong>
+            </div>
+            <div>
+              <span>Assigned</span>
+              <strong>{queueSummary.scans.assigned}</strong>
+            </div>
+            <div>
+              <span>Stored / Done</span>
+              <strong>{queueSummary.scans.done}</strong>
+            </div>
+            <div>
+              <span>Errors</span>
+              <strong>{queueSummary.scans.error}</strong>
+            </div>
             <div>
               <span>Pick Waiting</span>
               <strong>{queueSummary.pick.waiting}</strong>
@@ -932,22 +970,6 @@ function AdminControlPanel() {
             <div>
               <span>Pick Running</span>
               <strong>{queueSummary.pick.running}</strong>
-            </div>
-            <div>
-              <span>Pick Done</span>
-              <strong>{queueSummary.pick.done}</strong>
-            </div>
-            <div>
-              <span>Store Waiting</span>
-              <strong>{queueSummary.store.waiting}</strong>
-            </div>
-            <div>
-              <span>Store Running</span>
-              <strong>{queueSummary.store.running}</strong>
-            </div>
-            <div>
-              <span>Store Done</span>
-              <strong>{queueSummary.store.done}</strong>
             </div>
           </div>
         </article>
@@ -977,15 +999,21 @@ function AdminControlPanel() {
       <section className="control-dashboard-grid">
         <article className="control-card">
           <div className="control-card-heading compact">
-            <h2>Scan Queue</h2>
+            <h2>Scan Assignments</h2>
           </div>
           <div className="queue-list">
-            {scanQueue.length === 0 ? (
-              <p className="orders-customer-meta">No cartons waiting for lifter.</p>
-            ) : scanQueue.slice(0, 8).map((item) => (
+            {scanAssignmentItems.length === 0 ? (
+              <p className="orders-customer-meta">No confirmed scans waiting for assignment.</p>
+            ) : scanAssignmentItems.map((item) => (
               <div className="queue-row" key={item.id}>
                 <strong>{item.productKey || [item.brand, item.model, item.color, item.size].filter(Boolean).join('|')}</strong>
-                <span>{item.status || 'WAITING'} / Location {item.targetLocation || '-'}</span>
+                <span>
+                  {item.status || 'WAITING'}
+                  {item.assignmentStatus ? ` / ${item.assignmentStatus}` : ''}
+                  {' / '}Location {item.selectedLocation || item.locationId || '-'}
+                  {' / '}Command {item.command?.status || item.commandId || '-'}
+                </span>
+                {item.errorMessage && <span>{item.errorMessage}</span>}
               </div>
             ))}
           </div>
