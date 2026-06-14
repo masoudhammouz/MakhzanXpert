@@ -174,11 +174,31 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
   const locationRefs = Array.from({ length: TOTAL_LOCATIONS }, (_, index) => doc(db, 'locations', String(index + 1)));
 
   let committedLogs = [];
+  const txTrace = [];
 
   try {
     const result = await runTransaction(db, async (transaction) => {
-      const sourceSnapshot = await transaction.get(sourceRef);
-      const queueSnapshot = await transaction.get(queueRef);
+      let hasWritten = false;
+      const traceRead = async (description, readOperation) => {
+        if (hasWritten) {
+          txTrace.push(`ERROR_READ_AFTER_WRITE: ${description}`);
+          throw new Error(`READ_AFTER_WRITE at ${description}`);
+        }
+        txTrace.push(`READ: ${description}`);
+        const snapshot = await readOperation();
+        txTrace.push(`READ_OK: ${description}`);
+        return snapshot;
+      };
+      const traceWrite = (description, writeOperation) => {
+        txTrace.push(`WRITE: ${description}`);
+        hasWritten = true;
+        const result = writeOperation();
+        txTrace.push(`WRITE_OK: ${description}`);
+        return result;
+      };
+
+      const sourceSnapshot = await traceRead(`${sourceCollection}/${sourceDocId}`, () => transaction.get(sourceRef));
+      const queueSnapshot = await traceRead(`scanQueue/${sourceDocId}`, () => transaction.get(queueRef));
 
       if (!sourceSnapshot.exists() && !queueSnapshot.exists()) {
         return {
@@ -236,15 +256,15 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         existingBeltCommands,
         existingGoCommands,
       ] = await Promise.all([
-        transaction.get(settingsRef),
-        Promise.all(locationRefs.map((locationRef) => transaction.get(locationRef))),
-        transaction.get(beltCommandQuery),
-        transaction.get(goCommandQuery),
+        traceRead('settings/system', () => transaction.get(settingsRef)),
+        Promise.all(locationRefs.map((locationRef, index) => traceRead(`locations/${index + 1}`, () => transaction.get(locationRef)))),
+        traceRead(`commands duplicate belt query scanId=${identity.scanId} command=${BELT_MOVE_COMMAND}`, () => transaction.get(beltCommandQuery)),
+        traceRead(`commands duplicate GO query scanId=${identity.scanId}`, () => transaction.get(goCommandQuery)),
       ]);
 
       if (existingBeltCommands.empty) {
         const beltCommandId = beltCommandRef.id;
-        transaction.set(beltCommandRef, {
+        traceWrite(`commands/${beltCommandId} belt ${BELT_MOVE_COMMAND}`, () => transaction.set(beltCommandRef, {
           commandId: beltCommandId,
           deviceId: ESP_DEVICE_ID,
           command: BELT_MOVE_COMMAND,
@@ -257,7 +277,7 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
           },
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
-        });
+        }));
         logs.push(makeLog('BELT_MOVE_COMMAND_CREATED', `BELT_MOVE_COMMAND_CREATED ${BELT_MOVE_COMMAND}`, {
           ...identity,
           commandId: beltCommandId,
@@ -294,21 +314,21 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
           commandId,
           details: { existingCommandId: commandId },
         }));
-        transaction.set(queueRef, {
+        traceWrite(`scanQueue/${sourceDocId} mark assigned existing GO`, () => transaction.set(queueRef, {
           ...identity,
           source: scan.source || sourceCollection,
           status: 'ASSIGNED',
           assignmentStatus: 'COMMAND_CREATED',
           commandId,
           updatedAt: serverTimestamp(),
-        }, { merge: true });
+        }, { merge: true }));
         if (sourceCollection === 'scans') {
-          transaction.set(sourceRef, {
+          traceWrite(`${sourceCollection}/${sourceDocId} mark assigned existing GO`, () => transaction.set(sourceRef, {
             status: 'ASSIGNED',
             assignmentStatus: 'COMMAND_CREATED',
             commandId,
             updatedAt: serverTimestamp(),
-          }, { merge: true });
+          }, { merge: true }));
         }
         return { skipped: true, reason: 'command already exists', commandId, logs };
       }
@@ -326,14 +346,14 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
           sortingMode,
           details: { error: errorMessage },
         }));
-        transaction.set(queueRef, {
+        traceWrite(`scanQueue/${sourceDocId} missing sortingMode error`, () => transaction.set(queueRef, {
           ...identity,
           source: scan.source || sourceCollection,
           status: 'ERROR',
           errorCode: 'missing-sortingMode',
           errorMessage,
           updatedAt: serverTimestamp(),
-        }, { merge: true });
+        }, { merge: true }));
         return { skipped: true, reason: 'missing sortingMode', logs };
       }
 
@@ -367,14 +387,14 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
           sortingMode,
           details: { error: errorMessage, emptyLocations },
         }));
-        transaction.set(queueRef, {
+        traceWrite(`scanQueue/${sourceDocId} no empty locations error`, () => transaction.set(queueRef, {
           ...identity,
           source: scan.source || sourceCollection,
           status: 'ERROR',
           errorCode: 'no-empty-locations',
           errorMessage,
           updatedAt: serverTimestamp(),
-        }, { merge: true });
+        }, { merge: true }));
         return { skipped: true, reason: 'no empty locations', logs };
       }
 
@@ -401,7 +421,7 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         details: { inPosition, outPosition },
       }));
 
-      transaction.set(doc(db, 'locations', String(selectedLocation)), {
+      traceWrite(`locations/${selectedLocation} reserve`, () => transaction.set(doc(db, 'locations', String(selectedLocation)), {
         status: 'reserved',
         locationId: selectedLocation,
         position: selectedLocation,
@@ -414,7 +434,7 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         size: identity.size,
         scanId: identity.scanId,
         updatedAt: serverTimestamp(),
-      }, { merge: true });
+      }, { merge: true }));
       logs.push(makeLog('LOCATION_RESERVED', `LOCATION_RESERVED ${selectedLocation}`, {
         ...identity,
         sortingMode,
@@ -422,7 +442,7 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         details: { locationId: selectedLocation },
       }));
 
-      transaction.set(newCommandRef, {
+      traceWrite(`commands/${commandId} GO ${inPosition}`, () => transaction.set(newCommandRef, {
         commandId,
         deviceId: ESP_DEVICE_ID,
         command: 'GO',
@@ -436,7 +456,7 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         payload,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      });
+      }));
       logs.push(makeLog('COMMAND_CREATED', `COMMAND_CREATED GO ${inPosition}`, {
         ...identity,
         sortingMode,
@@ -445,7 +465,7 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         details: { command: 'GO', position: inPosition, payload },
       }));
 
-      transaction.set(queueRef, {
+      traceWrite(`scanQueue/${sourceDocId} assign scan`, () => transaction.set(queueRef, {
         ...identity,
         source: scan.source || sourceCollection,
         status: 'ASSIGNED',
@@ -456,9 +476,9 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         outPosition,
         commandId,
         updatedAt: serverTimestamp(),
-      }, { merge: true });
+      }, { merge: true }));
       if (sourceCollection === 'scans') {
-        transaction.set(sourceRef, {
+        traceWrite(`${sourceCollection}/${sourceDocId} assign scan`, () => transaction.set(sourceRef, {
           status: 'ASSIGNED',
           selectedLocation,
           locationId: selectedLocation,
@@ -466,7 +486,7 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
           outPosition,
           commandId,
           updatedAt: serverTimestamp(),
-        }, { merge: true });
+        }, { merge: true }));
       }
       logs.push(makeLog('SCAN_ASSIGNED', `SCAN_ASSIGNED ${identity.scanId}`, {
         ...identity,
@@ -491,18 +511,35 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
     });
 
     committedLogs = result.logs || [];
-    await writeAutomationLogs(committedLogs);
+    await writeAutomationLogs(committedLogs.map((log) => ({
+      ...log,
+      details: {
+        ...log.details,
+        txTrace,
+      },
+    })));
     return result;
   } catch (error) {
+    console.table(txTrace);
     const beltErrorLog = makeLog('BELT_MOVE_COMMAND_ERROR', error.message || String(error), {
       scanId: sourceDocId,
-      details: { sourceCollection, sourceDocId, error: error.message || String(error) },
+      details: { sourceCollection, sourceDocId, error: error.message || String(error), txTrace },
     });
     const errorLog = makeLog('PROCESS_ERROR', error.message || String(error), {
       scanId: sourceDocId,
-      details: { sourceCollection, sourceDocId, error: error.message || String(error) },
+      details: { sourceCollection, sourceDocId, error: error.message || String(error), txTrace },
     });
-    await writeAutomationLogs([...committedLogs, beltErrorLog, errorLog]);
+    await writeAutomationLogs([
+      ...committedLogs.map((log) => ({
+        ...log,
+        details: {
+          ...log.details,
+          txTrace,
+        },
+      })),
+      beltErrorLog,
+      errorLog,
+    ]);
     throw error;
   }
 }
