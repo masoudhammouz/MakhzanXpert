@@ -65,10 +65,15 @@ function isFullInventoryLocation(location) {
   );
 }
 
-function countFullLocationsForProduct(locations, product, productId) {
+function isReservedForOrder(location) {
+  return Boolean(location?.reservedForOrder || location?.reservedForOrderId || location?.orderId);
+}
+
+function countFullLocationsForProduct(locations, product, productId, options = {}) {
   const productIds = productIdentityValues(product, productId);
   return locations.filter((location) => (
     isFullInventoryLocation(location) &&
+    (!options.availableOnly || !isReservedForOrder(location)) &&
     identitiesOverlap(productIds, locationIdentityValues(location))
   )).length;
 }
@@ -105,20 +110,22 @@ async function updateProductStocksFromLocations(products, locations, context = {
 
   const batch = writeBatch(db);
   const updatedProducts = products.map(({ id, ref, data }) => {
-    const count = countFullLocationsForProduct(locations, data, id);
+    const physicalCount = countFullLocationsForProduct(locations, data, id);
+    const availableCount = countFullLocationsForProduct(locations, data, id, { availableOnly: true });
     const update = {
-      stock: count,
-      quantity: count,
-      availableQuantity: count,
-      availableStock: count,
-      inStock: count > 0,
-      isAvailable: count > 0,
+      stock: availableCount,
+      physicalStock: physicalCount,
+      quantity: physicalCount,
+      availableQuantity: availableCount,
+      availableStock: availableCount,
+      inStock: availableCount > 0,
+      isAvailable: availableCount > 0,
       inventorySource: 'locations',
       updatedAt: serverTimestamp(),
     };
 
     batch.set(ref, update, { merge: true });
-    return { id, count };
+    return { id, physicalStock: physicalCount, availableStock: availableCount };
   });
 
   await batch.commit();
@@ -135,10 +142,11 @@ async function updateProductStocksFromLocations(products, locations, context = {
 
   await Promise.allSettled(updatedProducts.map((product) => {
     console.info('[PRODUCT_STOCK_UPDATED]', product);
+    console.info('[INVENTORY_AVAILABLE_STOCK_UPDATED]', product);
     return logInventoryActivity(
       'PRODUCT_STOCK_UPDATED',
-      `Product ${product.id} stock updated to ${product.count}.`,
-      { ...context, productId: product.id, stock: product.count },
+      `Product ${product.id} available stock updated to ${product.availableStock}.`,
+      { ...context, productId: product.id, physicalStock: product.physicalStock, availableStock: product.availableStock },
     );
   }));
 
@@ -264,6 +272,8 @@ export async function markPickedLocationEmpty(locationId, context = {}) {
       reserved: false,
       occupied: false,
       isOccupied: false,
+      reservedForOrder: null,
+      reservedForOrderId: null,
       clearedAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
       productKey: deleteField(),
@@ -290,9 +300,9 @@ export async function markPickedLocationEmpty(locationId, context = {}) {
   if (!pickedLocation) return null;
 
   const productIdOrSku = productSkuFromLocation(pickedLocation);
-  console.info('[LOCATION_MARKED_EMPTY_AFTER_PICK]', { locationId, productIdOrSku, ...context });
+  console.info('[LOCATION_CLEARED_AFTER_PICK]', { locationId, productIdOrSku, ...context });
   await logInventoryActivity(
-    'LOCATION_MARKED_EMPTY_AFTER_PICK',
+    'LOCATION_CLEARED_AFTER_PICK',
     `Location ${locationId} cleared after picking ${productIdOrSku}.`,
     { locationId, productIdOrSku, ...context },
   );

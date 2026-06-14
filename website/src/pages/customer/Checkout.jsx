@@ -1,9 +1,10 @@
-import { collection, doc, runTransaction, serverTimestamp } from 'firebase/firestore';
+import { collection, doc, getDocs, query, runTransaction, serverTimestamp, where } from 'firebase/firestore';
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useCart } from '../../context/CartContext.jsx';
 import { db } from '../../firebase/firebase.js';
 import { formatCurrency } from '../../utils/formatCurrency.js';
+import { syncAllProductInventoryFromLocations } from '../../utils/inventorySync.js';
 import { buildProductSlug, getSellableStock, isCustomerPurchasableProduct, isProductAvailable } from '../../utils/productVisibility.js';
 
 function getProductTitle(product) {
@@ -14,6 +15,48 @@ function buildProductKey(product) {
   return ['brand', 'model', 'color', 'size']
     .map((field) => String(product[field] || '').trim().toUpperCase())
     .join('|');
+}
+
+function normalizeIdentity(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function compactIdentityValues(values) {
+  return new Set(values.map(normalizeIdentity).filter(Boolean));
+}
+
+function identityValues(data) {
+  return compactIdentityValues([
+    data?.id,
+    data?.productId,
+    data?.sku,
+    data?.normalizedSku,
+    data?.productKey,
+    buildProductKey(data),
+  ]);
+}
+
+function identitiesOverlap(left, right) {
+  for (const value of left) {
+    if (right.has(value)) return true;
+  }
+  return false;
+}
+
+function getTimestampValue(value) {
+  if (value?.toMillis) return value.toMillis();
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === 'number') return value;
+  return 0;
+}
+
+function isReservableLocation(location, item) {
+  return (
+    String(location.status || '').toLowerCase() === 'full' &&
+    (location.occupied === true || location.isOccupied === true) &&
+    !location.reservedForOrder &&
+    identitiesOverlap(identityValues(item), identityValues(location))
+  );
 }
 
 function Checkout() {
@@ -70,10 +113,48 @@ function Checkout() {
         quantity: Number(item.quantity || 0),
         imageUrl: item.imageUrl || '',
       }));
+      const locationsSnapshot = await getDocs(query(collection(db, 'locations'), where('status', '==', 'full')));
+      const fullLocations = locationsSnapshot.docs
+        .map((locationDoc) => ({ id: locationDoc.id, ref: locationDoc.ref, ...locationDoc.data() }))
+        .sort((left, right) => getTimestampValue(left.filledAt) - getTimestampValue(right.filledAt));
+      const selectedLocationIds = new Set();
+      const reservedLocationsByProductId = new Map();
+
+      for (const item of items) {
+        const quantity = Number(item.quantity || 0);
+        const matches = fullLocations.filter((location) => (
+          !selectedLocationIds.has(location.id) &&
+          isReservableLocation(location, item)
+        ));
+
+        if (matches.length < quantity) {
+          throw new Error(`${getProductTitle(item)} is not available for checkout.`);
+        }
+
+        const selected = matches.slice(0, quantity);
+        selected.forEach((location) => selectedLocationIds.add(location.id));
+        reservedLocationsByProductId.set(item.id, selected);
+      }
 
       await runTransaction(db, async (transaction) => {
         const productRefs = items.map((item) => doc(db, 'products', item.id));
         const productSnapshots = await Promise.all(productRefs.map((ref) => transaction.get(ref)));
+        const orderRef = doc(collection(db, 'orders'));
+        const orderId = `ORD-${Date.now()}`;
+        const locationPlans = [];
+
+        items.forEach((item) => {
+          const reservedLocations = reservedLocationsByProductId.get(item.id) || [];
+          reservedLocations.forEach((location, unitIndex) => {
+            locationPlans.push({
+              item,
+              unitIndex,
+              location,
+              snapshotPromise: transaction.get(location.ref),
+            });
+          });
+        });
+        const locationSnapshots = await Promise.all(locationPlans.map((plan) => plan.snapshotPromise));
 
         productSnapshots.forEach((snapshot, index) => {
           const cartItem = items[index];
@@ -115,15 +196,40 @@ function Checkout() {
           }
         });
 
-        const orderRef = doc(collection(db, 'orders'));
-        const orderId = `ORD-${Date.now()}`;
+        locationSnapshots.forEach((locationSnapshot, index) => {
+          const plan = locationPlans[index];
+          const locationData = locationSnapshot.exists() ? { id: locationSnapshot.id, ...locationSnapshot.data() } : null;
+          if (!locationData || !isReservableLocation(locationData, plan.item)) {
+            throw new Error(`${getProductTitle(plan.item)} is no longer available.`);
+          }
+
+          transaction.set(plan.location.ref, {
+            reservedForOrder: orderRef.id,
+            reservedForOrderId: orderId,
+            reservedOrderItemKey: `${plan.item.id}-${plan.unitIndex}`,
+            reservedAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }, { merge: true });
+
+          console.info('[ORDER_LOCATION_RESERVED]', {
+            orderId: orderRef.id,
+            orderNumber: orderId,
+            locationId: plan.location.id,
+            productId: plan.item.id,
+          });
+        });
+
         transaction.set(orderRef, {
           orderId,
           customerName: form.customerName.trim(),
           customerPhone: form.customerPhone.trim(),
           customerAddress: form.customerAddress.trim(),
           notes: form.notes.trim(),
-          items: orderItems,
+          items: orderItems.map((item) => ({
+            ...item,
+            reservedLocationIds: (reservedLocationsByProductId.get(item.productId) || []).map((location) => location.id),
+            reservedLocationNumbers: (reservedLocationsByProductId.get(item.productId) || []).map((location) => Number(location.locationId ?? location.position ?? location.id)),
+          })),
           totalPrice: Number(subtotal || 0),
           status: 'pending',
           createdAt: serverTimestamp(),
@@ -131,6 +237,7 @@ function Checkout() {
         });
       });
 
+      await syncAllProductInventoryFromLocations();
       clearCart();
       navigate('/order-success');
     } catch (error) {

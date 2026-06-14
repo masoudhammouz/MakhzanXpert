@@ -134,9 +134,19 @@ function isLocationMatch(location, item) {
 function isPickableLocation(location) {
   return (
     String(location.status || '').toLowerCase() === 'full' &&
-    (location.occupied === true || location.isOccupied === true) &&
-    location.reserved !== true
+    (location.occupied === true || location.isOccupied === true)
   );
+}
+
+function isLocationReservedForOrder(location, order) {
+  return (
+    String(location.reservedForOrder || '') === String(order.id) ||
+    String(location.reservedForOrderId || '') === String(order.orderId || order.id)
+  );
+}
+
+function isLocationReservedForAnotherOrder(location, order) {
+  return Boolean(location.reservedForOrder || location.reservedForOrderId) && !isLocationReservedForOrder(location, order);
 }
 
 function getLocationNumber(location) {
@@ -256,7 +266,7 @@ function AdminOrders() {
       const pickCommands = orderCommandsSnapshot.docs
         .map((commandDoc) => ({ id: commandDoc.id, ...commandDoc.data() }))
         .filter((item) => item.type === PICK_COMMAND || item.command === PICK_COMMAND || String(item.arduinoCommand || '').startsWith(`${PICK_COMMAND} `));
-      const doneCommands = pickCommands.filter((item) => ['done', 'executed', 'picked'].includes(item.status) || item.id === command.id);
+      const doneCommands = pickCommands.filter((item) => ['done', 'completed', 'executed', 'picked'].includes(item.status) || item.id === command.id);
       const allDone = pickCommands.length > 0 && doneCommands.length === pickCommands.length;
 
       const assignedLocations = pickCommands.map((item) => ({
@@ -265,7 +275,7 @@ function AdminOrders() {
         productId: item.productId || '',
         locationId: item.locationId,
         locationNumber: item.locationNumber,
-        status: ['done', 'executed', 'picked'].includes(item.status) || item.id === command.id ? 'picked' : (item.status || 'waiting'),
+        status: ['done', 'completed', 'executed', 'picked'].includes(item.status) || item.id === command.id ? 'picked' : (item.status || 'waiting'),
         commandId: item.commandId || item.id,
       }));
 
@@ -302,7 +312,7 @@ function AdminOrders() {
         .filter((command) => (
           command.orderId &&
           !command.finalizedAt &&
-          ['done', 'executed', 'picked'].includes(command.status) &&
+          ['done', 'completed', 'executed', 'picked'].includes(command.status) &&
           (command.type === PICK_COMMAND || command.command === PICK_COMMAND || String(command.arduinoCommand || '').startsWith(`${PICK_COMMAND} `))
         ))
         .forEach((command) => {
@@ -334,8 +344,12 @@ function AdminOrders() {
   const findLocationsForOrder = async (order) => {
     const locationsSnapshot = await getDocs(collection(db, 'locations'));
     const availableLocations = locationsSnapshot.docs
-      .map((locationDoc) => ({ id: locationDoc.id, ...locationDoc.data() }))
-      .filter((location) => isPickableLocation(location) && getLocationNumber(location) > 0)
+      .map((locationDoc) => ({ id: locationDoc.id, ref: locationDoc.ref, ...locationDoc.data() }))
+      .filter((location) => (
+        isPickableLocation(location) &&
+        getLocationNumber(location) > 0 &&
+        !isLocationReservedForAnotherOrder(location, order)
+      ))
       .sort(sortOldestFilledFirst);
 
     const assignedLocationIds = new Set();
@@ -343,7 +357,18 @@ function AdminOrders() {
     const missingItems = [];
 
     for (const item of expandOrderItems(order.items)) {
-      const match = availableLocations.find((location) => !assignedLocationIds.has(location.id) && isLocationMatch(location, item));
+      const reservedMatches = availableLocations.filter((location) => (
+        !assignedLocationIds.has(location.id) &&
+        isLocationReservedForOrder(location, order) &&
+        isLocationMatch(location, item)
+      ));
+      const fallbackMatches = availableLocations.filter((location) => (
+        !assignedLocationIds.has(location.id) &&
+        !location.reservedForOrder &&
+        !location.reservedForOrderId &&
+        isLocationMatch(location, item)
+      ));
+      const match = reservedMatches[0] || fallbackMatches[0];
       if (!match) {
         missingItems.push(productLabel(item));
         continue;
@@ -362,7 +387,9 @@ function AdminOrders() {
         color: normalize(item.color),
         size: normalize(item.size),
         locationId: match.id,
+        locationRef: match.ref,
         locationNumber,
+        wasReservedForOrder: isLocationReservedForOrder(match, order),
         status: 'waiting',
       });
     }
@@ -373,6 +400,7 @@ function AdminOrders() {
   const handlePrepareOrder = async (order) => {
     setPreparingId(order.id);
     setError('');
+    console.info('[PREPARE_ORDER_CLICKED]', { orderId: order.id, orderNumber: order.orderId || order.id });
 
     try {
       const { assignments, missingItems } = await findLocationsForOrder(order);
@@ -417,6 +445,8 @@ function AdminOrders() {
             orderNumber: order.orderId || order.id,
             locationId: assignment.locationId,
             locationNumber: assignment.locationNumber,
+            productId: assignment.productId,
+            sku: assignment.sku || assignment.normalizedSku,
             arduinoCommand,
           },
           source: 'admin-prepare-order',
@@ -424,7 +454,22 @@ function AdminOrders() {
           updatedAt: serverTimestamp(),
         });
 
-        console.info('[PICK_ORDER_COMMAND_CREATED]', {
+        if (assignment.locationRef) {
+          batch.set(assignment.locationRef, {
+            reservedForOrder: order.id,
+            reservedForOrderId: order.orderId || order.id,
+            updatedAt: serverTimestamp(),
+          }, { merge: true });
+          console.info('[ORDER_LOCATION_RESERVED]', {
+            orderId: order.id,
+            orderNumber: order.orderId || order.id,
+            locationId: assignment.locationId,
+            locationNumber: assignment.locationNumber,
+            alreadyReserved: assignment.wasReservedForOrder,
+          });
+        }
+
+        console.info('[PICK_COMMAND_CREATED]', {
           commandId,
           arduinoCommand,
           orderId: order.id,
@@ -434,7 +479,18 @@ function AdminOrders() {
         });
 
         return {
-          ...assignment,
+          orderItemKey: assignment.orderItemKey,
+          productKey: assignment.productKey,
+          productId: assignment.productId,
+          sku: assignment.sku,
+          normalizedSku: assignment.normalizedSku,
+          brand: assignment.brand,
+          model: assignment.model,
+          color: assignment.color,
+          size: assignment.size,
+          locationId: assignment.locationId,
+          locationNumber: assignment.locationNumber,
+          status: assignment.status,
           commandId,
           arduinoCommand,
         };

@@ -353,6 +353,11 @@ void readArduinoSerial() {
     } else if (line.startsWith("DONE:")) {
       Serial.print("[ARDUINO_RESPONSE] ");
       Serial.println(line);
+      if (line.startsWith("DONE:PICK_LOCATION ")) {
+        Serial.print("[ARDUINO_PICK_DONE_RECEIVED] ");
+        Serial.println(line);
+        publishSystemActivity("ARDUINO_PICK_DONE_RECEIVED", line, false);
+      }
       lastDoneLine = line;
       publishSystemActivity("ARDUINO_RESPONSE", line, false);
       publishHardwareStatus(true);
@@ -655,6 +660,11 @@ void pollFirestoreCommands() {
     lastDoneLine = "";
     lastErrorLine = "";
     sendToArduino(arduinoCommand);
+    if (arduinoCommand.startsWith("PICK_LOCATION ")) {
+      Serial.print("[ESP_PICK_COMMAND_FORWARDED] ");
+      Serial.println(arduinoCommand);
+      publishSystemActivity("ESP_PICK_COMMAND_FORWARDED", arduinoCommand, false);
+    }
     Serial.print("COMMAND SENT ");
     Serial.println(arduinoCommand);
 
