@@ -26,7 +26,7 @@ const ESP_DEVICE_ID = 'esp-main-01';
 const TOTAL_LOCATIONS = 9;
 const BELT_MOVE_COMMAND = 'BELT_RUN_UNTIL_IR_LAST';
 const PROCESSABLE_STATUS = 'CONFIRMED';
-const PROCESSED_STATUSES = new Set(['ASSIGNED', 'COMMAND_CREATED', 'PROCESSING', 'DONE', 'ERROR']);
+const PROCESSED_STATUSES = new Set(['ASSIGNED', 'COMMAND_CREATED', 'PROCESSING', 'STORED', 'DONE', 'ERROR']);
 
 const NEIGHBORS = {
   1: [2, 4],
@@ -86,12 +86,16 @@ function locationIdOf(location, fallbackId) {
   return Number.isInteger(id) ? id : fallbackId;
 }
 
+function isRejectedByOccupiedFlag(location) {
+  return location?.occupied === true || location?.isOccupied === true;
+}
+
 function isEmptyLocation(location, fallbackId) {
   const id = locationIdOf(location, fallbackId);
   const status = String(location.status || '').trim().toLowerCase();
   if (!Number.isInteger(id) || id < 1 || id > TOTAL_LOCATIONS) return false;
   if (status === 'reserved' || status === 'full') return false;
-  return status === '' || status === 'empty';
+  return (status === '' || status === 'empty') && !isRejectedByOccupiedFlag(location);
 }
 
 function scoreNeighbor(scan, neighbor, sortingMode) {
@@ -147,6 +151,10 @@ function locationPositions(locationId) {
   };
 }
 
+function commandDocId(prefix, scanId) {
+  return `${prefix}-${String(scanId).replaceAll('/', '_')}`;
+}
+
 function makeLog(type, message, context = {}) {
   return {
     type,
@@ -171,8 +179,6 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
   const sourceRef = doc(db, sourceCollection, sourceDocId);
   const queueRef = doc(db, 'scanQueue', sourceDocId);
   const settingsRef = doc(db, 'settings', 'system');
-  const beltCommandRef = doc(collection(db, 'commands'));
-  const newCommandRef = doc(collection(db, 'commands'));
   const locationRefs = Array.from({ length: TOTAL_LOCATIONS }, (_, index) => doc(db, 'locations', String(index + 1)));
 
   let committedLogs = [];
@@ -186,6 +192,8 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
       ...(queueSnapshotBeforeTransaction.exists() ? queueSnapshotBeforeTransaction.data() : {}),
     };
     const preflightIdentity = scanIdentity(preflightScan, sourceDocId);
+    const beltCommandRef = doc(db, 'commands', commandDocId('belt', preflightIdentity.scanId));
+    const newCommandRef = doc(db, 'commands', commandDocId('go', preflightIdentity.scanId));
     const beltCommandQuery = query(
       collection(db, 'commands'),
       where('scanId', '==', preflightIdentity.scanId),
@@ -314,6 +322,13 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
       }
 
       logs.push(makeLog('SCAN_PROCESSING_STARTED', `Processing scan ${identity.scanId}.`, identity));
+      logs.push(makeLog('COMMAND_DETERMINISTIC_ID_USED', `COMMAND_DETERMINISTIC_ID_USED ${beltCommandRef.id} ${newCommandRef.id}`, {
+        ...identity,
+        details: {
+          beltCommandDocId: beltCommandRef.id,
+          goCommandDocId: newCommandRef.id,
+        },
+      }));
 
       logs.push(makeLog('COMMAND_DUPLICATE_CHECK', `Found ${existingGoCommands.size} existing GO commands for scan ${identity.scanId}.`, {
         ...identity,
@@ -383,6 +398,23 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         sortingMode,
         details: { emptyLocations },
       }));
+      const occupiedFlagRejectedLocations = locationSnapshots
+        .map((snapshot, index) => ({
+          locationId: index + 1,
+          ...(snapshot.exists() ? snapshot.data() : {}),
+        }))
+        .filter((location) => {
+          const status = String(location.status || '').trim().toLowerCase();
+          return (status === '' || status === 'empty') && isRejectedByOccupiedFlag(location);
+        })
+        .map((location) => location.locationId);
+      if (occupiedFlagRejectedLocations.length > 0) {
+        logs.push(makeLog('LOCATION_REJECTED_OCCUPIED_FLAG', `LOCATION_REJECTED_OCCUPIED_FLAG ${occupiedFlagRejectedLocations.join(', ')}`, {
+          ...identity,
+          sortingMode,
+          details: { rejectedLocations: occupiedFlagRejectedLocations },
+        }));
+      }
       logs.push(makeLog('LOCATION_SCORING_STARTED', `LOCATION_SCORING_STARTED ${sortingMode}`, {
         ...identity,
         sortingMode,
