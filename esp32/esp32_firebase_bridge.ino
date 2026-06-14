@@ -480,6 +480,18 @@ String normalizeFirestoreCommand(String raw) {
     if (n.length() > 0) return "GO " + n;
   }
 
+  if (raw.startsWith("PICK_LOCATION ")) return raw;
+  if (raw.startsWith("PICK ")) {
+    String n = raw.substring(5);
+    n.trim();
+    if (n.length() > 0) return "PICK_LOCATION " + n;
+  }
+  if (raw.startsWith("PICK_LOCATION")) {
+    String n = raw.substring(13);
+    n.trim();
+    if (n.length() > 0) return "PICK_LOCATION " + n;
+  }
+
   if (raw == "START_AUTOMATION") return "START_AUTOMATION";
   if (raw == "AUTO") return "START_AUTOMATION";
   if (raw == "AUTOMATION_START") return "START_AUTOMATION";
@@ -537,6 +549,11 @@ String expectedDoneForFirestoreCommand(String arduinoCommand) {
     n.trim();
     return "DONE:" + n;
   }
+  if (arduinoCommand.startsWith("PICK_LOCATION ")) {
+    String n = arduinoCommand.substring(14);
+    n.trim();
+    return "DONE:PICK_LOCATION " + n;
+  }
   if (arduinoCommand == "HOME") return "DONE:HOME";
   if (arduinoCommand == "BELT_RUN_UNTIL_IR_LAST") return "DONE:BELT_RUN_UNTIL_IR_LAST";
   return "";
@@ -546,6 +563,7 @@ bool shouldWaitForFirestoreCommand(String rawCommand, String arduinoCommand) {
   rawCommand.trim();
   rawCommand.toUpperCase();
   return arduinoCommand.startsWith("GO ") ||
+    arduinoCommand.startsWith("PICK_LOCATION ") ||
     arduinoCommand == "HOME" ||
     arduinoCommand == "BELT_RUN_UNTIL_IR_LAST" ||
     rawCommand == "HOME_LIFTER" ||
@@ -650,6 +668,7 @@ void pollFirestoreCommands() {
     if (shouldWaitForFirestoreCommand(rawCommand, arduinoCommand)) {
       String expectedDone = expectedDoneForFirestoreCommand(arduinoCommand);
       unsigned long timeoutMs = (arduinoCommand == "BELT_RUN_UNTIL_IR_LAST") ? 60000UL : 140000UL;
+      if (arduinoCommand.startsWith("PICK_LOCATION ")) timeoutMs = 180000UL;
       String responseLine;
       bool arduinoError = false;
       bool done = waitForFirestoreCommandResult(expectedDone, timeoutMs, responseLine, arduinoError);
@@ -812,6 +831,7 @@ void handleCommand() {
   if (arduinoCommand == "BELT_START") expectedDone = "DONE:BELT_START";
   else if (arduinoCommand == "BELT_STOP") expectedDone = "DONE:BELT_STOP";
   else if (arduinoCommand == "BELT_RUN_UNTIL_IR_LAST") { expectedDone = "DONE:BELT_RUN_UNTIL_IR_LAST"; timeoutMs = 60000; }
+  else if (arduinoCommand.startsWith("PICK_LOCATION ")) { expectedDone = expectedDoneForFirestoreCommand(arduinoCommand); timeoutMs = 180000; }
   else if (arduinoCommand == "HOME") expectedDone = "DONE:HOME";
   else if (arduinoCommand == "START") expectedDone = "DONE:START";
   else if (arduinoCommand == "ULTRA") expectedDone = "DONE:ULTRA";

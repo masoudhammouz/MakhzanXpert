@@ -91,6 +91,7 @@ struct Position {
 };
 
 Position STARTING_POINT = {26, 317, 171};
+const Position DELIVERY_POINT = {2400, 0, 0};
 
 Position positions[18] = {
   {53, 125, 1846},    {53, 0, 1846},
@@ -358,6 +359,28 @@ void handleCommand(String cmd) {
       reply("DONE:VERIFY_LOCATION DETECTED");
     } else {
       reply("DONE:VERIFY_LOCATION CLEAR");
+    }
+  }
+
+  else if (cmd.startsWith("PICK_LOCATION ")) {
+    int locationNumber = cmd.substring(14).toInt();
+
+    if (locationNumber >= 1 && locationNumber <= 9) {
+      pickLocationThenDeliver(locationNumber);
+      reply("DONE:PICK_LOCATION " + String(locationNumber));
+    } else {
+      reply("ERROR:BAD_PICK_LOCATION");
+    }
+  }
+
+  else if (cmd.startsWith("PICK ")) {
+    int locationNumber = cmd.substring(5).toInt();
+
+    if (locationNumber >= 1 && locationNumber <= 9) {
+      pickLocationThenDeliver(locationNumber);
+      reply("DONE:PICK_LOCATION " + String(locationNumber));
+    } else {
+      reply("ERROR:BAD_PICK_LOCATION");
     }
   }
 
@@ -723,6 +746,43 @@ bool isSamePairInOut(int currentPos, int targetPos) {
   return currentPair == targetPair && currentPos != targetPos;
 }
 
+int getInPositionForLocation(int locationNumber) {
+  if (locationNumber < 1 || locationNumber > 9) return -1;
+  return locationNumber * 2 - 1;
+}
+
+int getOutPositionForLocation(int locationNumber) {
+  if (locationNumber < 1 || locationNumber > 9) return -1;
+  return locationNumber * 2;
+}
+
+void pickLocationThenDeliver(int locationNumber) {
+  int inPosition = getInPositionForLocation(locationNumber);
+  int outPosition = getOutPositionForLocation(locationNumber);
+
+  if (inPosition < 1 || outPosition < 1) {
+    reply("ERROR:BAD_PICK_LOCATION");
+    return;
+  }
+
+  reply("PICK_ORDER_STARTED");
+  reply("PICK_ENTER_OUT_POSITION");
+  goPosition(outPosition);
+
+  reply("PICK_EXIT_IN_POSITION");
+  goPosition(inPosition);
+
+  reply("PICK_DELIVERY_POINT");
+  moveToXYZ(
+    DELIVERY_POINT.x,
+    DELIVERY_POINT.y,
+    DELIVERY_POINT.z
+  );
+  currentPositionIndex = 0;
+
+  reply("PICK_ORDER_DONE");
+}
+
 // ================= MOVE LOGIC =================
 
 void moveToXYZ(long targetX, long targetY, long targetZ) {
@@ -1017,6 +1077,7 @@ void printHelp() {
   Serial.println("CAMERA / SCAN");
   Serial.println("SITE 1 to SITE 9");
   Serial.println("GO 1 to GO 18");
+  Serial.println("PICK_LOCATION 1 to 9 / PICK 1 to 9");
   Serial.println("STATUS");
   Serial.println("TESTIR");
   Serial.println("TESTLIM");

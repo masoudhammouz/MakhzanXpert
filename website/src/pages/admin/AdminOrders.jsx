@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  addDoc,
   collection,
   doc,
   getDocs,
+  limit,
   onSnapshot,
   orderBy,
   query,
@@ -16,8 +16,12 @@ import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
 import { formatCurrency } from '../../utils/formatCurrency.js';
+import { markPickedLocationEmpty } from '../../utils/inventorySync.js';
+import { buildNormalizedSku } from '../../utils/productVisibility.js';
 
-const ORDER_STATUSES = ['pending', 'retrieving', 'ready', 'completed', 'cancelled'];
+const ESP_DEVICE_ID = 'esp-main-01';
+const PICK_COMMAND = 'PICK_LOCATION';
+const ORDER_STATUSES = ['pending', 'preparing', 'retrieving', 'ready', 'completed', 'cancelled'];
 const COMPLETABLE_STATUSES = ['ready', 'completed'];
 
 function getTimestampValue(value) {
@@ -46,6 +50,43 @@ function buildProductKey(item) {
 
 function productLabel(item) {
   return buildProductKey(item).split('|').filter(Boolean).join(' ');
+}
+
+function normalizeIdentity(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function compactIdentityValues(values) {
+  return new Set(values.map(normalizeIdentity).filter(Boolean));
+}
+
+function itemIdentityValues(item) {
+  return compactIdentityValues([
+    item?.id,
+    item?.productId,
+    item?.sku,
+    item?.normalizedSku,
+    item?.productKey,
+    buildProductKey(item),
+    buildNormalizedSku(item),
+  ]);
+}
+
+function locationIdentityValues(location) {
+  return compactIdentityValues([
+    location?.productId,
+    location?.sku,
+    location?.normalizedSku,
+    location?.productKey,
+    buildNormalizedSku(location),
+  ]);
+}
+
+function identitiesOverlap(left, right) {
+  for (const value of left) {
+    if (right.has(value)) return true;
+  }
+  return false;
 }
 
 function getItemsCount(order) {
@@ -79,17 +120,35 @@ function getStatusClass(status) {
 }
 
 function isLocationMatch(location, item) {
-  const key = buildProductKey(item);
+  const identityMatch = identitiesOverlap(itemIdentityValues(item), locationIdentityValues(location));
+  if (identityMatch) return true;
+
   return (
-    location.status === 'full' &&
-    normalize(location.productKey) === normalize(key)
-  ) || (
-    location.status === 'full' &&
     normalize(location.brand) === normalize(item.brand) &&
     normalize(location.model) === normalize(item.model || item.name) &&
     normalize(location.color) === normalize(item.color) &&
     normalize(location.size) === normalize(item.size)
   );
+}
+
+function isPickableLocation(location) {
+  return (
+    String(location.status || '').toLowerCase() === 'full' &&
+    (location.occupied === true || location.isOccupied === true) &&
+    location.reserved !== true
+  );
+}
+
+function getLocationNumber(location) {
+  const value = Number(location.locationId ?? location.position ?? location.id);
+  return Number.isInteger(value) && value >= 1 && value <= 9 ? value : 0;
+}
+
+function sortOldestFilledFirst(left, right) {
+  const leftFilledAt = getTimestampValue(left.filledAt);
+  const rightFilledAt = getTimestampValue(right.filledAt);
+  if (leftFilledAt !== rightFilledAt) return leftFilledAt - rightFilledAt;
+  return getLocationNumber(left) - getLocationNumber(right);
 }
 
 function expandOrderItems(items) {
@@ -113,6 +172,7 @@ function AdminOrders() {
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [updatingId, setUpdatingId] = useState('');
   const [preparingId, setPreparingId] = useState('');
+  const finalizingCommandIds = useRef(new Set());
 
   useEffect(() => {
     setLoading(true);
@@ -143,7 +203,7 @@ function AdminOrders() {
 
   const summary = useMemo(() => ({
     pending: orders.filter((order) => (order.status || 'pending') === 'pending').length,
-    retrieving: orders.filter((order) => order.status === 'retrieving').length,
+    retrieving: orders.filter((order) => ['preparing', 'retrieving'].includes(order.status)).length,
     ready: orders.filter((order) => order.status === 'ready').length,
     completed: orders.filter((order) => order.status === 'completed').length,
   }), [orders]);
@@ -175,6 +235,84 @@ function AdminOrders() {
     }
   };
 
+  const finalizePickCommand = async (command) => {
+    if (!command?.id || finalizingCommandIds.current.has(command.id) || command.finalizedAt) return;
+    finalizingCommandIds.current.add(command.id);
+
+    try {
+      await markPickedLocationEmpty(command.locationId || command.locationNumber, {
+        orderId: command.orderId,
+        commandId: command.commandId || command.id,
+        arduinoCommand: command.arduinoCommand,
+      });
+
+      await updateDoc(doc(db, 'commands', command.id), {
+        finalizedAt: serverTimestamp(),
+        finalizedStatus: 'location_cleared',
+        updatedAt: serverTimestamp(),
+      });
+
+      const orderCommandsSnapshot = await getDocs(query(collection(db, 'commands'), where('orderId', '==', command.orderId)));
+      const pickCommands = orderCommandsSnapshot.docs
+        .map((commandDoc) => ({ id: commandDoc.id, ...commandDoc.data() }))
+        .filter((item) => item.type === PICK_COMMAND || item.command === PICK_COMMAND || String(item.arduinoCommand || '').startsWith(`${PICK_COMMAND} `));
+      const doneCommands = pickCommands.filter((item) => ['done', 'executed', 'picked'].includes(item.status) || item.id === command.id);
+      const allDone = pickCommands.length > 0 && doneCommands.length === pickCommands.length;
+
+      const assignedLocations = pickCommands.map((item) => ({
+        orderItemKey: item.orderItemKey,
+        productKey: item.productKey,
+        productId: item.productId || '',
+        locationId: item.locationId,
+        locationNumber: item.locationNumber,
+        status: ['done', 'executed', 'picked'].includes(item.status) || item.id === command.id ? 'picked' : (item.status || 'waiting'),
+        commandId: item.commandId || item.id,
+      }));
+
+      const orderUpdates = {
+        retrievalDone: doneCommands.length,
+        retrievalProgressLabel: `${doneCommands.length} / ${pickCommands.length} Retrieved`,
+        assignedBoxes: assignedLocations,
+        updatedAt: serverTimestamp(),
+      };
+
+      if (allDone) {
+        orderUpdates.status = 'ready';
+        orderUpdates.readyAt = serverTimestamp();
+      }
+
+      await updateDoc(doc(db, 'orders', command.orderId), orderUpdates);
+      refreshSelectedOrder(command.orderId, {
+        ...orderUpdates,
+        updatedAt: Date.now(),
+        readyAt: allDone ? Date.now() : undefined,
+      });
+    } catch (finalizeError) {
+      console.error('[PICK_ORDER_FINALIZE_FAILED]', command, finalizeError);
+    } finally {
+      finalizingCommandIds.current.delete(command.id);
+    }
+  };
+
+  useEffect(() => {
+    const commandsQuery = query(collection(db, 'commands'), orderBy('createdAt', 'desc'), limit(80));
+    const unsubscribe = onSnapshot(commandsQuery, (snapshot) => {
+      snapshot.docs
+        .map((commandDoc) => ({ id: commandDoc.id, ...commandDoc.data() }))
+        .filter((command) => (
+          command.orderId &&
+          !command.finalizedAt &&
+          ['done', 'executed', 'picked'].includes(command.status) &&
+          (command.type === PICK_COMMAND || command.command === PICK_COMMAND || String(command.arduinoCommand || '').startsWith(`${PICK_COMMAND} `))
+        ))
+        .forEach((command) => {
+          finalizePickCommand(command);
+        });
+    });
+
+    return unsubscribe;
+  }, []);
+
   const handleStatusChange = async (order, nextStatus) => {
     if (!COMPLETABLE_STATUSES.includes(nextStatus)) return;
     setUpdatingId(order.id);
@@ -193,33 +331,38 @@ function AdminOrders() {
     }
   };
 
-  const findBoxesForOrder = async (order) => {
+  const findLocationsForOrder = async (order) => {
     const locationsSnapshot = await getDocs(collection(db, 'locations'));
     const availableLocations = locationsSnapshot.docs
       .map((locationDoc) => ({ id: locationDoc.id, ...locationDoc.data() }))
-      .filter((location) => location.status === 'full' && location.boxId);
+      .filter((location) => isPickableLocation(location) && getLocationNumber(location) > 0)
+      .sort(sortOldestFilledFirst);
 
-    const assignedBoxIds = new Set();
+    const assignedLocationIds = new Set();
     const assignments = [];
     const missingItems = [];
 
     for (const item of expandOrderItems(order.items)) {
-      const match = availableLocations.find((location) => !assignedBoxIds.has(location.boxId) && isLocationMatch(location, item));
+      const match = availableLocations.find((location) => !assignedLocationIds.has(location.id) && isLocationMatch(location, item));
       if (!match) {
         missingItems.push(productLabel(item));
         continue;
       }
-      assignedBoxIds.add(match.boxId);
+
+      const locationNumber = getLocationNumber(match);
+      assignedLocationIds.add(match.id);
       assignments.push({
         orderItemKey: item.itemKey,
         productKey: buildProductKey(item),
         productId: item.productId || '',
+        sku: item.sku || '',
+        normalizedSku: item.normalizedSku || buildNormalizedSku(item),
         brand: normalize(item.brand),
         model: normalize(item.model || item.name),
         color: normalize(item.color),
         size: normalize(item.size),
-        boxId: match.boxId,
-        locationId: Number(match.id || match.locationId),
+        locationId: match.id,
+        locationNumber,
         status: 'waiting',
       });
     }
@@ -232,9 +375,9 @@ function AdminOrders() {
     setError('');
 
     try {
-      const { assignments, missingItems } = await findBoxesForOrder(order);
+      const { assignments, missingItems } = await findLocationsForOrder(order);
       if (missingItems.length > 0) {
-        setError(`Not enough stored boxes for: ${missingItems.join(', ')}.`);
+        setError('No available warehouse location for this product.');
         return;
       }
       if (assignments.length === 0) {
@@ -242,37 +385,76 @@ function AdminOrders() {
         return;
       }
 
-      await Promise.all(assignments.map((assignment) => addDoc(collection(db, 'pickRequests'), {
-        requestType: 'location',
-        queryValue: String(assignment.locationId),
-        orderId: order.id,
-        orderNumber: order.orderId || order.id,
-        orderItemKey: assignment.orderItemKey,
-        productKey: assignment.productKey,
-        productId: assignment.productId,
-        boxId: assignment.boxId,
-        locationId: assignment.locationId,
-        brand: assignment.brand,
-        model: assignment.model,
-        color: assignment.color,
-        size: assignment.size,
-        status: 'waiting',
-        source: 'order',
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      })));
+      const batch = writeBatch(db);
+      const assignedLocations = assignments.map((assignment) => {
+        const commandRef = doc(collection(db, 'commands'));
+        const commandId = commandRef.id;
+        const arduinoCommand = `${PICK_COMMAND} ${assignment.locationNumber}`;
+
+        batch.set(commandRef, {
+          commandId,
+          type: PICK_COMMAND,
+          command: PICK_COMMAND,
+          arduinoCommand,
+          deviceId: ESP_DEVICE_ID,
+          status: 'pending',
+          locationId: assignment.locationId,
+          locationNumber: assignment.locationNumber,
+          position: assignment.locationNumber,
+          orderId: order.id,
+          orderNumber: order.orderId || order.id,
+          orderItemKey: assignment.orderItemKey,
+          productKey: assignment.productKey,
+          productId: assignment.productId,
+          sku: assignment.sku,
+          normalizedSku: assignment.normalizedSku,
+          brand: assignment.brand,
+          model: assignment.model,
+          color: assignment.color,
+          size: assignment.size,
+          payload: {
+            orderId: order.id,
+            orderNumber: order.orderId || order.id,
+            locationId: assignment.locationId,
+            locationNumber: assignment.locationNumber,
+            arduinoCommand,
+          },
+          source: 'admin-prepare-order',
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+
+        console.info('[PICK_ORDER_COMMAND_CREATED]', {
+          commandId,
+          arduinoCommand,
+          orderId: order.id,
+          locationId: assignment.locationId,
+          locationNumber: assignment.locationNumber,
+          productKey: assignment.productKey,
+        });
+
+        return {
+          ...assignment,
+          commandId,
+          arduinoCommand,
+        };
+      });
 
       const updates = {
-        status: 'retrieving',
+        status: 'preparing',
         retrievalTotal: assignments.length,
         retrievalDone: 0,
         retrievalProgressLabel: `0 / ${assignments.length} Retrieved`,
-        assignedBoxes: assignments,
-        retrievalStartedAt: serverTimestamp(),
+        assignedBoxes: assignedLocations,
+        pickedLocationId: assignedLocations[0]?.locationId || '',
+        pickedLocationNumber: assignedLocations[0]?.locationNumber || 0,
+        preparingAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       };
-      await updateDoc(doc(db, 'orders', order.id), updates);
-      refreshSelectedOrder(order.id, { ...updates, retrievalStartedAt: Date.now(), updatedAt: Date.now() });
+
+      batch.update(doc(db, 'orders', order.id), updates);
+      await batch.commit();
+      refreshSelectedOrder(order.id, { ...updates, preparingAt: Date.now(), updatedAt: Date.now() });
     } catch {
       setError('Unable to prepare order. Please check stored inventory and try again.');
     } finally {
@@ -281,7 +463,7 @@ function AdminOrders() {
   };
 
   const handleCancelOrder = async (order) => {
-    if (!['pending', 'retrieving'].includes(order.status || 'pending')) return;
+    if (!['pending', 'preparing', 'retrieving'].includes(order.status || 'pending')) return;
     setUpdatingId(order.id);
     setError('');
 
@@ -294,11 +476,11 @@ function AdminOrders() {
         updatedAt: serverTimestamp(),
       });
 
-      const requestsSnapshot = await getDocs(query(collection(db, 'pickRequests'), where('orderId', '==', order.id)));
-      requestsSnapshot.docs.forEach((requestDoc) => {
-        const status = requestDoc.data().status;
+      const commandsSnapshot = await getDocs(query(collection(db, 'commands'), where('orderId', '==', order.id)));
+      commandsSnapshot.docs.forEach((commandDoc) => {
+        const status = commandDoc.data().status;
         if (!['done', 'picked', 'error'].includes(status)) {
-          batch.update(requestDoc.ref, {
+          batch.update(commandDoc.ref, {
             status: 'cancelled',
             updatedAt: serverTimestamp(),
           });
@@ -423,7 +605,7 @@ function AdminOrders() {
                                   Complete
                                 </button>
                               )}
-                              {['pending', 'retrieving'].includes(order.status || 'pending') && (
+                              {['pending', 'preparing', 'retrieving'].includes(order.status || 'pending') && (
                                 <button className="button-danger" type="button" disabled={updatingId === order.id} onClick={() => handleCancelOrder(order)}>
                                   Cancel
                                 </button>
@@ -497,18 +679,18 @@ function AdminOrders() {
             </div>
 
             <div className="ordered-products-list">
-              <h3>Boxes assigned</h3>
+              <h3>Locations assigned</h3>
               {(selectedOrder.assignedBoxes || []).length === 0 ? (
-                <p className="orders-customer-meta">No boxes assigned yet.</p>
+                <p className="orders-customer-meta">No locations assigned yet.</p>
               ) : (
                 selectedOrder.assignedBoxes.map((box, index) => (
-                  <div className="ordered-product-row order-box-row" key={`${box.boxId || box.locationId}-${index}`}>
+                  <div className="ordered-product-row order-box-row" key={`${box.commandId || box.locationId}-${index}`}>
                     <div>
                       <p className="inventory-product-name">{box.productKey}</p>
-                      <p className="orders-customer-meta">Location {box.locationId}</p>
+                      <p className="orders-customer-meta">Location {box.locationNumber || box.locationId}</p>
                     </div>
                     <p>{box.status || 'waiting'}</p>
-                    <p>{box.boxId || '-'}</p>
+                    <p>{box.commandId || '-'}</p>
                   </div>
                 ))
               )}

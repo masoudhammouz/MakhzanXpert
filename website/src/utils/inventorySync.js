@@ -1,6 +1,7 @@
 import {
   addDoc,
   collection,
+  deleteField,
   doc,
   getDoc,
   getDocs,
@@ -247,6 +248,56 @@ export async function markLocationFull(locationId) {
   );
   await recomputeProductInventoryFromLocations(productIdOrSku);
   return location;
+}
+
+export async function markPickedLocationEmpty(locationId, context = {}) {
+  const locationRef = doc(db, 'locations', String(locationId));
+  const pickedLocation = await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(locationRef);
+    if (!snapshot.exists()) return null;
+
+    const current = { id: snapshot.id, ...snapshot.data() };
+    if (String(current.status || '').toLowerCase() !== 'full') return null;
+
+    transaction.set(locationRef, {
+      status: 'empty',
+      reserved: false,
+      occupied: false,
+      isOccupied: false,
+      clearedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      productKey: deleteField(),
+      productId: deleteField(),
+      sku: deleteField(),
+      normalizedSku: deleteField(),
+      brand: deleteField(),
+      model: deleteField(),
+      color: deleteField(),
+      size: deleteField(),
+      scanId: deleteField(),
+      commandId: deleteField(),
+      reservedAt: deleteField(),
+      filledAt: deleteField(),
+      inPosition: deleteField(),
+      outPosition: deleteField(),
+      sortingMode: deleteField(),
+      boxId: deleteField(),
+    }, { merge: true });
+
+    return current;
+  });
+
+  if (!pickedLocation) return null;
+
+  const productIdOrSku = productSkuFromLocation(pickedLocation);
+  console.info('[LOCATION_MARKED_EMPTY_AFTER_PICK]', { locationId, productIdOrSku, ...context });
+  await logInventoryActivity(
+    'LOCATION_MARKED_EMPTY_AFTER_PICK',
+    `Location ${locationId} cleared after picking ${productIdOrSku}.`,
+    { locationId, productIdOrSku, ...context },
+  );
+  await recomputeProductInventoryFromLocations(productIdOrSku);
+  return pickedLocation;
 }
 
 export function markLocationFullAfterDelay(locationId, options = {}) {
