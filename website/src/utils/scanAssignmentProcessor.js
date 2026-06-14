@@ -2,6 +2,8 @@ import {
   addDoc,
   collection,
   doc,
+  getDoc,
+  getDocs,
   limit,
   query,
   runTransaction,
@@ -177,15 +179,43 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
   const txTrace = [];
 
   try {
+    const sourceSnapshotBeforeTransaction = await getDoc(sourceRef);
+    const queueSnapshotBeforeTransaction = await getDoc(queueRef);
+    const preflightScan = {
+      ...(sourceSnapshotBeforeTransaction.exists() ? sourceSnapshotBeforeTransaction.data() : {}),
+      ...(queueSnapshotBeforeTransaction.exists() ? queueSnapshotBeforeTransaction.data() : {}),
+    };
+    const preflightIdentity = scanIdentity(preflightScan, sourceDocId);
+    const beltCommandQuery = query(
+      collection(db, 'commands'),
+      where('scanId', '==', preflightIdentity.scanId),
+      where('command', '==', BELT_MOVE_COMMAND),
+      limit(1),
+    );
+    const goCommandQuery = query(
+      collection(db, 'commands'),
+      where('scanId', '==', preflightIdentity.scanId),
+      where('command', '==', 'GO'),
+      limit(1),
+    );
+    const [existingBeltCommands, existingGoCommands] = await Promise.all([
+      getDocs(beltCommandQuery),
+      getDocs(goCommandQuery),
+    ]);
+
     const result = await runTransaction(db, async (transaction) => {
       let hasWritten = false;
-      const traceRead = async (description, readOperation) => {
+      const traceRead = async (description, ref) => {
         if (hasWritten) {
           txTrace.push(`ERROR_READ_AFTER_WRITE: ${description}`);
           throw new Error(`READ_AFTER_WRITE at ${description}`);
         }
+        if (!ref || !ref.path) {
+          txTrace.push(`INVALID_DOC_REF: ${description}`);
+          throw new Error(`INVALID_DOC_REF: ${description}`);
+        }
         txTrace.push(`READ: ${description}`);
-        const snapshot = await readOperation();
+        const snapshot = await transaction.get(ref);
         txTrace.push(`READ_OK: ${description}`);
         return snapshot;
       };
@@ -197,8 +227,8 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         return result;
       };
 
-      const sourceSnapshot = await traceRead(`${sourceCollection}/${sourceDocId}`, () => transaction.get(sourceRef));
-      const queueSnapshot = await traceRead(`scanQueue/${sourceDocId}`, () => transaction.get(queueRef));
+      const sourceSnapshot = await traceRead(`${sourceCollection}/${sourceDocId}`, sourceRef);
+      const queueSnapshot = await traceRead(`scanQueue/${sourceDocId}`, queueRef);
 
       if (!sourceSnapshot.exists() && !queueSnapshot.exists()) {
         return {
@@ -238,28 +268,12 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         return { skipped: true, reason: `unsupported status ${status}`, logs };
       }
 
-      const beltCommandQuery = query(
-        collection(db, 'commands'),
-        where('scanId', '==', identity.scanId),
-        where('command', '==', BELT_MOVE_COMMAND),
-        limit(1),
-      );
-      const goCommandQuery = query(
-        collection(db, 'commands'),
-        where('scanId', '==', identity.scanId),
-        where('command', '==', 'GO'),
-        limit(1),
-      );
       const [
         settingsSnapshot,
         locationSnapshots,
-        existingBeltCommands,
-        existingGoCommands,
       ] = await Promise.all([
-        traceRead('settings/system', () => transaction.get(settingsRef)),
-        Promise.all(locationRefs.map((locationRef, index) => traceRead(`locations/${index + 1}`, () => transaction.get(locationRef)))),
-        traceRead(`commands duplicate belt query scanId=${identity.scanId} command=${BELT_MOVE_COMMAND}`, () => transaction.get(beltCommandQuery)),
-        traceRead(`commands duplicate GO query scanId=${identity.scanId}`, () => transaction.get(goCommandQuery)),
+        traceRead('settings/system', settingsRef),
+        Promise.all(locationRefs.map((locationRef, index) => traceRead(`locations/${index + 1}`, locationRef))),
       ]);
 
       if (existingBeltCommands.empty) {
