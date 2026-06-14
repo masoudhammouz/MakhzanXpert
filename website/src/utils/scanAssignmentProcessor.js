@@ -1,8 +1,14 @@
 import {
+  addDoc,
   collection,
   doc,
+  getDoc,
+  getDocs,
+  limit,
+  query,
   runTransaction,
   serverTimestamp,
+  where,
 } from 'firebase/firestore';
 import { db } from '../firebase/firebase.js';
 
@@ -18,6 +24,9 @@ export const VALID_SORTING_STRATEGIES = new Set([
 
 const ESP_DEVICE_ID = 'esp-main-01';
 const TOTAL_LOCATIONS = 9;
+const BELT_MOVE_COMMAND = 'BELT_RUN_UNTIL_IR_LAST';
+const PROCESSABLE_STATUS = 'CONFIRMED';
+const PROCESSED_STATUSES = new Set(['ASSIGNED', 'COMMAND_CREATED', 'PROCESSING', 'DONE', 'ERROR']);
 
 const NEIGHBORS = {
   1: [2, 4],
@@ -41,10 +50,11 @@ const STRATEGY_WEIGHTS = {
   model_size: { model: 10, size: 7 },
 };
 
-const ACTIVE_SCAN_STATUSES = new Set(['CONFIRMED']);
-const FINAL_SCAN_STATUSES = new Set(['ASSIGNED', 'PROCESSING', 'COMMAND_CREATED', 'STORED', 'DONE', 'ERROR']);
-
 function normalize(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function normalizeStatus(value) {
   return String(value || '').trim().toUpperCase();
 }
 
@@ -59,8 +69,16 @@ function productKeyFor(scan) {
   return scan.productKey || [scan.brand, scan.model, scan.color, scan.size].map(normalize).join('|');
 }
 
-function safeDocId(value) {
-  return String(value || '').replaceAll('/', '_').trim() || crypto.randomUUID();
+function scanIdentity(scan, fallbackId) {
+  return {
+    scanId: String(scan.scanId || fallbackId),
+    productKey: productKeyFor(scan),
+    brand: normalize(scan.brand),
+    model: normalize(scan.model),
+    color: normalize(scan.color),
+    size: normalize(scan.size),
+    normalizedSku: normalizeSku(scan),
+  };
 }
 
 function locationIdOf(location, fallbackId) {
@@ -73,45 +91,53 @@ function isEmptyLocation(location, fallbackId) {
   const status = String(location.status || '').trim().toLowerCase();
   if (!Number.isInteger(id) || id < 1 || id > TOTAL_LOCATIONS) return false;
   if (status === 'reserved' || status === 'full') return false;
-  return status === 'empty' || !location.isOccupied;
+  return status === '' || status === 'empty';
 }
 
-function scoreNeighbor(scan, neighbor, strategy) {
-  const weights = STRATEGY_WEIGHTS[strategy] || {};
+function scoreNeighbor(scan, neighbor, sortingMode) {
+  const weights = STRATEGY_WEIGHTS[sortingMode] || {};
   return Object.entries(weights).reduce((score, [field, weight]) => {
     return normalize(scan[field]) && normalize(scan[field]) === normalize(neighbor[field]) ? score + weight : score;
   }, 0);
 }
 
-function scoreLocation(scan, locationsById, locationId, strategy) {
+function scoreLocation(scan, locationsById, locationId, sortingMode) {
   return (NEIGHBORS[locationId] || []).reduce((score, neighborId) => {
-    return score + scoreNeighbor(scan, locationsById.get(neighborId) || {}, strategy);
+    return score + scoreNeighbor(scan, locationsById.get(neighborId) || {}, sortingMode);
   }, 0);
 }
 
-function chooseStorageLocation(scan, locations, strategy) {
+function buildLocationContext(locationSnapshots) {
   const locationsById = new Map();
   for (let id = 1; id <= TOTAL_LOCATIONS; id += 1) {
-    locationsById.set(id, { status: 'empty', position: id });
+    locationsById.set(id, { status: '', position: id });
   }
-  locations.forEach((location, index) => {
-    const fallbackId = index + 1;
-    locationsById.set(locationIdOf(location, fallbackId), location);
+
+  locationSnapshots.forEach((snapshot, index) => {
+    locationsById.set(index + 1, {
+      id: snapshot.id,
+      position: index + 1,
+      ...(snapshot.exists() ? snapshot.data() : {}),
+    });
   });
 
   const emptyLocations = Array.from({ length: TOTAL_LOCATIONS }, (_, index) => index + 1)
     .filter((locationId) => isEmptyLocation(locationsById.get(locationId), locationId));
 
-  if (emptyLocations.length === 0) return null;
+  return { locationsById, emptyLocations };
+}
 
-  const ranked = emptyLocations
+function chooseStorageLocation(scan, locationSnapshots, sortingMode) {
+  const { locationsById, emptyLocations } = buildLocationContext(locationSnapshots);
+  const scores = emptyLocations
     .map((locationId) => ({
       locationId,
-      score: scoreLocation(scan, locationsById, locationId, strategy),
+      score: scoreLocation(scan, locationsById, locationId, sortingMode),
     }))
     .sort((left, right) => right.score - left.score || left.locationId - right.locationId);
 
-  return ranked[0].score > 0 ? ranked[0].locationId : emptyLocations[0];
+  const selectedLocation = scores.length === 0 ? null : scores[0].score > 0 ? scores[0].locationId : emptyLocations[0];
+  return { emptyLocations, scores, selectedLocation };
 }
 
 function locationPositions(locationId) {
@@ -121,139 +147,366 @@ function locationPositions(locationId) {
   };
 }
 
-function scanPayload(scan) {
+function makeLog(type, message, context = {}) {
   return {
-    brand: normalize(scan.brand),
-    model: normalize(scan.model),
-    color: normalize(scan.color),
-    size: normalize(scan.size),
-    productKey: productKeyFor(scan),
-    normalizedSku: normalizeSku(scan),
+    type,
+    message,
+    scanId: context.scanId || '',
+    productKey: context.productKey || '',
+    sortingMode: context.sortingMode || '',
+    selectedLocation: context.selectedLocation || null,
+    commandId: context.commandId || '',
+    details: context.details || {},
   };
 }
 
-export async function assignConfirmedScan(scanDocId) {
-  const scanRef = doc(db, 'scanQueue', scanDocId);
+export async function writeAutomationLogs(logs) {
+  await Promise.allSettled(logs.map((log) => addDoc(collection(db, 'automationLogs'), {
+    ...log,
+    createdAt: serverTimestamp(),
+  })));
+}
+
+export async function assignConfirmedScan(sourceCollection, sourceDocId) {
+  const sourceRef = doc(db, sourceCollection, sourceDocId);
+  const queueRef = doc(db, 'scanQueue', sourceDocId);
   const settingsRef = doc(db, 'settings', 'system');
-  const commandRef = doc(db, 'commands', `scan-${safeDocId(scanDocId)}`);
+  const beltCommandRef = doc(collection(db, 'commands'));
+  const newCommandRef = doc(collection(db, 'commands'));
   const locationRefs = Array.from({ length: TOTAL_LOCATIONS }, (_, index) => doc(db, 'locations', String(index + 1)));
 
-  return runTransaction(db, async (transaction) => {
-    const scanSnapshot = await transaction.get(scanRef);
-    const settingsSnapshot = await transaction.get(settingsRef);
-    const commandSnapshot = await transaction.get(commandRef);
-    const locationSnapshots = await Promise.all(locationRefs.map((locationRef) => transaction.get(locationRef)));
+  let committedLogs = [];
 
-    if (!scanSnapshot.exists()) {
-      return { skipped: true, reason: 'duplicate scan' };
-    }
+  try {
+    const sourceSnapshotBeforeTransaction = await getDoc(sourceRef);
+    const queueSnapshotBeforeTransaction = await getDoc(queueRef);
+    const preflightScan = {
+      ...(sourceSnapshotBeforeTransaction.exists() ? sourceSnapshotBeforeTransaction.data() : {}),
+      ...(queueSnapshotBeforeTransaction.exists() ? queueSnapshotBeforeTransaction.data() : {}),
+    };
+    const preflightIdentity = scanIdentity(preflightScan, sourceDocId);
+    const beltCommandQuery = query(
+      collection(db, 'commands'),
+      where('scanId', '==', preflightIdentity.scanId),
+      where('command', '==', BELT_MOVE_COMMAND),
+      limit(1),
+    );
+    const goCommandQuery = query(
+      collection(db, 'commands'),
+      where('scanId', '==', preflightIdentity.scanId),
+      where('command', '==', 'GO'),
+      limit(1),
+    );
+    const [existingBeltCommands, existingGoCommands] = await Promise.all([
+      getDocs(beltCommandQuery),
+      getDocs(goCommandQuery),
+    ]);
 
-    const scan = scanSnapshot.data();
-    const status = String(scan.status || '').toUpperCase();
-    if (!ACTIVE_SCAN_STATUSES.has(status)) {
-      return { skipped: true, reason: FINAL_SCAN_STATUSES.has(status) ? 'already processed' : `unsupported status ${status}` };
-    }
+    const result = await runTransaction(db, async (transaction) => {
+      const sourceSnapshot = await transaction.get(sourceRef);
+      const queueSnapshot = await transaction.get(queueRef);
 
-    if (commandSnapshot.exists()) {
-      transaction.set(scanRef, {
+      if (!sourceSnapshot.exists() && !queueSnapshot.exists()) {
+        return {
+          skipped: true,
+          logs: [makeLog('PROCESS_ERROR', `Scan ${sourceDocId} does not exist.`, {
+            scanId: sourceDocId,
+            details: { sourceCollection, sourceDocId },
+          })],
+        };
+      }
+
+      const sourceScan = sourceSnapshot.exists() ? sourceSnapshot.data() : {};
+      const queueScan = queueSnapshot.exists() ? queueSnapshot.data() : {};
+      const scan = { ...sourceScan, ...queueScan };
+      const identity = scanIdentity(scan, sourceDocId);
+      const status = normalizeStatus(scan.status);
+      const logs = [
+        makeLog('SCAN_RECEIVED', `SCAN_RECEIVED ${identity.productKey}`, {
+          ...identity,
+          details: { sourceCollection, sourceDocId, status },
+        }),
+      ];
+
+      if (PROCESSED_STATUSES.has(status)) {
+        logs.push(makeLog('SCAN_IGNORED_ALREADY_PROCESSED', `Scan ${identity.scanId} already has status ${status}.`, {
+          ...identity,
+          details: { status },
+        }));
+        return { skipped: true, reason: 'already processed', logs };
+      }
+
+      if (status !== PROCESSABLE_STATUS) {
+        logs.push(makeLog('SCAN_IGNORED_ALREADY_PROCESSED', `Scan ${identity.scanId} ignored because status is ${status || 'missing'}.`, {
+          ...identity,
+          details: { status },
+        }));
+        return { skipped: true, reason: `unsupported status ${status}`, logs };
+      }
+
+      if (existingBeltCommands.empty) {
+        const beltCommandId = beltCommandRef.id;
+        transaction.set(beltCommandRef, {
+          commandId: beltCommandId,
+          deviceId: ESP_DEVICE_ID,
+          command: BELT_MOVE_COMMAND,
+          status: 'pending',
+          source: 'website-scan-processor',
+          scanId: identity.scanId,
+          payload: {
+            operation: 'move_to_lifter_ir',
+            stopOn: 'irLast',
+          },
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        logs.push(makeLog('BELT_MOVE_COMMAND_CREATED', `BELT_MOVE_COMMAND_CREATED ${BELT_MOVE_COMMAND}`, {
+          ...identity,
+          commandId: beltCommandId,
+          details: {
+            command: BELT_MOVE_COMMAND,
+            payload: {
+              operation: 'move_to_lifter_ir',
+              stopOn: 'irLast',
+            },
+          },
+        }));
+      } else {
+        const beltCommand = existingBeltCommands.docs[0];
+        const beltCommandId = beltCommand.data().commandId || beltCommand.id;
+        logs.push(makeLog('BELT_COMMAND_ALREADY_EXISTS', `BELT_COMMAND_ALREADY_EXISTS ${beltCommandId}`, {
+          ...identity,
+          commandId: beltCommandId,
+          details: { existingCommandId: beltCommandId, command: BELT_MOVE_COMMAND },
+        }));
+      }
+
+      logs.push(makeLog('SCAN_PROCESSING_STARTED', `Processing scan ${identity.scanId}.`, identity));
+
+      logs.push(makeLog('COMMAND_DUPLICATE_CHECK', `Found ${existingGoCommands.size} existing GO commands for scan ${identity.scanId}.`, {
+        ...identity,
+        details: { existingCommands: existingGoCommands.size, command: 'GO' },
+      }));
+
+      if (!existingGoCommands.empty) {
+        const goCommand = existingGoCommands.docs[0];
+        const commandId = goCommand.data().commandId || goCommand.id;
+        logs.push(makeLog('COMMAND_ALREADY_EXISTS', `Command already exists for scan ${identity.scanId}: ${commandId}.`, {
+          ...identity,
+          commandId,
+          details: { existingCommandId: commandId },
+        }));
+        transaction.set(queueRef, {
+          ...identity,
+          source: scan.source || sourceCollection,
+          status: 'ASSIGNED',
+          assignmentStatus: 'COMMAND_CREATED',
+          commandId,
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+        if (sourceCollection === 'scans') {
+          transaction.set(sourceRef, {
+            status: 'ASSIGNED',
+            assignmentStatus: 'COMMAND_CREATED',
+            commandId,
+            updatedAt: serverTimestamp(),
+          }, { merge: true });
+        }
+        return { skipped: true, reason: 'command already exists', commandId, logs };
+      }
+
+      const settingsSnapshot = await transaction.get(settingsRef);
+      const sortingMode = String(settingsSnapshot.data()?.sortingMode || '').trim();
+      logs.push(makeLog('SORTING_MODE_READ', `SORTING_MODE_READ ${sortingMode || 'missing'}`, {
+        ...identity,
+        sortingMode,
+      }));
+
+      if (!VALID_SORTING_STRATEGIES.has(sortingMode)) {
+        const errorMessage = 'Missing or invalid settings/system.sortingMode.';
+        logs.push(makeLog('PROCESS_ERROR', errorMessage, {
+          ...identity,
+          sortingMode,
+          details: { error: errorMessage },
+        }));
+        transaction.set(queueRef, {
+          ...identity,
+          source: scan.source || sourceCollection,
+          status: 'ERROR',
+          errorCode: 'missing-sortingMode',
+          errorMessage,
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+        return { skipped: true, reason: 'missing sortingMode', logs };
+      }
+
+      const locationSnapshots = await Promise.all(locationRefs.map((locationRef) => transaction.get(locationRef)));
+      logs.push(makeLog('LOCATIONS_READ', `LOCATIONS_READ ${locationSnapshots.length}`, {
+        ...identity,
+        sortingMode,
+        details: { locationsRead: locationSnapshots.length },
+      }));
+
+      const { emptyLocations, scores, selectedLocation } = chooseStorageLocation(identity, locationSnapshots, sortingMode);
+      logs.push(makeLog('EMPTY_LOCATIONS_FOUND', `EMPTY_LOCATIONS_FOUND ${emptyLocations.length}`, {
+        ...identity,
+        sortingMode,
+        details: { emptyLocations },
+      }));
+      logs.push(makeLog('LOCATION_SCORING_STARTED', `LOCATION_SCORING_STARTED ${sortingMode}`, {
+        ...identity,
+        sortingMode,
+        details: { strategyWeights: STRATEGY_WEIGHTS[sortingMode] },
+      }));
+      logs.push(makeLog('LOCATION_SCORE_RESULT', `LOCATION_SCORE_RESULT ${scores.map((item) => `${item.locationId}:${item.score}`).join(', ') || 'none'}`, {
+        ...identity,
+        sortingMode,
+        details: { scores },
+      }));
+
+      if (!selectedLocation) {
+        const errorMessage = 'No empty warehouse location is available.';
+        logs.push(makeLog('PROCESS_ERROR', errorMessage, {
+          ...identity,
+          sortingMode,
+          details: { error: errorMessage, emptyLocations },
+        }));
+        transaction.set(queueRef, {
+          ...identity,
+          source: scan.source || sourceCollection,
+          status: 'ERROR',
+          errorCode: 'no-empty-locations',
+          errorMessage,
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+        return { skipped: true, reason: 'no empty locations', logs };
+      }
+
+      const { inPosition, outPosition } = locationPositions(selectedLocation);
+      const commandId = newCommandRef.id;
+      const payload = {
+        operation: 'put',
+        scanId: identity.scanId,
+        locationId: selectedLocation,
+        inPosition,
+        outPosition,
+        brand: identity.brand,
+        model: identity.model,
+        color: identity.color,
+        size: identity.size,
+        productKey: identity.productKey,
+        normalizedSku: identity.normalizedSku,
+      };
+
+      logs.push(makeLog('LOCATION_SELECTED', `LOCATION_SELECTED ${selectedLocation}`, {
+        ...identity,
+        sortingMode,
+        selectedLocation,
+        details: { inPosition, outPosition },
+      }));
+
+      transaction.set(doc(db, 'locations', String(selectedLocation)), {
+        status: 'reserved',
+        locationId: selectedLocation,
+        position: selectedLocation,
+        productId: identity.normalizedSku,
+        normalizedSku: identity.normalizedSku,
+        productKey: identity.productKey,
+        brand: identity.brand,
+        model: identity.model,
+        color: identity.color,
+        size: identity.size,
+        scanId: identity.scanId,
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+      logs.push(makeLog('LOCATION_RESERVED', `LOCATION_RESERVED ${selectedLocation}`, {
+        ...identity,
+        sortingMode,
+        selectedLocation,
+        details: { locationId: selectedLocation },
+      }));
+
+      transaction.set(newCommandRef, {
+        commandId,
+        deviceId: ESP_DEVICE_ID,
+        command: 'GO',
+        arduinoCommand: `GO ${inPosition}`,
+        type: 'GO',
+        position: inPosition,
+        status: 'pending',
+        source: 'website-scan-processor',
+        scanId: identity.scanId,
+        locationId: selectedLocation,
+        payload,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      logs.push(makeLog('COMMAND_CREATED', `COMMAND_CREATED GO ${inPosition}`, {
+        ...identity,
+        sortingMode,
+        selectedLocation,
+        commandId,
+        details: { command: 'GO', position: inPosition, payload },
+      }));
+
+      transaction.set(queueRef, {
+        ...identity,
+        source: scan.source || sourceCollection,
         status: 'ASSIGNED',
         assignmentStatus: 'COMMAND_CREATED',
-        commandId: commandRef.id,
-        duplicateGuard: 'existing-command',
+        selectedLocation,
+        locationId: selectedLocation,
+        inPosition,
+        outPosition,
+        commandId,
         updatedAt: serverTimestamp(),
       }, { merge: true });
-      return { skipped: true, reason: 'duplicate scan', commandId: commandRef.id };
-    }
+      if (sourceCollection === 'scans') {
+        transaction.set(sourceRef, {
+          status: 'ASSIGNED',
+          selectedLocation,
+          locationId: selectedLocation,
+          inPosition,
+          outPosition,
+          commandId,
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+      }
+      logs.push(makeLog('SCAN_ASSIGNED', `SCAN_ASSIGNED ${identity.scanId}`, {
+        ...identity,
+        sortingMode,
+        selectedLocation,
+        commandId,
+        details: { inPosition, outPosition },
+      }));
 
-    const sortingMode = String(settingsSnapshot.data()?.sortingMode || '').trim();
-    if (!VALID_SORTING_STRATEGIES.has(sortingMode)) {
-      transaction.set(scanRef, {
-        status: 'ERROR',
-        errorCode: 'missing-sortingMode',
-        errorMessage: 'Missing or invalid settings/system.sortingMode.',
-        updatedAt: serverTimestamp(),
-      }, { merge: true });
-      return { skipped: true, reason: 'missing sortingMode' };
-    }
-
-    const locations = locationSnapshots.map((snapshot, index) => ({
-      id: snapshot.id,
-      position: index + 1,
-      ...(snapshot.exists() ? snapshot.data() : {}),
-    }));
-    const selectedLocation = chooseStorageLocation(scan, locations, sortingMode);
-    if (!selectedLocation) {
-      transaction.set(scanRef, {
-        status: 'ERROR',
-        errorCode: 'no-empty-locations',
-        errorMessage: 'No empty warehouse location is available.',
-        updatedAt: serverTimestamp(),
-      }, { merge: true });
-      return { skipped: true, reason: 'no empty locations' };
-    }
-
-    const commandId = commandRef.id;
-    const { inPosition, outPosition } = locationPositions(selectedLocation);
-    const payload = {
-      operation: 'put',
-      scanId: scan.scanId || scanDocId,
-      locationId: selectedLocation,
-      inPosition,
-      outPosition,
-      ...scanPayload(scan),
-    };
-
-    transaction.set(scanRef, {
-      status: 'ASSIGNED',
-      assignmentStatus: 'COMMAND_CREATED',
-      selectedLocation,
-      locationId: selectedLocation,
-      inPosition,
-      outPosition,
-      commandId,
-      updatedAt: serverTimestamp(),
-    }, { merge: true });
-
-    transaction.set(doc(db, 'locations', String(selectedLocation)), {
-      status: 'reserved',
-      isOccupied: false,
-      locationId: selectedLocation,
-      position: selectedLocation,
-      productId: payload.normalizedSku,
-      normalizedSku: payload.normalizedSku,
-      productKey: payload.productKey,
-      brand: payload.brand,
-      model: payload.model,
-      color: payload.color,
-      size: payload.size,
-      scanId: payload.scanId,
-      updatedAt: serverTimestamp(),
-    }, { merge: true });
-
-    transaction.set(commandRef, {
-      commandId,
-      deviceId: ESP_DEVICE_ID,
-      command: 'GO',
-      arduinoCommand: `GO ${inPosition}`,
-      type: 'GO',
-      position: inPosition,
-      status: 'pending',
-      source: 'website-scan-processor',
-      scanId: payload.scanId,
-      locationId: selectedLocation,
-      payload,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+      // Product stock is intentionally not incremented here.
+      // Status plan: CONFIRMED -> ASSIGNED -> COMMAND_CREATED -> STORED/DONE after storage completion.
+      return {
+        skipped: false,
+        scanId: identity.scanId,
+        productKey: identity.productKey,
+        commandId,
+        locationId: selectedLocation,
+        inPosition,
+        outPosition,
+        logs,
+      };
     });
 
-    // Inventory stock is intentionally not incremented here.
-    // Status plan: CONFIRMED -> ASSIGNED -> COMMAND_CREATED -> STORED/DONE after storage completion.
-    return {
-      skipped: false,
-      scanId: payload.scanId,
-      commandId,
-      locationId: selectedLocation,
-      inPosition,
-    };
-  });
+    committedLogs = result.logs || [];
+    await writeAutomationLogs(committedLogs);
+    return result;
+  } catch (error) {
+    const beltErrorLog = makeLog('BELT_MOVE_COMMAND_ERROR', error.message || String(error), {
+      scanId: sourceDocId,
+      details: { sourceCollection, sourceDocId, error: error.message || String(error) },
+    });
+    const errorLog = makeLog('PROCESS_ERROR', error.message || String(error), {
+      scanId: sourceDocId,
+      details: { sourceCollection, sourceDocId, error: error.message || String(error) },
+    });
+    await writeAutomationLogs([...committedLogs, beltErrorLog, errorLog]);
+    throw error;
+  }
 }

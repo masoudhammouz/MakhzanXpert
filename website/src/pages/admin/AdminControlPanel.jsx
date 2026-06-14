@@ -197,6 +197,11 @@ function queueCounts(items) {
   };
 }
 
+function formatLogDetails(details) {
+  if (!details || Object.keys(details).length === 0) return '';
+  return JSON.stringify(details);
+}
+
 function AdminControlPanel() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [sortingMode, setSortingMode] = useState(DEFAULT_SETTINGS.sortingMode);
@@ -206,6 +211,7 @@ function AdminControlPanel() {
   const [scanQueue, setScanQueue] = useState([]);
   const [orderQueue, setOrderQueue] = useState([]);
   const [commands, setCommands] = useState([]);
+  const [automationLogs, setAutomationLogs] = useState([]);
   const [automationStatus, setAutomationStatus] = useState(DEFAULT_AUTOMATION_STATUS);
   const [espDevice, setEspDevice] = useState(null);
   const [products, setProducts] = useState([]);
@@ -314,6 +320,13 @@ function AdminControlPanel() {
       () => setCommands([]),
     );
 
+    const automationLogsQuery = query(collection(db, 'automationLogs'), orderBy('createdAt', 'desc'), limit(60));
+    const unsubscribeAutomationLogs = onSnapshot(
+      automationLogsQuery,
+      (snapshot) => setAutomationLogs(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+      () => setAutomationLogs([]),
+    );
+
     const productsQuery = query(collection(db, 'products'), orderBy('createdAt', 'desc'));
     const unsubscribeProducts = onSnapshot(
       productsQuery,
@@ -328,6 +341,7 @@ function AdminControlPanel() {
       unsubscribeScanQueue();
       unsubscribeOrderQueue();
       unsubscribeCommands();
+      unsubscribeAutomationLogs();
       unsubscribeProducts();
     };
   }, []);
@@ -371,6 +385,7 @@ function AdminControlPanel() {
   const commandsByScanId = useMemo(() => {
     const map = new Map();
     commands.forEach((command) => {
+      if (command.command !== 'GO') return;
       if (command.scanId) map.set(command.scanId, command);
       if (command.payload?.scanId) map.set(command.payload.scanId, command);
     });
@@ -386,6 +401,31 @@ function AdminControlPanel() {
         command: commandsByScanId.get(item.scanId || item.id),
       }));
   }, [commandsByScanId, scanQueue]);
+
+  const latestConfirmedScan = useMemo(() => {
+    return scanQueue.find((item) => item.status === 'CONFIRMED') || (latestScan?.status === 'CONFIRMED' ? latestScan : null);
+  }, [latestScan, scanQueue]);
+
+  const automationDebugSummary = useMemo(() => {
+    const findLatestLog = (type) => automationLogs.find((item) => item.type === type);
+    const processingLog = findLatestLog('SCAN_PROCESSING_STARTED');
+    const selectedLog = findLatestLog('LOCATION_SELECTED');
+    const commandLog = findLatestLog('COMMAND_CREATED') || findLatestLog('COMMAND_ALREADY_EXISTS');
+    const beltCommandLog = findLatestLog('BELT_MOVE_COMMAND_CREATED') || findLatestLog('BELT_COMMAND_ALREADY_EXISTS');
+    const emptyLocationsLog = findLatestLog('EMPTY_LOCATIONS_FOUND');
+    const errorLog = findLatestLog('PROCESS_ERROR');
+
+    return {
+      currentProcessingScan: processingLog?.scanId || '--',
+      selectedLocation: selectedLog?.selectedLocation || '--',
+      createdCommandId: commandLog?.commandId || '--',
+      beltCommandId: beltCommandLog?.commandId || '--',
+      emptyLocationsCount: Array.isArray(emptyLocationsLog?.details?.emptyLocations)
+        ? emptyLocationsLog.details.emptyLocations.length
+        : '--',
+      currentError: errorLog?.message || '--',
+    };
+  }, [automationLogs]);
 
   const lifterStatus = automationStatus.lifterBusy || currentOperation ? 'Working' : automationStatus.lastError ? 'Error' : 'Idle';
   const selectedStrategy = automationStatus.sortingStrategy || sortingMode;
@@ -690,6 +730,69 @@ function AdminControlPanel() {
 
       {error && <p className="admin-form-error">{error}</p>}
       {notice && <p className="admin-form-success">{notice}</p>}
+
+      <section className="control-system-card">
+        <div className="control-card-heading">
+          <div>
+            <p className="section-eyebrow">Automation debug</p>
+            <h2>Automation Debug Log</h2>
+          </div>
+        </div>
+
+        <div className="control-detail-grid">
+          <div>
+            <span>Latest Confirmed Scan</span>
+            <strong>{latestConfirmedScan?.productKey || [latestConfirmedScan?.brand, latestConfirmedScan?.model, latestConfirmedScan?.color, latestConfirmedScan?.size].filter(Boolean).join('|') || '--'}</strong>
+          </div>
+          <div>
+            <span>Current Processing Scan</span>
+            <strong>{automationDebugSummary.currentProcessingScan}</strong>
+          </div>
+          <div>
+            <span>Selected Sorting Mode</span>
+            <strong>{sortingMode || selectedStrategy || '--'}</strong>
+          </div>
+          <div>
+            <span>Empty Locations Count</span>
+            <strong>{automationDebugSummary.emptyLocationsCount}</strong>
+          </div>
+          <div>
+            <span>Selected Location</span>
+            <strong>{automationDebugSummary.selectedLocation}</strong>
+          </div>
+          <div>
+            <span>Created Command ID</span>
+            <strong>{automationDebugSummary.createdCommandId}</strong>
+          </div>
+          <div>
+            <span>Belt Command ID</span>
+            <strong>{automationDebugSummary.beltCommandId}</strong>
+          </div>
+          <div>
+            <span>Current Error</span>
+            <strong>{automationDebugSummary.currentError}</strong>
+          </div>
+        </div>
+
+        <div className="queue-list">
+          {automationLogs.length === 0 ? (
+            <p className="orders-customer-meta">No automation debug logs yet.</p>
+          ) : automationLogs.slice(0, 20).map((log) => (
+            <div className="queue-row" key={log.id}>
+              <strong>{formatDate(log.createdAt)} / {log.type}</strong>
+              <span>
+                {log.message || '-'}
+                {log.scanId ? ` / scanId ${log.scanId}` : ''}
+                {log.productKey ? ` / ${log.productKey}` : ''}
+                {log.sortingMode ? ` / sorting ${log.sortingMode}` : ''}
+                {log.selectedLocation ? ` / location ${log.selectedLocation}` : ''}
+                {log.commandId ? ` / command ${log.commandId}` : ''}
+              </span>
+              {formatLogDetails(log.details) && <span>{formatLogDetails(log.details)}</span>}
+            </div>
+          ))}
+        </div>
+      </section>
 
       <section className="control-system-card">
         <div className="control-card-heading">

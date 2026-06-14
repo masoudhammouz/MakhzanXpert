@@ -35,56 +35,65 @@ function ScanAssignmentWorker() {
   useEffect(() => {
     if (loading || !currentUser) return undefined;
 
-    const confirmedScansQuery = query(
-      collection(db, 'scanQueue'),
-      where('status', '==', 'CONFIRMED'),
-      limit(10),
-    );
+    const listenForConfirmedScans = (sourceCollection) => {
+      const confirmedScansQuery = query(
+        collection(db, sourceCollection),
+        where('status', '==', 'CONFIRMED'),
+        limit(10),
+      );
 
-    const unsubscribe = onSnapshot(
-      confirmedScansQuery,
-      (snapshot) => {
-        snapshot.docs.forEach((scanDoc) => {
-          if (processingScanIds.current.has(scanDoc.id)) return;
+      return onSnapshot(
+        confirmedScansQuery,
+        (snapshot) => {
+          snapshot.docs.forEach((scanDoc) => {
+            const processingKey = `${sourceCollection}/${scanDoc.id}`;
+            if (processingScanIds.current.has(processingKey)) return;
 
-          processingScanIds.current.add(scanDoc.id);
-          assignConfirmedScan(scanDoc.id)
-            .then((result) => {
-              if (result.skipped) {
-                console.info('[SCAN_ASSIGNMENT_SKIPPED]', scanDoc.id, result.reason);
-                return;
-              }
-              console.info('[SCAN_ASSIGNED]', result);
-              logScanProcessorActivity(
-                'SCAN_ASSIGNED',
-                `Scan ${result.scanId} assigned to location ${result.locationId}; GO ${result.inPosition} command ${result.commandId} created.`,
-                'success',
-              );
-            })
-            .catch((error) => {
-              console.error('[SCAN_ASSIGNMENT_FAILED]', scanDoc.id, error);
-              logScanProcessorActivity(
-                'SCAN_ASSIGNMENT_FAILED',
-                `Scan ${scanDoc.id} assignment failed: ${error.message || error}`,
-                'error',
-              );
-            })
-            .finally(() => {
-              processingScanIds.current.delete(scanDoc.id);
-            });
-        });
-      },
-      (error) => {
-        console.error('[SCAN_ASSIGNMENT_LISTENER_FAILED]', error);
-        logScanProcessorActivity(
-          'SCAN_ASSIGNMENT_LISTENER_FAILED',
-          `Scan assignment listener failed: ${error.message || error}`,
-          'error',
-        );
-      },
-    );
+            processingScanIds.current.add(processingKey);
+            assignConfirmedScan(sourceCollection, scanDoc.id)
+              .then((result) => {
+                if (result.skipped) {
+                  console.info('[SCAN_ASSIGNMENT_SKIPPED]', processingKey, result.reason);
+                  return;
+                }
+                console.info('[SCAN_ASSIGNED]', result);
+                logScanProcessorActivity(
+                  'SCAN_ASSIGNED',
+                  `Scan ${result.scanId} assigned to location ${result.locationId}; GO ${result.inPosition} command ${result.commandId} created.`,
+                  'success',
+                );
+              })
+              .catch((error) => {
+                console.error('[SCAN_ASSIGNMENT_FAILED]', processingKey, error);
+                logScanProcessorActivity(
+                  'SCAN_ASSIGNMENT_FAILED',
+                  `Scan ${processingKey} assignment failed: ${error.message || error}`,
+                  'error',
+                );
+              })
+              .finally(() => {
+                processingScanIds.current.delete(processingKey);
+              });
+          });
+        },
+        (error) => {
+          console.error('[SCAN_ASSIGNMENT_LISTENER_FAILED]', sourceCollection, error);
+          logScanProcessorActivity(
+            'SCAN_ASSIGNMENT_LISTENER_FAILED',
+            `${sourceCollection} scan assignment listener failed: ${error.message || error}`,
+            'error',
+          );
+        },
+      );
+    };
 
-    return unsubscribe;
+    const unsubscribeScanQueue = listenForConfirmedScans('scanQueue');
+    const unsubscribeScans = listenForConfirmedScans('scans');
+
+    return () => {
+      unsubscribeScanQueue();
+      unsubscribeScans();
+    };
   }, [currentUser, loading]);
 
   return null;
