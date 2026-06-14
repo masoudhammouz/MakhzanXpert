@@ -20,6 +20,7 @@ const VALID_SORTING_STRATEGIES = new Set([
   'model_size',
   'sku_exact',
   'smart_auto',
+  'nearest_location_priority',
 ]);
 
 const SORTING_OPTIONS = [
@@ -33,6 +34,7 @@ const SORTING_OPTIONS = [
   { value: 'model_size', label: 'Model + Size', description: 'Prefer the same model area, then keep sizes ordered inside it.' },
   { value: 'sku_exact', label: 'Exact SKU Cluster', description: 'Place exact matching SKUs beside each other, with model-size fallback.' },
   { value: 'smart_auto', label: 'Smart Auto', description: 'Automatically choose SKU, model, brand, color, or size ordering from existing stock.' },
+  { value: 'nearest_location_priority', label: 'Nearest Location Priority', description: 'Ignore product attributes and pick the first empty location in fixed priority order: 1, 2, 4, 3, 5, 7, 6, 8, 9.' },
 ];
 
 const DEFAULT_SETTINGS = {

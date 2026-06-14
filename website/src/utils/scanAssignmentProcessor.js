@@ -23,11 +23,13 @@ export const VALID_SORTING_STRATEGIES = new Set([
   'model_size',
   'sku_exact',
   'smart_auto',
+  'nearest_location_priority',
 ]);
 
 const ESP_DEVICE_ID = 'esp-main-01';
 const TOTAL_LOCATIONS = 9;
 const SORT_PATH = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+const PRIORITY_ORDER = [1, 2, 4, 3, 5, 7, 6, 8, 9];
 const BELT_MOVE_COMMAND = 'BELT_RUN_UNTIL_IR_LAST';
 const PROCESSABLE_STATUS = 'CONFIRMED';
 const PROCESSED_STATUSES = new Set(['ASSIGNED', 'COMMAND_CREATED', 'PROCESSING', 'STORED', 'DONE', 'ERROR']);
@@ -109,6 +111,32 @@ function getLocationIndex(locationNumber) {
 
 function getEmptyCandidateLocations(locations) {
   return getSortPath().filter((locationId) => isEmptyLocation(locations.get(locationId), locationId));
+}
+
+function assignNearestLocationPriority(locations) {
+  const emptyLocations = PRIORITY_ORDER.filter((locationId) => isEmptyLocation(locations.get(locationId), locationId));
+  const rejectedLocations = PRIORITY_ORDER.filter((locationId) => !emptyLocations.includes(locationId));
+  const scores = emptyLocations.map((locationId, index) => ({
+    locationId,
+    score: PRIORITY_ORDER.length - index,
+    details: {
+      candidate: locationId,
+      priorityIndex: index,
+      priorityOrder: PRIORITY_ORDER,
+      reason: 'first-empty-location-in-priority-order',
+      finalScore: PRIORITY_ORDER.length - index,
+    },
+  }));
+
+  return {
+    emptyLocations,
+    scores,
+    selectedLocation: emptyLocations[0] || null,
+    requestedStrategy: 'nearest_location_priority',
+    resolvedStrategy: 'nearest_location_priority',
+    rejectedLocations,
+    tieBreakUsed: false,
+  };
 }
 
 function getFullLocations(locations) {
@@ -398,6 +426,9 @@ function buildLocationContext(locationSnapshots) {
 
 function chooseStorageLocation(scan, locationSnapshots, sortingMode) {
   const { locationsById } = buildLocationContext(locationSnapshots);
+  if (sortingMode === 'nearest_location_priority') {
+    return assignNearestLocationPriority(locationsById);
+  }
   return chooseBestLocation(scan, locationsById, sortingMode);
 }
 
@@ -736,7 +767,9 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
       }));
 
       if (!selectedLocation) {
-        const errorMessage = 'No empty warehouse location is available.';
+        const errorMessage = sortingMode === 'nearest_location_priority'
+          ? 'NO_AVAILABLE_LOCATION'
+          : 'No empty warehouse location is available.';
         logs.push(makeLog('PROCESS_ERROR', errorMessage, {
           ...identity,
           sortingMode,
@@ -746,11 +779,11 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
           ...identity,
           source: scan.source || sourceCollection,
           status: 'ERROR',
-          errorCode: 'no-empty-locations',
+          errorCode: sortingMode === 'nearest_location_priority' ? 'NO_AVAILABLE_LOCATION' : 'no-empty-locations',
           errorMessage,
           updatedAt: serverTimestamp(),
         }, { merge: true }));
-        return { skipped: true, reason: 'no empty locations', logs };
+        return { skipped: true, reason: sortingMode === 'nearest_location_priority' ? 'NO_AVAILABLE_LOCATION' : 'no empty locations', logs };
       }
 
       const { inPosition, outPosition } = locationPositions(selectedLocation);
