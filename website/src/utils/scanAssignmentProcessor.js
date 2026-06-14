@@ -2,8 +2,6 @@ import {
   addDoc,
   collection,
   doc,
-  getDoc,
-  getDocs,
   limit,
   query,
   runTransaction,
@@ -178,30 +176,6 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
   let committedLogs = [];
 
   try {
-    const sourceSnapshotBeforeTransaction = await getDoc(sourceRef);
-    const queueSnapshotBeforeTransaction = await getDoc(queueRef);
-    const preflightScan = {
-      ...(sourceSnapshotBeforeTransaction.exists() ? sourceSnapshotBeforeTransaction.data() : {}),
-      ...(queueSnapshotBeforeTransaction.exists() ? queueSnapshotBeforeTransaction.data() : {}),
-    };
-    const preflightIdentity = scanIdentity(preflightScan, sourceDocId);
-    const beltCommandQuery = query(
-      collection(db, 'commands'),
-      where('scanId', '==', preflightIdentity.scanId),
-      where('command', '==', BELT_MOVE_COMMAND),
-      limit(1),
-    );
-    const goCommandQuery = query(
-      collection(db, 'commands'),
-      where('scanId', '==', preflightIdentity.scanId),
-      where('command', '==', 'GO'),
-      limit(1),
-    );
-    const [existingBeltCommands, existingGoCommands] = await Promise.all([
-      getDocs(beltCommandQuery),
-      getDocs(goCommandQuery),
-    ]);
-
     const result = await runTransaction(db, async (transaction) => {
       const sourceSnapshot = await transaction.get(sourceRef);
       const queueSnapshot = await transaction.get(queueRef);
@@ -243,6 +217,30 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         }));
         return { skipped: true, reason: `unsupported status ${status}`, logs };
       }
+
+      const beltCommandQuery = query(
+        collection(db, 'commands'),
+        where('scanId', '==', identity.scanId),
+        where('command', '==', BELT_MOVE_COMMAND),
+        limit(1),
+      );
+      const goCommandQuery = query(
+        collection(db, 'commands'),
+        where('scanId', '==', identity.scanId),
+        where('command', '==', 'GO'),
+        limit(1),
+      );
+      const [
+        settingsSnapshot,
+        locationSnapshots,
+        existingBeltCommands,
+        existingGoCommands,
+      ] = await Promise.all([
+        transaction.get(settingsRef),
+        Promise.all(locationRefs.map((locationRef) => transaction.get(locationRef))),
+        transaction.get(beltCommandQuery),
+        transaction.get(goCommandQuery),
+      ]);
 
       if (existingBeltCommands.empty) {
         const beltCommandId = beltCommandRef.id;
@@ -315,7 +313,6 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         return { skipped: true, reason: 'command already exists', commandId, logs };
       }
 
-      const settingsSnapshot = await transaction.get(settingsRef);
       const sortingMode = String(settingsSnapshot.data()?.sortingMode || '').trim();
       logs.push(makeLog('SORTING_MODE_READ', `SORTING_MODE_READ ${sortingMode || 'missing'}`, {
         ...identity,
@@ -340,7 +337,6 @@ export async function assignConfirmedScan(sourceCollection, sourceDocId) {
         return { skipped: true, reason: 'missing sortingMode', logs };
       }
 
-      const locationSnapshots = await Promise.all(locationRefs.map((locationRef) => transaction.get(locationRef)));
       logs.push(makeLog('LOCATIONS_READ', `LOCATIONS_READ ${locationSnapshots.length}`, {
         ...identity,
         sortingMode,
