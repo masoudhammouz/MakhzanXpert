@@ -83,17 +83,45 @@ async function createAutomationCommand(command) {
   const commandRef = doc(collection(db, 'commands'));
   const commandId = commandRef.id;
 
-  await setDoc(commandRef, {
-    command,
-    status: 'pending',
-    deviceId: ESP_DEVICE_ID,
-    createdAt: serverTimestamp(),
-    commandId,
-  });
+  try {
+    await setDoc(commandRef, {
+      commandId,
+      command,
+      arduinoCommand: command,
+      type: 'AUTOMATION',
+      status: 'pending',
+      source: 'website-admin-control',
+      deviceId: ESP_DEVICE_ID,
+      payload: {
+        requestedBy: 'admin-control-panel',
+      },
+      response: null,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
 
-  const createdCommand = await getDocFromServer(commandRef);
-  if (!createdCommand.exists()) {
-    throw new Error(`${command} command was not created in Firestore.`);
+    const createdCommand = await getDocFromServer(commandRef);
+    if (!createdCommand.exists()) {
+      throw new Error(`${command} command was not created in Firestore.`);
+    }
+
+    console.info('[COMMAND_CREATED]', {
+      commandId,
+      command,
+      status: 'pending',
+      deviceId: ESP_DEVICE_ID,
+      collectionPath: 'commands',
+    });
+  } catch (error) {
+    console.error('[COMMAND_CREATION_FAILED]', {
+      commandId,
+      command,
+      status: 'pending',
+      deviceId: ESP_DEVICE_ID,
+      collectionPath: 'commands',
+      error,
+    });
+    throw error;
   }
 
   return commandId;
@@ -314,7 +342,7 @@ function AdminControlPanel() {
       () => setOrderQueue([]),
     );
 
-    const commandsQuery = query(collection(db, 'commands'), orderBy('updatedAt', 'desc'), limit(50));
+    const commandsQuery = query(collection(db, 'commands'), orderBy('createdAt', 'desc'), limit(50));
     const unsubscribeCommands = onSnapshot(
       commandsQuery,
       (snapshot) => setCommands(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
@@ -477,7 +505,12 @@ function AdminControlPanel() {
       return;
     }
 
-    console.log(enabled ? 'START_AUTOMATION_CLICKED' : 'STOP_AUTOMATION_CLICKED');
+    console.info(enabled ? '[START_AUTOMATION_CLICKED]' : '[STOP_AUTOMATION_CLICKED]', {
+      command,
+      status: 'pending',
+      deviceId: ESP_DEVICE_ID,
+      collectionPath: 'commands',
+    });
     commandRequestInFlight.current = true;
     setSaving(actionLabel);
     setError('');
@@ -527,8 +560,7 @@ function AdminControlPanel() {
       await verifyAutomationStatus(nextStatus);
 
       const commandId = await createAutomationCommand(command);
-      console.log(enabled ? 'START_COMMAND_CREATED' : 'STOP_COMMAND_CREATED');
-      console.log(`${command} sent`);
+      console.info(`${command} sent`);
 
       await logWebsiteActivity(
         enabled ? 'AUTOMATION_STARTED' : 'AUTOMATION_STOPPED',

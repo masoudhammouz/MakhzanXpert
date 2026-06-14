@@ -1,10 +1,23 @@
 import { useEffect, useMemo, useState } from 'react';
-import { collection, doc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
+import {
+  collection,
+  doc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  setDoc,
+  where,
+  writeBatch,
+} from 'firebase/firestore';
 import EmptyState from '../../components/EmptyState.jsx';
 import LoadingState from '../../components/LoadingState.jsx';
 import { db } from '../../firebase/firebase.js';
 
 const ESP_DEVICE_ID = 'esp-main-01';
+const PENDING_COMMAND_STATUSES = ['pending', 'queued', 'processing'];
 
 const RAW_POSITIONS = [
   { position: 1, label: 'GO 1' },
@@ -54,11 +67,27 @@ function getCommandStatusClass(status) {
   return 'command-status-pending';
 }
 
+async function deleteCommandDocuments(snapshot) {
+  const docs = [...snapshot.docs];
+  let deletedCount = 0;
+
+  for (let index = 0; index < docs.length; index += 500) {
+    const batch = writeBatch(db);
+    docs.slice(index, index + 500).forEach((item) => batch.delete(item.ref));
+    await batch.commit();
+    deletedCount += docs.slice(index, index + 500).length;
+  }
+
+  return deletedCount;
+}
+
 function AdminCommands() {
   const [commands, setCommands] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [executingCommand, setExecutingCommand] = useState('');
+  const [clearingAction, setClearingAction] = useState('');
 
   useEffect(() => {
     const commandsQuery = query(collection(db, 'commands'), orderBy('createdAt', 'desc'), limit(50));
@@ -88,6 +117,7 @@ function AdminCommands() {
   const handleExecuteCommand = async (commandConfig) => {
     setExecutingCommand(commandConfig.arduinoCommand);
     setError('');
+    setNotice('');
 
     try {
       const commandRef = doc(collection(db, 'commands'));
@@ -112,10 +142,59 @@ function AdminCommands() {
         updatedAt: serverTimestamp(),
       });
       console.info('[COMMAND_CREATED]', commandConfig.arduinoCommand, commandId);
-    } catch {
+    } catch (commandError) {
+      console.error('[COMMAND_CREATION_FAILED]', commandConfig.arduinoCommand, commandError);
       setError(`Unable to create ${commandConfig.arduinoCommand} command.`);
     } finally {
       setExecutingCommand('');
+    }
+  };
+
+  const handleClearCommandHistory = async () => {
+    if (!window.confirm('Clear all command history? This will delete every document in the commands collection.')) return;
+
+    setClearingAction('history');
+    setError('');
+    setNotice('');
+
+    try {
+      const snapshot = await getDocs(collection(db, 'commands'));
+      const deletedCount = await deleteCommandDocuments(snapshot);
+      console.info('[COMMAND_HISTORY_CLEARED]', { deletedCount, collectionPath: 'commands' });
+      setNotice('Command history cleared successfully');
+    } catch (clearError) {
+      console.error('[COMMAND_HISTORY_CLEAR_FAILED]', clearError);
+      setError('Unable to clear command history.');
+    } finally {
+      setClearingAction('');
+    }
+  };
+
+  const handleClearPendingCommands = async () => {
+    if (!window.confirm('Clear pending commands? This will delete pending, queued, and processing command documents only.')) return;
+
+    setClearingAction('pending');
+    setError('');
+    setNotice('');
+
+    try {
+      const pendingQuery = query(
+        collection(db, 'commands'),
+        where('status', 'in', PENDING_COMMAND_STATUSES),
+      );
+      const snapshot = await getDocs(pendingQuery);
+      const deletedCount = await deleteCommandDocuments(snapshot);
+      console.info('[PENDING_COMMANDS_CLEARED]', {
+        deletedCount,
+        collectionPath: 'commands',
+        statuses: PENDING_COMMAND_STATUSES,
+      });
+      setNotice(`Pending commands cleared. Deleted ${deletedCount} command${deletedCount === 1 ? '' : 's'}.`);
+    } catch (clearError) {
+      console.error('[PENDING_COMMANDS_CLEAR_FAILED]', clearError);
+      setError('Unable to clear pending commands.');
+    } finally {
+      setClearingAction('');
     }
   };
 
@@ -130,6 +209,7 @@ function AdminCommands() {
       </section>
 
       {error && <p className="admin-form-error">{error}</p>}
+      {notice && <p className="admin-form-success">{notice}</p>}
 
       <section className="inventory-summary-grid" aria-label="Commands summary">
         <article className="admin-summary-card">
@@ -187,6 +267,24 @@ function AdminCommands() {
           <div>
             <h2>Command History</h2>
             <p>Latest 50 command documents from Firestore, updated in real time.</p>
+          </div>
+          <div className="control-actions">
+            <button
+              className="button button-secondary"
+              type="button"
+              onClick={handleClearPendingCommands}
+              disabled={Boolean(clearingAction)}
+            >
+              {clearingAction === 'pending' ? 'Clearing...' : 'Clear Pending Commands'}
+            </button>
+            <button
+              className="button button-danger"
+              type="button"
+              onClick={handleClearCommandHistory}
+              disabled={Boolean(clearingAction)}
+            >
+              {clearingAction === 'history' ? 'Clearing...' : 'Clear Command History'}
+            </button>
           </div>
         </div>
 
