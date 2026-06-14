@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { addDoc, collection, doc, getDocFromServer, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore';
+import { addDoc, collection, doc, getDocFromServer, getDocs, limit, onSnapshot, orderBy, query, runTransaction, serverTimestamp, setDoc } from 'firebase/firestore';
 import ScanAssignmentWorker from '../../components/ScanAssignmentWorker.jsx';
 import { db } from '../../firebase/firebase.js';
+import { markPickedLocationEmpty } from '../../utils/inventorySync.js';
 
 const SYSTEM_SETTINGS_REF = doc(db, 'settings', 'system');
 const AUTOMATION_STATUS_REF = doc(db, 'automation', 'status');
@@ -10,6 +11,8 @@ const ESP_DEVICE_REF = doc(db, 'devices', 'esp-main-01');
 const ESP_DEVICE_ID = 'esp-main-01';
 const TOTAL_MOVEMENT_POSITIONS = 18;
 const ONLINE_WINDOW_MS = 30000;
+const BULK_PICK_DELIVERY_DELAY_MS = 5000;
+const BULK_PICK_COMMAND_TIMEOUT_MS = 180000;
 const VALID_SORTING_STRATEGIES = new Set([
   'brand',
   'size',
@@ -85,6 +88,56 @@ function logWebsiteActivity(activityType, message) {
   ]);
 }
 
+function wait(ms) {
+  return new Promise((resolve) => {
+    globalThis.setTimeout(resolve, ms);
+  });
+}
+
+function isStoredLocation(location) {
+  const id = locationIdOf(location);
+  return (
+    Number.isInteger(id) &&
+    id >= 1 &&
+    id <= 9 &&
+    String(location?.status || '').toLowerCase() === 'full' &&
+    (location?.occupied === true || location?.isOccupied === true)
+  );
+}
+
+function productTitleFromLocation(location) {
+  return [location?.brand, location?.model, location?.color, location?.size]
+    .filter(Boolean)
+    .join(' ') || location?.productKey || location?.sku || 'Stored product';
+}
+
+function isCompletedCommandStatus(status) {
+  return ['done', 'completed', 'complete', 'executed'].includes(String(status || '').toLowerCase());
+}
+
+function isFailedCommandStatus(status) {
+  return ['error', 'failed', 'failure', 'cancelled', 'canceled'].includes(String(status || '').toLowerCase());
+}
+
+async function logBulkPickActivity(activityType, message, details = {}, status = 'info') {
+  const data = {
+    type: activityType,
+    activityType,
+    message,
+    details,
+    source: 'website-bulk-retrieval',
+    sourceDevice: 'website',
+    status,
+    createdAt: serverTimestamp(),
+  };
+
+  return Promise.allSettled([
+    addDoc(collection(db, 'systemActivity'), data),
+    addDoc(collection(db, 'activityLog'), data),
+    addDoc(collection(db, 'automationLogs'), data),
+  ]);
+}
+
 async function createAutomationCommand(command) {
   const commandRef = doc(collection(db, 'commands'));
   const commandId = commandRef.id;
@@ -131,6 +184,80 @@ async function createAutomationCommand(command) {
   }
 
   return commandId;
+}
+
+async function createBulkRetrievalCommand({ command, arduinoCommand, payload, type = 'PICK_BY_SIZE' }) {
+  const commandRef = doc(collection(db, 'commands'));
+  const commandId = commandRef.id;
+  const cleanPayload = Object.fromEntries(
+    Object.entries(payload || {}).map(([key, value]) => [key, value ?? null]),
+  );
+
+  await setDoc(commandRef, {
+    commandId,
+    command,
+    arduinoCommand,
+    type,
+    status: 'pending',
+    source: 'website-bulk-retrieval',
+    deviceId: ESP_DEVICE_ID,
+    payload: cleanPayload,
+    response: null,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+
+  console.info('[PICK_BY_SIZE_COMMAND_CREATED]', {
+    commandId,
+    command,
+    arduinoCommand,
+    deviceId: ESP_DEVICE_ID,
+    payload: cleanPayload,
+  });
+
+  return { commandId, commandRef };
+}
+
+async function waitForCommandDone(commandRef, timeoutMs = BULK_PICK_COMMAND_TIMEOUT_MS) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const snapshot = await getDocFromServer(commandRef);
+    if (!snapshot.exists()) {
+      throw new Error('Command document disappeared before completion.');
+    }
+
+    const command = snapshot.data();
+    if (isCompletedCommandStatus(command.status)) return command;
+    if (isFailedCommandStatus(command.status)) {
+      throw new Error(command.response || command.error || `Command failed with status ${command.status}.`);
+    }
+
+    await wait(1000);
+  }
+
+  throw new Error('Timed out waiting for Arduino command completion.');
+}
+
+async function acquireBulkPickLock(operationId, requestedSize) {
+  await runTransaction(db, async (transaction) => {
+    const statusSnapshot = await transaction.get(AUTOMATION_STATUS_REF);
+    const status = statusSnapshot.exists() ? statusSnapshot.data() : {};
+
+    if (status.bulkRetrievalRunning === true) {
+      throw new Error('A bulk retrieval queue is already running.');
+    }
+
+    transaction.set(AUTOMATION_STATUS_REF, {
+      bulkRetrievalRunning: true,
+      bulkRetrievalOperationId: operationId,
+      currentState: 'PICK_BY_SIZE_STARTING',
+      currentOperation: `PICK_BY_SIZE ${requestedSize}`,
+      lifterBusy: true,
+      lastError: '',
+      updatedAt: serverTimestamp(),
+    }, { merge: true });
+  });
 }
 
 async function verifyAutomationStatus(expected) {
@@ -251,6 +378,17 @@ function AdminControlPanel() {
   const [espDevice, setEspDevice] = useState(null);
   const [products, setProducts] = useState([]);
   const [quickRetrieve, setQuickRetrieve] = useState({ brand: '', model: '', color: '', size: '' });
+  const [bulkPickSize, setBulkPickSize] = useState('');
+  const [bulkPickState, setBulkPickState] = useState({
+    running: false,
+    paused: false,
+    total: 0,
+    completed: 0,
+    failed: 0,
+    currentIndex: 0,
+    currentLocation: '',
+    currentProduct: '',
+  });
   const [productSearch, setProductSearch] = useState('');
   const [advancedBoxId, setAdvancedBoxId] = useState('');
   const [firebaseOnline, setFirebaseOnline] = useState(false);
@@ -258,6 +396,8 @@ function AdminControlPanel() {
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const commandRequestInFlight = useRef(false);
+  const bulkPickRunningRef = useRef(false);
+  const bulkPickStopRequestedRef = useRef(false);
   const sortingModeRef = useRef(DEFAULT_SETTINGS.sortingMode);
 
   useEffect(() => {
@@ -500,6 +640,10 @@ function AdminControlPanel() {
   };
 
   const handleAutomationToggle = async (enabled) => {
+    if (!enabled && bulkPickRunningRef.current) {
+      bulkPickStopRequestedRef.current = true;
+    }
+
     if (commandRequestInFlight.current) return;
 
     const actionLabel = enabled ? 'Start Automation' : 'Stop Automation';
@@ -661,6 +805,295 @@ function AdminControlPanel() {
     }
   };
 
+  const pickAllBySize = async (size) => {
+    const requestedSize = normalize(size);
+    if (!requestedSize) {
+      throw new Error('Enter a shoe size.');
+    }
+    if (bulkPickRunningRef.current) {
+      throw new Error('A bulk retrieval queue is already running.');
+    }
+
+    bulkPickRunningRef.current = true;
+    bulkPickStopRequestedRef.current = false;
+    const operationId = `PICK_BY_SIZE_${requestedSize}_${Date.now()}`;
+    let completed = 0;
+    let failed = 0;
+    let paused = false;
+    let lockAcquired = false;
+
+    try {
+      await acquireBulkPickLock(operationId, requestedSize);
+      lockAcquired = true;
+
+      const [locationSnapshot, productSnapshot] = await Promise.all([
+        getDocs(collection(db, 'locations')),
+        getDocs(collection(db, 'products')),
+      ]);
+
+      const freshProducts = productSnapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      const productsByKey = new Map();
+      freshProducts.forEach((product) => {
+        [product.id, product.productId, product.sku, product.normalizedSku]
+          .filter(Boolean)
+          .forEach((key) => productsByKey.set(normalize(key), product));
+      });
+
+      const queue = locationSnapshot.docs
+        .map((item) => {
+          const location = { id: item.id, ...item.data() };
+          const product = [location.productId, location.sku, location.normalizedSku]
+            .map((key) => productsByKey.get(normalize(key)))
+            .find(Boolean);
+          return {
+            ...location,
+            productSize: normalize(location.size || product?.size),
+            productTitle: productTitleFromLocation({ ...product, ...location }),
+          };
+        })
+        .filter((location) => isStoredLocation(location) && location.productSize === requestedSize)
+        .sort((left, right) => locationIdOf(left) - locationIdOf(right));
+
+      setBulkPickState({
+        running: true,
+        paused: false,
+        total: queue.length,
+        completed: 0,
+        failed: 0,
+        currentIndex: 0,
+        currentLocation: '',
+        currentProduct: '',
+      });
+      setNotice(queue.length === 0 ? `No stored products found for size ${requestedSize}.` : `Found ${queue.length} product${queue.length === 1 ? '' : 's'} for size ${requestedSize}.`);
+
+      console.info('[PICK_BY_SIZE_STARTED]', { operationId, requestedSize, total: queue.length });
+      await logBulkPickActivity(
+        'PICK_BY_SIZE_STARTED',
+        `Pick by size started for size ${requestedSize}.`,
+        { operationId, requestedSize, total: queue.length },
+      );
+
+      await setDoc(AUTOMATION_STATUS_REF, {
+        currentState: queue.length > 0 ? 'PICK_BY_SIZE_RUNNING' : 'IDLE',
+        currentOperation: queue.length > 0 ? `PICK_BY_SIZE ${requestedSize}` : '',
+        lifterBusy: queue.length > 0,
+        bulkRetrievalRunning: queue.length > 0,
+        bulkRetrievalOperationId: queue.length > 0 ? operationId : null,
+        lastError: '',
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+
+      for (let index = 0; index < queue.length; index += 1) {
+        const location = queue[index];
+        const locationNumber = locationIdOf(location);
+        const locationDocumentId = location.id || String(locationNumber);
+        const productTitle = location.productTitle;
+
+        setBulkPickState((current) => ({
+          ...current,
+          currentIndex: index + 1,
+          currentLocation: String(locationNumber),
+          currentProduct: productTitle,
+        }));
+
+        console.info('[PICK_BY_SIZE_ITEM_STARTED]', { operationId, requestedSize, locationNumber, productTitle });
+        await logBulkPickActivity(
+          'PICK_BY_SIZE_ITEM_STARTED',
+          `Retrieving ${productTitle} from location ${locationNumber}.`,
+          {
+            operationId,
+            requestedSize,
+            locationId: locationDocumentId,
+            locationNumber,
+            productId: location.productId || null,
+            sku: location.sku || null,
+          },
+        );
+
+        try {
+          const arduinoCommand = `PICK_LOCATION ${locationNumber}`;
+          const { commandId, commandRef } = await createBulkRetrievalCommand({
+            command: 'PICK_LOCATION',
+            arduinoCommand,
+            payload: {
+              operation: 'PICK_BY_SIZE',
+              operationId,
+              size: requestedSize,
+              locationId: locationDocumentId,
+              locationNumber,
+              productId: location.productId || null,
+              sku: location.sku || null,
+              normalizedSku: location.normalizedSku || null,
+            },
+          });
+
+          await waitForCommandDone(commandRef);
+          await wait(BULK_PICK_DELIVERY_DELAY_MS);
+          await markPickedLocationEmpty(locationDocumentId, {
+            operation: 'PICK_BY_SIZE',
+            operationId,
+            commandId,
+            size: requestedSize,
+            locationNumber,
+          });
+          await addDoc(collection(db, 'movementLogs'), {
+            type: 'PICK_BY_SIZE_ITEM_COMPLETED',
+            operation: 'PICK_BY_SIZE',
+            operationId,
+            commandId,
+            locationId: locationDocumentId,
+            locationNumber,
+            productId: location.productId || null,
+            sku: location.sku || null,
+            size: requestedSize,
+            productTitle,
+            status: 'completed',
+            createdAt: serverTimestamp(),
+          });
+
+          completed += 1;
+          setBulkPickState((current) => ({
+            ...current,
+            completed,
+            failed,
+          }));
+          console.info('[PICK_BY_SIZE_ITEM_COMPLETED]', { operationId, requestedSize, locationNumber, commandId });
+          await logBulkPickActivity(
+            'PICK_BY_SIZE_ITEM_COMPLETED',
+            `Retrieved ${productTitle} from location ${locationNumber}.`,
+            { operationId, requestedSize, locationNumber, commandId, completed, failed },
+          );
+        } catch (itemError) {
+          failed += 1;
+          setBulkPickState((current) => ({
+            ...current,
+            completed,
+            failed,
+          }));
+          console.error('[PICK_BY_SIZE_ITEM_FAILED]', { operationId, requestedSize, locationNumber, error: itemError });
+          await logBulkPickActivity(
+            'PICK_BY_SIZE_ITEM_FAILED',
+            `Failed to retrieve ${productTitle} from location ${locationNumber}.`,
+            {
+              operationId,
+              requestedSize,
+              locationId: locationDocumentId,
+              locationNumber,
+              error: itemError.message || String(itemError),
+              completed,
+              failed,
+            },
+            'error',
+          );
+        }
+
+        if (bulkPickStopRequestedRef.current) {
+          paused = true;
+          break;
+        }
+      }
+
+      if (paused) {
+        await setDoc(AUTOMATION_STATUS_REF, {
+          currentState: 'PAUSED',
+          currentOperation: `PICK_BY_SIZE ${requestedSize}`,
+          lifterBusy: false,
+          bulkRetrievalRunning: false,
+          bulkRetrievalOperationId: null,
+          lastError: 'Bulk retrieval paused by STOP_AUTOMATION after current item.',
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+        setBulkPickState((current) => ({
+          ...current,
+          running: false,
+          paused: true,
+          currentLocation: '',
+          currentProduct: '',
+        }));
+        return { operationId, requestedSize, total: queue.length, completed, failed, paused };
+      }
+
+      if (queue.length > 0) {
+        const { commandRef } = await createBulkRetrievalCommand({
+          command: 'START',
+          arduinoCommand: 'START',
+          type: 'PICK_BY_SIZE_RETURN_HOME',
+          payload: {
+            operation: 'PICK_BY_SIZE',
+            operationId,
+            size: requestedSize,
+          },
+        });
+        await waitForCommandDone(commandRef, 140000);
+      }
+
+      await setDoc(AUTOMATION_STATUS_REF, {
+        currentState: 'IDLE',
+        currentOperation: '',
+        lifterBusy: false,
+        bulkRetrievalRunning: false,
+        bulkRetrievalOperationId: null,
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+
+      console.info('[PICK_BY_SIZE_COMPLETED]', { operationId, requestedSize, total: queue.length, completed, failed });
+      await logBulkPickActivity(
+        'PICK_BY_SIZE_COMPLETED',
+        `Pick by size completed for size ${requestedSize}.`,
+        { operationId, requestedSize, total: queue.length, completed, failed },
+      );
+
+      setBulkPickState((current) => ({
+        ...current,
+        running: false,
+        paused: false,
+        total: queue.length,
+        completed,
+        failed,
+        currentLocation: '',
+        currentProduct: '',
+      }));
+
+      return { operationId, requestedSize, total: queue.length, completed, failed, paused: false };
+    } finally {
+      bulkPickRunningRef.current = false;
+      if (lockAcquired) {
+        await setDoc(AUTOMATION_STATUS_REF, {
+          bulkRetrievalRunning: false,
+          bulkRetrievalOperationId: null,
+          lifterBusy: false,
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+      }
+    }
+  };
+
+  const handlePickBySize = async (event) => {
+    event.preventDefault();
+    setSaving('Pick By Size');
+    setError('');
+    setNotice('');
+
+    try {
+      const summary = await pickAllBySize(bulkPickSize);
+      if (summary.paused) {
+        setNotice(`Pick by size paused after ${summary.completed} of ${summary.total}. Failed: ${summary.failed}.`);
+      } else {
+        setNotice(`Pick by size complete. Retrieved ${summary.completed} of ${summary.total}. Failed: ${summary.failed}.`);
+      }
+    } catch (pickError) {
+      setError(pickError.message || 'Unable to run Pick By Size.');
+      setBulkPickState((current) => ({
+        ...current,
+        running: false,
+        currentLocation: '',
+        currentProduct: '',
+      }));
+    } finally {
+      setSaving('');
+    }
+  };
+
   const createPickRequestForLocation = async (location, source = 'retrieval-panel') => {
     const locationId = locationIdOf(location);
     if (!isRetrievableLocation(location)) {
@@ -753,6 +1186,10 @@ function AdminControlPanel() {
       setSaving('');
     }
   };
+
+  const bulkPickProgressLabel = bulkPickState.running
+    ? `Retrieving ${bulkPickState.currentIndex || 0} / ${bulkPickState.total}`
+    : `${bulkPickState.completed} / ${bulkPickState.total} Retrieved`;
 
   return (
     <div className="admin-control-page">
@@ -853,7 +1290,7 @@ function AdminControlPanel() {
               className="button button-secondary"
               type="button"
               onClick={() => handleAutomationToggle(false)}
-              disabled={Boolean(saving)}
+              disabled={Boolean(saving) && saving !== 'Pick By Size'}
             >
               {saving === 'Stop Automation' ? 'Stopping...' : 'Stop Automation'}
             </button>
@@ -1004,6 +1441,60 @@ function AdminControlPanel() {
         <Link className="button button-secondary control-view-locations" to="/admin/locations">
           View Locations
         </Link>
+      </section>
+
+      <section className="control-card warehouse-control-card">
+        <div className="control-card-heading">
+          <div>
+            <p className="section-eyebrow">Bulk Retrieval</p>
+            <h2>Pick By Size</h2>
+            <p>Retrieve every stored product with the selected shoe size, one location at a time.</p>
+          </div>
+        </div>
+
+        <form className="quick-retrieve-grid" onSubmit={handlePickBySize}>
+          <label className="control-field" htmlFor="bulk-pick-size">
+            <span>Size</span>
+            <input
+              id="bulk-pick-size"
+              value={bulkPickSize}
+              onChange={(event) => setBulkPickSize(event.target.value)}
+              placeholder="40"
+              type="text"
+              disabled={bulkPickState.running}
+            />
+          </label>
+          <button className="button button-primary" type="submit" disabled={Boolean(saving) || bulkPickState.running}>
+            {bulkPickState.running ? 'Retrieving...' : 'Retrieve All'}
+          </button>
+        </form>
+
+        <div className="control-detail-grid">
+          <div>
+            <span>Total Found Items</span>
+            <strong>{bulkPickState.total}</strong>
+          </div>
+          <div>
+            <span>Current Progress</span>
+            <strong>{bulkPickProgressLabel}</strong>
+          </div>
+          <div>
+            <span>Current Location</span>
+            <strong>{bulkPickState.currentLocation || '--'}</strong>
+          </div>
+          <div>
+            <span>Current Product</span>
+            <strong>{bulkPickState.currentProduct || '--'}</strong>
+          </div>
+          <div>
+            <span>Failed Items</span>
+            <strong>{bulkPickState.failed}</strong>
+          </div>
+          <div>
+            <span>Queue Status</span>
+            <strong>{bulkPickState.running ? 'Running' : bulkPickState.paused ? 'Paused' : 'Idle'}</strong>
+          </div>
+        </div>
       </section>
 
       <section className="control-card warehouse-control-card">

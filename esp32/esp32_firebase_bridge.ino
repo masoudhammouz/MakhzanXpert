@@ -560,6 +560,7 @@ String expectedDoneForFirestoreCommand(String arduinoCommand) {
     return "DONE:PICK_LOCATION " + n;
   }
   if (arduinoCommand == "HOME") return "DONE:HOME";
+  if (arduinoCommand == "START") return "DONE:START";
   if (arduinoCommand == "BELT_RUN_UNTIL_IR_LAST") return "DONE:BELT_RUN_UNTIL_IR_LAST";
   return "";
 }
@@ -570,6 +571,7 @@ bool shouldWaitForFirestoreCommand(String rawCommand, String arduinoCommand) {
   return arduinoCommand.startsWith("GO ") ||
     arduinoCommand.startsWith("PICK_LOCATION ") ||
     arduinoCommand == "HOME" ||
+    arduinoCommand == "START" ||
     arduinoCommand == "BELT_RUN_UNTIL_IR_LAST" ||
     rawCommand == "HOME_LIFTER" ||
     rawCommand == "RESET_SYSTEM";
